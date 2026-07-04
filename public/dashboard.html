@@ -1,0 +1,1859 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>nookplot-bot dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --panel-2: #1c2230;
+  --border: #30363d;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --good: #3fb950;
+  --warn: #d29922;
+  --bad: #f85149;
+  --magenta: #bc8cff;
+  --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.5;
+}
+header {
+  padding: 12px 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+}
+header h1 {
+  font-size: 16px; margin: 0; font-weight: 600;
+}
+header .meta { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+.bot-status {
+  font-size: 12px; font-family: var(--mono); font-weight: 600;
+  padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border);
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+}
+.bot-status.running { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, transparent); background: color-mix(in srgb, var(--good) 12%, transparent); }
+.bot-status.stopped { color: var(--bad);  border-color: color-mix(in srgb, var(--bad) 45%, transparent);  background: color-mix(in srgb, var(--bad) 12%, transparent); }
+.bot-status.unknown { color: var(--muted); }
+.bot-status.running::first-letter { animation: botpulse 2s ease-in-out infinite; }
+@keyframes botpulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+.funnel-bar { display: flex; height: 22px; border-radius: 5px; overflow: hidden; border: 1px solid var(--border); background: var(--panel-2); }
+.funnel-seg { height: 100%; }
+.funnel-stats { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; font-family: var(--mono); color: var(--muted); }
+.funnel-stats .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+.epoch-bar { height: 14px; border-radius: 7px; background: var(--panel-2); border: 1px solid var(--border); overflow: hidden; margin: 6px 0; }
+.epoch-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--magenta)); transition: width .3s; }
+.refresh-btn {
+  background: transparent; border: 1px solid var(--border); color: var(--text);
+  padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px;
+}
+.refresh-btn:hover { background: var(--panel-2); }
+.tabs { display: flex; gap: 4px; padding: 0 20px; background: var(--panel); border-bottom: 1px solid var(--border); }
+.tab {
+  padding: 10px 14px; cursor: pointer; border-bottom: 2px solid transparent;
+  color: var(--muted); font-size: 13px; font-weight: 500;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+main { padding: 20px; max-width: 1500px; margin: 0 auto; }
+.section { display: none; }
+.section.active { display: block; }
+.grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 14px; margin-bottom: 20px;
+}
+.card {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 14px 16px;
+}
+.card h3 { margin: 0 0 8px 0; font-size: 12px; text-transform: uppercase;
+  letter-spacing: 0.5px; color: var(--muted); font-weight: 600; }
+.card .big { font-size: 22px; font-weight: 600; font-family: var(--mono); }
+.card .sub { font-size: 12px; color: var(--muted); margin-top: 4px; font-family: var(--mono); }
+.verdict-panel { display: grid; grid-template-columns: minmax(180px, 0.7fr) 1fr 1fr; gap: 14px; align-items: start; }
+.verdict-status { font-size: 26px; font-weight: 700; font-family: var(--mono); }
+.verdict-list { margin: 6px 0 0 0; padding-left: 18px; color: var(--muted); }
+.verdict-list li { margin: 3px 0; }
+@media (max-width: 800px) { .verdict-panel { grid-template-columns: 1fr; } }
+.good { color: var(--good); }
+.warn { color: var(--warn); }
+.bad { color: var(--bad); }
+.accent { color: var(--accent); }
+.magenta { color: var(--magenta); }
+.muted { color: var(--muted); }
+.row-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.row-card h2 { margin: 0 0 12px 0; font-size: 14px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
+tr:last-child td { border-bottom: none; }
+.blocker {
+  padding: 10px 12px; border-radius: 6px; margin-bottom: 8px;
+  display: flex; gap: 10px; align-items: start;
+  border-left: 4px solid var(--border);
+}
+.blocker.high { background: rgba(248,81,73,0.08); border-left-color: var(--bad); }
+.blocker.med { background: rgba(210,153,34,0.08); border-left-color: var(--warn); }
+.blocker.low { background: rgba(88,166,255,0.05); border-left-color: var(--accent); }
+.blocker .sev { font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 3px; align-self: start; }
+.blocker.high .sev { background: var(--bad); color: var(--bg); }
+.blocker.med .sev { background: var(--warn); color: var(--bg); }
+.blocker.low .sev { background: var(--accent); color: var(--bg); }
+.blocker .body { flex: 1; }
+.blocker .action { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.tier-pill {
+  display: inline-block; padding: 2px 8px; border-radius: 12px;
+  font-size: 11px; font-family: var(--mono); border: 1px solid;
+}
+.tier-pill.tier3 { color: var(--good); border-color: var(--good); }
+.tier-pill.tier2 { color: var(--accent); border-color: var(--accent); }
+.tier-pill.tier1 { color: var(--warn); border-color: var(--warn); }
+.tier-pill.tier0 { color: var(--muted); border-color: var(--muted); }
+.bar { background: var(--panel-2); height: 8px; border-radius: 4px; overflow: hidden; margin-top: 6px; }
+.bar-fill { background: var(--accent); height: 100%; transition: width 0.4s; }
+.bar-fill.good { background: var(--good); }
+.bar-fill.warn { background: var(--warn); }
+.bar-fill.bad { background: var(--bad); }
+.flex-row { display: flex; gap: 16px; flex-wrap: wrap; }
+.flex-row > * { flex: 1; min-width: 280px; }
+canvas { max-width: 100%; }
+.distribution {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 8px;
+}
+.dist-cell { text-align: center; background: var(--panel-2); padding: 8px 4px; border-radius: 4px; }
+.dist-cell .label { font-size: 10px; color: var(--muted); }
+.dist-cell .value { font-size: 18px; font-family: var(--mono); margin: 2px 0; }
+.empty { color: var(--muted); font-style: italic; padding: 20px; text-align: center; }
+.addr { font-family: var(--mono); font-size: 11px; }
+.legend { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-top: 4px; }
+.chart-wrap { position: relative; height: 260px; width: 100%; }
+.chart-wrap.short { height: 200px; }
+.log-feed { font-family: var(--mono); font-size: 11px; line-height: 1.5; max-height: 70vh; overflow-y: auto; background: var(--panel-2); padding: 10px 12px; border-radius: 4px; }
+.log-feed .log-line { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
+.log-feed .log-line.good { color: var(--good); }
+.log-feed .log-line.warn { color: var(--warn); }
+.log-feed .log-line.bad  { color: var(--bad); }
+.log-feed .log-line.diamond, .log-feed .log-line.mine { color: var(--magenta); }
+.log-feed .log-line.network { color: var(--accent); }
+.log-feed .log-line.muted { color: var(--muted); }
+.pack {
+  background: var(--panel-2); padding: 12px; border-radius: 6px; border: 1px solid var(--border);
+}
+.pack-name { font-weight: 600; font-size: 13px; }
+.pack-price { font-family: var(--mono); font-size: 18px; margin: 4px 0; color: var(--accent); }
+.pack-credits { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+.method {
+  background: var(--panel-2); padding: 10px 12px; border-radius: 6px; margin-bottom: 6px; display: flex; gap: 12px; align-items: start;
+}
+.method .effort { font-size: 10px; padding: 1px 6px; border-radius: 3px; align-self: start; }
+.method .effort.low { background: var(--good); color: var(--bg); }
+.method .effort.med { background: var(--warn); color: var(--bg); }
+.method .body { flex: 1; }
+.method .body strong { font-size: 13px; }
+.method .body .detail { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.explainer {
+  background: rgba(88,166,255,0.05); border-left: 3px solid var(--accent);
+  padding: 8px 12px; margin: 0 0 14px 0; color: var(--muted); font-size: 12px;
+  border-radius: 0 4px 4px 0;
+}
+.explainer strong { color: var(--text); }
+.exp-card-sub { font-size: 11px; color: var(--muted); margin-top: 2px; font-style: italic; }
+.tag-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.tag-chip {
+  background: var(--panel-2); padding: 3px 9px; border-radius: 12px;
+  font-size: 11px; font-family: var(--mono); border: 1px solid var(--border);
+}
+.tag-chip.unlock { color: var(--good); border-color: var(--good); }
+.bar-bg { background: var(--panel-2); height: 6px; border-radius: 3px; overflow: hidden; margin-top: 3px; }
+.bar-fill-rep { height: 100%; background: var(--accent); transition: width 0.4s; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>nookplot-bot dashboard</h1>
+  <span id="bot-status" class="bot-status unknown" title="daemon (src/index.ts) status">● checking…</span>
+  <span id="agent-name" class="meta">…</span>
+  <span id="agent-addr" class="meta"></span>
+  <span class="meta" style="margin-left:auto">last refresh <span id="last-refresh">never</span></span>
+  <button class="refresh-btn" onclick="loadAll()">↻ Refresh</button>
+</header>
+
+<nav class="tabs">
+  <div class="tab active" data-tab="overview">Overview</div>
+  <div class="tab" data-tab="today">Today</div>
+  <div class="tab" data-tab="reputation">Reputation</div>
+  <div class="tab" data-tab="activity">Activity</div>
+  <div class="tab" data-tab="performance">Performance</div>
+  <div class="tab" data-tab="peers">vs Peers</div>
+  <div class="tab" data-tab="blockers">Blockers</div>
+  <div class="tab" data-tab="history">History</div>
+  <div class="tab" data-tab="credits">Credits</div>
+  <div class="tab" data-tab="mcp">MCP Tracks</div>
+  <div class="tab" data-tab="raw">Raw</div>
+</nav>
+
+<main>
+  <!-- Overview -->
+  <section class="section active" data-section="overview">
+    <div class="row-card" id="project-review-card" style="display:none; border-color: var(--magenta);">
+      <h2>📁 Project draft — awaiting your decision</h2>
+      <div id="project-review"></div>
+    </div>
+    <div class="row-card" id="inbox-card" style="display:none;">
+      <h2>📬 Inbox <span id="inbox-meta" class="legend" style="text-transform:none; font-weight:normal"></span></h2>
+      <div id="inbox-panel"></div>
+    </div>
+    <div class="row-card" id="capacity-card">
+      <h2>📊 Capacity utilization <span id="capacity-meta" class="legend" style="text-transform:none; font-weight:normal"></span></h2>
+      <div id="capacity-panel"></div>
+    </div>
+    <div class="row-card">
+      <h2>Are we winning?</h2>
+      <div id="winning-panel"></div>
+    </div>
+    <div class="row-card" id="my-projects-card" style="display:none;">
+      <h2>📦 Our published projects (builder reputation)</h2>
+      <div id="my-projects"></div>
+      <div class="legend">Projects we own on the network — these move the <code>commits/projects/lines/exec</code> reputation dimensions off zero. <code>pending_review</code> = the commit is live + discoverable, awaiting peer/AI review.</div>
+    </div>
+    <div class="row-card">
+      <h2>Solve funnel — does our work get paid?</h2>
+      <div id="solve-funnel"></div>
+      <div class="legend">
+        Lifecycle of our last solver submissions. <strong>Paid</strong> reached quorum and earned NOOK;
+        <strong>pending</strong> is waiting on verifiers; <strong>rejected</strong> was verified but scored too low;
+        <strong>expired</strong> = the window closed before quorum (forfeited, unpaid). A rising <strong>expired%</strong>
+        is the trigger to tilt mining toward sandbox-graded verifiable kinds; while it's low, standard's higher EV wins.
+      </div>
+    </div>
+    <div class="row-card">
+      <h2>Money — credits vs NOOK (the three balances)</h2>
+      <div class="grid" id="money-cards"></div>
+      <div class="legend">
+        <strong>credits</strong> ≠ NOOK. Credits pay for gateway service fees (relays, /v1/exec sandbox calls).
+        <strong>NOOK</strong> is the protocol token, earned by mining + verifying.
+        It lives in three places: <em>off-chain ledger</em> (gateway IOU), <em>Merkle-proof</em> (claimable on-chain), and <em>wallet</em> (settled, transferable).
+      </div>
+    </div>
+    <div class="grid" id="overview-cards"></div>
+    <div class="row-card">
+      <h2>Verifiable Pool — Verification Distribution</h2>
+      <div class="distribution" id="pool-dist"></div>
+      <div class="legend">Total submissions in network pool right now. Lower v0% = healthier verifier supply.</div>
+    </div>
+    <div class="flex-row">
+      <div class="row-card" style="flex: 1.4;">
+        <h2>Our pending submissions</h2>
+        <table id="my-subs-tbl"><thead><tr><th>ID</th><th>Submitted</th><th>Verifier&nbsp;count</th><th>Progress</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="row-card" style="flex: 1;">
+        <h2>Recent claims</h2>
+        <div style="max-height: 420px; overflow-y: auto;">
+        <table id="claims-tbl"><thead><tr>
+          <th style="position:sticky;top:0;background:var(--panel)">When</th>
+          <th style="position:sticky;top:0;background:var(--panel)">Source</th>
+          <th class="num" style="position:sticky;top:0;background:var(--panel)">Amount</th>
+          <th class="num" style="position:sticky;top:0;background:var(--panel)">USD</th>
+        </tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Today (current + last epoch) -->
+  <section class="section" data-section="today">
+    <div class="row-card">
+      <h2 id="epoch-title">This epoch</h2>
+      <div class="epoch-bar"><div id="epoch-bar-fill" class="epoch-bar-fill"></div></div>
+      <div class="legend" id="epoch-sub">…</div>
+    </div>
+    <div class="flex-row">
+      <div class="row-card" style="flex:1;">
+        <h2>Current epoch — pace</h2>
+        <div class="grid" id="epoch-current"></div>
+      </div>
+      <div class="row-card" style="flex:1;">
+        <h2>Last epoch — recap</h2>
+        <div class="grid" id="epoch-last"></div>
+      </div>
+    </div>
+    <div class="row-card">
+      <h2>Epoch prize pools (whole network, this epoch)</h2>
+      <div class="grid" id="epoch-pools"></div>
+      <div class="legend">Total NOOK the gateway emits this epoch, split across tracks. Your share scales with solves/verifies × your tier multiplier.</div>
+    </div>
+  </section>
+
+  <!-- Reputation -->
+  <section class="section" data-section="reputation">
+    <p class="explainer">
+      <strong>What's here:</strong> contribution score (gateway-computed daily across 10 activity categories),
+      our velocity multiplier (boost on drip + payouts), and per-domain expertise tags. <strong>Authorship rights
+      unlock at 50+ verified solves in one domain</strong> — that's a perpetual 10% royalty stream on every
+      challenge we author there. The progress bars show how far each domain is from that gate.
+    </p>
+    <div class="grid" id="reputation-cards"></div>
+    <div class="row-card" id="experiments-card"></div>
+    <div class="row-card">
+      <h2>Contribution breakdown — score by category</h2>
+      <p class="explainer">
+        10 categories scored daily. Categories where we have <strong>zero</strong> score are leaving free drip
+        on the table — diversification across all 10 maxes daily NOOK earn rate.
+      </p>
+      <div id="contrib-breakdown"></div>
+    </div>
+    <div class="row-card">
+      <h2>Expertise tags — racing toward authorship</h2>
+      <p class="explainer">
+        Each tag is activity-verified by the gateway. <strong>evidenceCount</strong> is solves/verifications we've
+        done in that domain. Reach 50 in one tag → authorship rights unlock → we can post our own challenges and
+        earn 10% royalties forever.
+      </p>
+      <div id="expertise-list"></div>
+    </div>
+    <div class="row-card">
+      <h2>Authorship rights</h2>
+      <div id="authorship-status"></div>
+    </div>
+  </section>
+
+  <!-- Activity -->
+  <section class="section" data-section="activity">
+    <p class="explainer">
+      <strong>What's here:</strong> per-track counters showing total + today's activity, plus a live tail of the
+      bot's log. <strong>Paper-repro opportunities</strong> are winner-take-all ML challenges that need GPU
+      training (we catalog; humans execute). Everything else is automated.
+    </p>
+    <div class="row-card">
+      <h2>Side-track counters (parity with TUI dashboard)</h2>
+      <div class="grid" id="sidetracks-grid"></div>
+    </div>
+    <div class="row-card">
+      <h2>Paper-reproduction opportunities (winner-take-all)</h2>
+      <div id="paper-repro-list" class="legend">none discovered yet</div>
+    </div>
+    <div class="row-card">
+      <h2>Recent activity (bot log tail)</h2>
+      <div class="legend" id="log-meta">…</div>
+      <div class="log-feed" id="log-feed">loading…</div>
+    </div>
+  </section>
+
+  <!-- Credits -->
+  <section class="section" data-section="credits">
+    <p class="explainer">
+      <strong>What's here:</strong> gateway service-fee credits (NOT NOOK — different currency). We're at tier
+      2 (200 relays/day at 0.10 cr each). Daily drip earns up to 45 cr/day if we hit all 6 activity categories
+      — see Reputation tab for which categories we're missing.
+    </p>
+    <div class="row-card">
+      <h2>Credit balance + usage</h2>
+      <div class="grid" id="credits-summary"></div>
+    </div>
+    <div class="row-card">
+      <h2>How to get more credits</h2>
+      <div id="credits-methods"></div>
+    </div>
+    <div class="row-card">
+      <h2>Buy credit packs (USDC, on-chain)</h2>
+      <div class="grid" id="credit-packs"></div>
+      <div class="legend" id="credit-pack-legend">CreditPurchase contract: <code>?</code></div>
+    </div>
+    <div class="row-card">
+      <h2>Last 20 transactions</h2>
+      <table id="credits-tx-tbl">
+        <thead><tr><th>Time</th><th>Type</th><th>Amount</th><th>Balance after</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Performance -->
+  <section class="section" data-section="performance">
+    <p class="explainer">
+      <strong>What's here:</strong> mining throughput vs the daily 13-cap (12 regular + 1 guild-exclusive),
+      per-model A/B comparison (5-way), and verifier scoring variance (last 20). <strong>Submit-rate</strong>
+      means "% of attempts that landed cleanly (pass or deferred)." Pass-rate stays at "—" until the network's
+      3-verifier quorum gate clears our submissions.
+    </p>
+    <div class="grid" id="perf-cards"></div>
+    <div class="row-card">
+      <h2>By model — last 24h</h2>
+      <table id="model-tbl">
+        <thead><tr><th>Model</th><th>n</th><th>pass</th><th>deferred</th><th>error</th><th>submit-rate</th><th>est NOOK</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="flex-row">
+      <div class="row-card" style="flex:1">
+        <h2>Mining attempts — last 7d</h2>
+        <div class="chart-wrap"><canvas id="mining-timeseries"></canvas></div>
+      </div>
+      <div class="row-card" style="flex:1">
+        <h2>Trace specificity — verifier scoring trend (last 20)</h2>
+        <div class="chart-wrap"><canvas id="verification-trend"></canvas></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- vs Peers -->
+  <section class="section" data-section="peers">
+    <p class="explainer">
+      <strong>What's here:</strong> our rank vs other solvers active in the verifiable pool right now.
+      Note: the gateway hides our own submissions from us when we query — what you see is from the
+      perspective of an outside observer. Top solvers tend to concentrate in 1-2 domains; we're using a
+      soft-specialization preference for <code>distributed-systems</code>.
+    </p>
+    <div class="grid" id="peers-cards"></div>
+    <div class="row-card">
+      <h2>Our position in the verifiable pool</h2>
+      <div id="peer-position"></div>
+    </div>
+    <div class="row-card">
+      <h2>Top 10 active solvers (by pool presence)</h2>
+      <table id="peers-tbl">
+        <thead><tr><th>Rank</th><th>Address</th><th>Subs in pool</th><th>Near quorum (≥v2)</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Blockers -->
+  <section class="section" data-section="blockers">
+    <p class="explainer">
+      <strong>What's here:</strong> issues currently slowing us down, color-coded by severity and split between
+      <strong>network</strong> (out of our control) and <strong>us</strong> (we can fix). Network v0% above 70%
+      means verifier supply is starved. Our own avg verifier count rising toward 3 means our submissions are
+      approaching quorum.
+    </p>
+    <div class="row-card">
+      <h2>Active blockers</h2>
+      <div id="blockers-list"></div>
+    </div>
+    <div class="flex-row">
+      <div class="row-card" style="flex:1">
+        <h2>Network v0% over time</h2>
+        <div class="chart-wrap"><canvas id="network-v0-trend"></canvas></div>
+        <div class="legend">Higher v0% = more submissions stuck without any verifier. Trending up = network getting more starved.</div>
+      </div>
+      <div class="row-card" style="flex:1">
+        <h2>Our average verifier count over time</h2>
+        <div class="chart-wrap"><canvas id="my-avg-vcount"></canvas></div>
+        <div class="legend">Average verifications collected on our pending submissions. Trending up = our work getting picked up. Quorum = 3.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- History -->
+  <section class="section" data-section="history">
+    <p class="explainer">
+      <strong>What's here:</strong> the bot's all-time earnings timeline. <strong>Claimed</strong> is what's
+      already settled to wallet or gateway ledger. <strong>Expected (24h deferred)</strong> is NOOK in flight
+      — submissions awaiting quorum. Conversion ratio tells you what fraction of our work has actually paid
+      out. Network snapshots show the verifier-supply trend.
+    </p>
+    <div class="row-card">
+      <h2>Earned vs expected NOOK (24h window)</h2>
+      <div id="earnings-status"></div>
+    </div>
+    <div class="row-card">
+      <h2>Daily earnings (USD)</h2>
+      <p class="explainer" id="usd-earnings-note"></p>
+      <div class="chart-wrap short"><canvas id="usd-earnings-chart"></canvas></div>
+    </div>
+    <div class="row-card">
+      <h2>💹 P&amp;L — earnings vs inference spend</h2>
+      <p class="explainer" id="pnl-note"></p>
+      <div class="chart-wrap short"><canvas id="pnl-chart"></canvas></div>
+      <table id="pnl-tbl" style="margin-top:10px">
+        <thead><tr><th>day</th><th>earned</th><th>spent</th><th>net</th><th>calls</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="row-card">
+      <h2>Claim history</h2>
+      <div class="chart-wrap short"><canvas id="claim-chart"></canvas></div>
+    </div>
+    <div class="row-card">
+      <h2>Network status snapshots</h2>
+      <table id="netstat-tbl">
+        <thead><tr><th>Time</th><th>Epoch</th><th>Pool</th><th>v0</th><th>v1</th><th>v2</th><th>RLM pending</th><th>Our pending</th><th>Claim balance</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- MCP Tracks -->
+  <section class="section" data-section="mcp">
+    <p class="explainer">
+      <strong>What's here:</strong> the new earning + diagnostic tracks scraped from the official Nookplot
+      MCP catalog and implemented as raw-API modules in our bot. Each track has its own JSONL log under
+      <code>~/.nookplot/</code> and its own environment-variable toggle. Default behavior is browse-only
+      logging — only the tracks with <code>BOT_*_AUTO_*=1</code> set ever take active write actions.
+    </p>
+    <div class="grid" id="mcp-tracks-grid"></div>
+    <div class="row-card">
+      <h2>Verdict timeline (V9 composite scores on our submissions)</h2>
+      <p class="explainer">
+        Per-submission composite verdict (0-100). Higher trend = our content is improving. Falling
+        trend = either we're slipping, or the network rubric tightened. Look at the raw verdicts +
+        rubric CIDs (via <code>/api/verdicts</code>) to root-cause.
+      </p>
+      <canvas id="verdict-timeline" height="120"></canvas>
+    </div>
+    <div class="row-card">
+      <h2>What each track does</h2>
+      <table style="width:100%">
+        <thead><tr><th>Track</th><th>Module</th><th>What it does</th><th>Toggle (env)</th></tr></thead>
+        <tbody>
+          <tr><td>💰 Bounties</td><td><code>bounties.ts</code></td><td>Logs matched native + external (Immunefi/Code4rena) bug bounties in our domains. Apply is manual.</td><td><code>BOT_BOUNTY_LOOP</code></td></tr>
+          <tr><td>❓ Clarifications</td><td><code>clarifications.ts</code></td><td>Micro-jobs: agents pay credit for short Q&amp;A. Logs matches; auto-offer behind <code>BOT_CLARIFY_AUTO_OFFER=1</code>.</td><td><code>BOT_CLARIFY_LOOP</code></td></tr>
+          <tr><td>🐝 Swarms</td><td><code>swarms.ts</code></td><td>Distributed work decomposed into subtasks. Browses; auto-claim behind <code>BOT_SWARM_AUTO_CLAIM=1</code>.</td><td><code>BOT_SWARM_LOOP</code></td></tr>
+          <tr><td>🏆 Weekly rewards</td><td><code>weekly-rewards.ts</code></td><td>Contribution-tier weekly epoch. Logs unclaimed amounts; claim sweeps via existing Merkle flow.</td><td><code>BOT_WEEKLY_REWARDS_LOOP</code></td></tr>
+          <tr><td>📚 Teaching</td><td><code>teaching.ts</code></td><td>Teaching marketplace. Logs incoming requests; accept+deliver is manual.</td><td><code>BOT_TEACHING_LOOP</code></td></tr>
+          <tr><td>📡 Attention</td><td><code>attention-signals.ts</code></td><td>Gateway-side notifications when work matches our profile. Polls + auto-acks.</td><td><code>BOT_ATTENTION_LOOP</code></td></tr>
+          <tr><td>🔍 Diagnostics</td><td><code>diagnostics.ts</code></td><td>V9 verdicts + my-verifications + authorship rights — gateway-truth, not local log.</td><td><code>BOT_DIAGNOSTICS_LOOP</code></td></tr>
+          <tr><td>📲 Subscriptions</td><td><code>subscriptions.ts</code></td><td>Push-instead-of-poll via webhooks. Only active when <code>BOT_WEBHOOK_URL</code> is set.</td><td><code>BOT_WEBHOOK_URL</code></td></tr>
+          <tr><td>🌐 Network wiki</td><td><code>network-wiki.ts</code></td><td>Free curated domain summaries; pulled into mining-context for every solve.</td><td>(always on)</td></tr>
+          <tr><td>📄 Semantic Scholar</td><td><code>papers.ts</code></td><td>Paper search + citation graph; augments mining context.</td><td>(always on)</td></tr>
+          <tr><td>🤗 HF datasets</td><td><code>hf-dataset.ts</code></td><td>Validates HF datasets before replication/prediction challenges.</td><td>(on-demand)</td></tr>
+          <tr><td>📈 Oracle</td><td><code>oracle.ts</code></td><td>Verified data snapshots for prediction verifier_kind.</td><td>(on-demand)</td></tr>
+          <tr><td>📊 Mining dataset</td><td><code>mining-dataset.ts</code></td><td>Browse high-scoring peer traces.</td><td>(on-demand)</td></tr>
+          <tr><td>📊 A/B results</td><td><code>ab-results.ts</code></td><td>Network-wide A/B harness analytics; cross-checks our per-model stats.</td><td>(on-demand)</td></tr>
+          <tr><td>🌍 Ecosystem</td><td><code>ecosystem.ts</code></td><td>Partner-protocol (Botcoin, Hermes, etc.) stats + leaderboards.</td><td>(periodic)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Raw -->
+  <section class="section" data-section="raw">
+    <p class="explainer">
+      <strong>What's here:</strong> the full <code>/api/snapshot</code> response as raw JSON — useful for
+      debugging, scripting, or finding fields not yet surfaced in the other tabs. Re-fetched on each refresh.
+    </p>
+    <div class="row-card">
+      <h2>Latest /api/snapshot</h2>
+      <pre id="raw-snapshot" style="background:var(--panel-2);padding:12px;border-radius:4px;overflow:auto;max-height:600px;font-size:11px;font-family:var(--mono)"></pre>
+    </div>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script>
+let snapshot = null;
+let networkHistory = null;
+let miningHistory = null;
+let verificationHistory = null;
+let claimsHistory = null;
+let dailyEarnings = null;
+let logFeed = null;
+let sidetracks = null;
+let credits = null;
+let solveFunnel = null;
+let epochProgress = null;
+let projectReview = null;
+let myProjects = null;
+let experimentsData = null;
+let inboxData = null;
+let capacityData = null;
+let charts = {};
+
+// ─── helpers ───
+function fmt(n, frac = 0) {
+  if (n === null || n === undefined) return "?";
+  if (typeof n !== "number") return String(n);
+  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return n.toFixed(frac);
+}
+function pct(num, den) {
+  if (!den || den === 0) return "0%";
+  return Math.round((num / den) * 100) + "%";
+}
+function usdFmt(n) {
+  if (n == null || isNaN(n)) return "$0";
+  const abs = Math.abs(n);
+  if (abs === 0) return "$0";
+  if (abs < 0.01) return "$" + Number(n.toPrecision(3));            // tiny price: $0.0000178
+  if (abs < 1000) return "$" + n.toFixed(2);                         // $10.30
+  return "$" + n.toLocaleString(undefined, { maximumFractionDigits: 0 }); // $1,234
+}
+function shortAddr(a) {
+  if (!a) return "?";
+  return a.slice(0, 8) + "…" + a.slice(-4);
+}
+function fmtAge(iso) {
+  if (!iso) return "?";
+  const ms = Date.now() - new Date(iso).getTime();
+  if (ms < 60_000) return Math.round(ms / 1000) + "s ago";
+  if (ms < 3600_000) return Math.round(ms / 60_000) + "m ago";
+  if (ms < 86_400_000) return Math.round(ms / 3600_000) + "h ago";
+  return Math.round(ms / 86_400_000) + "d ago";
+}
+function tierPill(tier) {
+  if (!tier) return "";
+  return `<span class="tier-pill ${tier}">${tier}</span>`;
+}
+
+// ─── tabs ───
+function activateTab(name) {
+  const tab = document.querySelector(`.tab[data-tab="${name}"]`);
+  const section = document.querySelector(`.section[data-section="${name}"]`);
+  if (!tab || !section) return false;
+  document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
+  document.querySelectorAll(".section").forEach((x) => x.classList.remove("active"));
+  tab.classList.add("active");
+  section.classList.add("active");
+  renderActiveTab();
+  return true;
+}
+document.querySelectorAll(".tab").forEach((t) => {
+  t.addEventListener("click", () => {
+    activateTab(t.dataset.tab);
+    history.replaceState(null, "", `#${t.dataset.tab}`);
+  });
+});
+// Deep-link: open the tab named in the URL hash (e.g. /#today), and follow hash changes.
+if (location.hash.length > 1) activateTab(location.hash.slice(1));
+window.addEventListener("hashchange", () => activateTab(location.hash.slice(1)));
+
+// ─── fetch ───
+// Use the injected auth token if WEB_AUTH_TOKEN is set server-side. No-op otherwise.
+function apiFetch(url) {
+  const headers = window.__AUTH_TOKEN__ ? { Authorization: `Bearer ${window.__AUTH_TOKEN__}` } : {};
+  return fetch(url, { headers }).then((r) => r.json());
+}
+
+// ─── daemon running indicator ───
+function fmtAgo(s) {
+  if (s == null) return "";
+  if (s < 90) return `${s}s ago`;
+  if (s < 5400) return `${Math.round(s / 60)}m ago`;
+  return `${Math.round(s / 3600)}h ago`;
+}
+async function refreshBotStatus() {
+  const el = document.getElementById("bot-status");
+  if (!el) return;
+  try {
+    const h = await apiFetch("/api/health");
+    const d = h && h.daemon ? h.daemon : { running: false, lastActivityAgoSec: null };
+    const ago = fmtAgo(d.lastActivityAgoSec);
+    if (d.running) {
+      el.className = "bot-status running";
+      el.textContent = "● bot running";
+      el.title = `daemon (src/index.ts) is up${ago ? ` · last activity ${ago}` : ""}`;
+    } else {
+      el.className = "bot-status stopped";
+      el.textContent = "● bot stopped";
+      el.title = `daemon (src/index.ts) not detected${ago ? ` · last activity ${ago}` : ""} — start it with DRY_RUN=false npm start`;
+    }
+  } catch {
+    el.className = "bot-status unknown";
+    el.textContent = "● status unknown";
+    el.title = "could not reach /api/health";
+  }
+}
+
+async function loadAll() {
+  document.getElementById("last-refresh").textContent = "loading…";
+  try {
+    const [snap, net, mining, verify, claims, earn, log, st, cr, fn, ep, pr, mp, experiments, ib, cap] = await Promise.all([
+      apiFetch("/api/snapshot"),
+      apiFetch("/api/history?metric=network"),
+      apiFetch("/api/history?metric=mining"),
+      apiFetch("/api/history?metric=verification"),
+      apiFetch("/api/history?metric=claims"),
+      apiFetch("/api/history?metric=daily-earnings"),
+      apiFetch("/api/log?limit=200"),
+      apiFetch("/api/sidetracks"),
+      apiFetch("/api/credits"),
+      apiFetch("/api/solve-funnel"),
+      apiFetch("/api/epoch-progress"),
+      apiFetch("/api/project-review"),
+      apiFetch("/api/my-projects"),
+      apiFetch("/api/experiments"),
+      apiFetch("/api/inbox"),
+      apiFetch("/api/capacity"),
+    ]);
+    snapshot = snap;
+    networkHistory = Array.isArray(net) ? net : [];
+    miningHistory = Array.isArray(mining) ? mining : [];
+    verificationHistory = Array.isArray(verify) ? verify : [];
+    claimsHistory = Array.isArray(claims) ? claims : [];
+    dailyEarnings = earn && Array.isArray(earn.series) ? earn : { series: [], priceUsd: 0, priceSource: "unavailable" };
+    logFeed = log;
+    sidetracks = st;
+    credits = cr;
+    solveFunnel = fn;
+    epochProgress = ep;
+    projectReview = pr;
+    myProjects = mp;
+    experimentsData = experiments;
+    inboxData = ib;
+    capacityData = cap;
+    document.getElementById("last-refresh").textContent = new Date().toLocaleTimeString();
+    refreshBotStatus();
+    document.getElementById("agent-name").textContent = snapshot.agent?.name ?? "?";
+    document.getElementById("agent-addr").textContent = shortAddr(snapshot.agent?.address ?? "");
+    renderActiveTab();
+  } catch (e) {
+    document.getElementById("last-refresh").textContent = "ERROR: " + e.message;
+    console.error(e);
+  }
+}
+
+function renderActiveTab() {
+  if (!snapshot) return;
+  const active = document.querySelector(".tab.active").dataset.tab;
+  if (active === "overview") renderOverview();
+  else if (active === "today") renderToday();
+  else if (active === "reputation") renderReputation();
+  else if (active === "activity") renderActivity();
+  else if (active === "performance") renderPerformance();
+  else if (active === "peers") renderPeers();
+  else if (active === "blockers") renderBlockers();
+  else if (active === "history") renderHistory();
+  else if (active === "credits") renderCredits();
+  else if (active === "mcp") renderMcpTracks();
+  else if (active === "raw") renderRaw();
+}
+
+function renderMcpTracks() {
+  const t = snapshot.mcpTracks ?? {};
+  const grid = document.getElementById("mcp-tracks-grid");
+  if (!grid) return;
+  const cards = [
+    { name: "💰 Bounties", val: `${t.bounties?.totalCandidates ?? 0} candidates`, sub: `${t.bounties?.last24h ?? 0} new (24h) · ${t.bounties?.applicationsSubmitted ?? 0} apps` },
+    { name: "❓ Clarifications", val: `${t.clarifications?.totalCandidates ?? 0} matched`, sub: `${t.clarifications?.candidatesLast24h ?? 0} (24h) · ${t.clarifications?.offersToday ?? 0} offers today` },
+    { name: "🐝 Swarms", val: `${t.swarms?.candidatesLast24h ?? 0} new (24h)`, sub: `${t.swarms?.claimsHeld ?? 0} held · ${t.swarms?.submitsToday ?? 0} submitted today` },
+    { name: "🏆 Weekly rewards", val: t.weeklyRewards?.currentEpoch != null ? `epoch #${t.weeklyRewards.currentEpoch}` : "—", sub: `${t.weeklyRewards?.unclaimedCount ?? 0} unclaimed · tier=${t.weeklyRewards?.currentTier ?? "?"}` },
+    { name: "📚 Teaching", val: `${t.teaching?.exchangesIncoming ?? 0} incoming`, sub: `${t.teaching?.exchangesDelivered ?? 0} delivered · ${t.teaching?.totalExchangesAllAgents ?? "?"} network-wide` },
+    { name: "📡 Attention", val: `${t.attention?.signalsLast24h ?? 0} (24h)`, sub: `${t.attention?.totalSignals ?? 0} total · ${t.attention?.geometricMatchesLast24h ?? 0} match-geo` },
+    { name: "🔍 Diagnostics", val: `${t.diagnostics?.verdictsLogged ?? 0} verdicts`, sub: `${t.diagnostics?.authorshipUnlocked ?? 0}/${t.diagnostics?.authorshipDomains ?? 0} domains unlocked · ${t.diagnostics?.crowdScoresGiven ?? 0} crowd-scores` },
+    { name: "📲 Subscriptions", val: `${t.subscriptions?.active ?? 0} active`, sub: t.subscriptions?.webhookConfigured ? "webhook ON" : "polling (default)" },
+    { name: "🌐 Egress proxy", val: `${t.egress?.callsToday ?? 0}/${Math.round((t.egress?.budgetCredits ?? 5) / 0.15)} calls`, sub: `${(t.egress?.spentTodayCredits ?? 0).toFixed(2)} cr today · ${(t.egress?.remainingCredits ?? 0).toFixed(2)} cr left` },
+  ];
+  grid.innerHTML = cards.map((c) => `
+    <div class="card">
+      <div class="card-label">${c.name}</div>
+      <div class="card-val">${c.val}</div>
+      <div class="card-sub">${c.sub}</div>
+    </div>`).join("");
+  renderVerdictTimeline();
+}
+
+async function renderVerdictTimeline() {
+  const canvas = document.getElementById("verdict-timeline");
+  if (!canvas) return;
+  try {
+    const r = await apiFetch("/api/verdicts");
+    const verdicts = (r.verdicts ?? [])
+      .map((v) => v.details)
+      .flat()
+      .filter((x) => x && typeof x === "object" && x.composite != null && x.ts);
+    if (verdicts.length === 0) {
+      canvas.parentElement.querySelector(".explainer").textContent = "No verdicts logged yet. Diagnostics tick fires every 2h.";
+      return;
+    }
+    const sorted = verdicts.slice(-50).sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
+    if (charts.verdictTimeline) charts.verdictTimeline.destroy();
+    charts.verdictTimeline = new Chart(canvas, {
+      type: "line",
+      data: {
+        labels: sorted.map((v) => new Date(v.ts).toLocaleDateString()),
+        datasets: [{ label: "Composite score (0-100)", data: sorted.map((v) => v.composite), borderColor: "#7c3aed", tension: 0.2 }],
+      },
+      options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, max: 100 } } },
+    });
+  } catch (e) {
+    console.warn("verdict-timeline render error", e);
+  }
+}
+
+function renderReputation() {
+  const r = snapshot.reputation;
+  const a = snapshot.authorship;
+  const AUTHORSHIP_GATE = 50;
+  if (!r) {
+    document.getElementById("reputation-cards").innerHTML =
+      `<div class="empty">Reputation data unavailable — /v1/contributions/:addr returned null</div>`;
+    return;
+  }
+  const cards = [
+    {
+      label: "Contribution score",
+      big: `<span class="accent">${fmt(r.score, 0)}</span>`,
+      sub: `velocity multiplier ${r.velocityMultiplier.toFixed(2)}× • computed ${fmtAge(r.computedAt)}`,
+    },
+    {
+      label: "Velocity multiplier",
+      big: `<span class="good">${r.velocityMultiplier.toFixed(2)}×</span>`,
+      sub: `applies to daily drip + payouts • boosted by diverse activity`,
+    },
+    {
+      label: "Verified expertise tags",
+      big: `<span class="magenta">${r.expertiseTags.length}</span>`,
+      sub: `activity-verified domains (1.0 confidence)`,
+    },
+    {
+      label: "Authorship rights unlocked",
+      big: a && a.unlocked && a.unlocked.length > 0
+        ? `<span class="good">${a.unlocked.length}</span>`
+        : `<span class="muted">0</span>`,
+      sub: a && a.unlocked && a.unlocked.length > 0
+        ? `domains: ${a.unlocked.map((x) => x.domain).join(", ")}`
+        : `tracking ${a?.trackedDomains ?? 0} domains; need 50 verified solves in one to unlock`,
+    },
+  ];
+  document.getElementById("reputation-cards").innerHTML = cards
+    .map((c) => `<div class="card"><h3>${c.label}</h3><div class="big">${c.big}</div><div class="sub">${c.sub}</div></div>`)
+    .join("");
+
+  // Contribution breakdown
+  const breakdown = r.breakdown ?? {};
+  const total = Object.values(breakdown).reduce((s, x) => s + (x || 0), 0) || 1;
+  const rows = Object.entries(breakdown)
+    .sort((a, b) => b[1] - a[1])
+    .map(([cat, score]) => {
+      const pct = ((score / total) * 100).toFixed(1);
+      const zero = score === 0;
+      const cls = zero ? "muted" : score >= 1000 ? "good" : score >= 100 ? "accent" : "warn";
+      const note = zero
+        ? `<span class="muted">no activity yet — onboarding loop should fix marketplace + projects</span>`
+        : `<span class="${cls}">${fmt(score, 0)}</span> <span class="muted">(${pct}% of total)</span>`;
+      return `<tr><td><code>${escapeHtml(cat)}</code></td><td>${note}</td></tr>`;
+    });
+  document.getElementById("contrib-breakdown").innerHTML =
+    `<table style="width:100%"><tbody>${rows.join("")}</tbody></table>`;
+
+  // Expertise tags with progress bars toward 50-solve authorship gate
+  const expHtml = r.expertiseTags.length === 0
+    ? `<div class="empty">No verified expertise tags yet — start solving challenges to accumulate evidence</div>`
+    : `<table style="width:100%"><thead><tr><th>Tag</th><th>Evidence</th><th>Confidence</th><th>Progress to authorship (50)</th></tr></thead><tbody>` +
+      r.expertiseTags.map((t) => {
+        const ev = t.evidenceCount ?? 0;
+        const pct = Math.min(100, (ev / AUTHORSHIP_GATE) * 100);
+        const cls = ev >= AUTHORSHIP_GATE ? "good" : ev >= 20 ? "accent" : "warn";
+        return `<tr>
+          <td><span class="tag-chip${ev >= AUTHORSHIP_GATE ? ' unlock' : ''}">${escapeHtml(t.tag)}</span></td>
+          <td><span class="${cls}">${ev}</span></td>
+          <td>${(t.confidence ?? 0).toFixed(2)}</td>
+          <td><div class="bar-bg"><div class="bar-fill-rep" style="width:${pct}%"></div></div>
+            <div class="exp-card-sub">${ev}/${AUTHORSHIP_GATE} ${ev >= AUTHORSHIP_GATE ? '— UNLOCKED 🎉' : `— need ${AUTHORSHIP_GATE - ev} more`}</div></td>
+        </tr>`;
+      }).join("") + `</tbody></table>`;
+  document.getElementById("expertise-list").innerHTML = expHtml;
+
+  // Authorship status — show unlocked + nearest-unlock progress
+  let authBody = "";
+  if (a && a.unlocked && a.unlocked.length > 0) {
+    authBody = `<div class="good">Unlocked in ${a.unlocked.length} domain${a.unlocked.length === 1 ? '' : 's'}:</div>
+       <table style="width:100%; margin-top:8px"><thead><tr><th>Domain</th><th>Solves</th><th>Authored</th><th>Royalties</th></tr></thead><tbody>` +
+       a.unlocked.map(x => `<tr><td><strong class="good">${escapeHtml(x.domain)}</strong></td><td>${x.solvesInDomain}</td><td>${x.challengesAuthored}</td><td>${x.totalRoyalties} NOOK</td></tr>`).join("") +
+       `</tbody></table>
+       <p class="exp-card-sub">Authoring a challenge in an unlocked domain earns 10% royalty on every solve forever. Use <code>nookplot_author_mining_challenge</code>.</p>`;
+  } else {
+    authBody = `<div class="muted">Not yet — need 50+ verified solves in one domain.</div>`;
+  }
+  // Nearest-unlock list (gateway's view, more authoritative than local expertise tags)
+  if (a && a.nearestUnlock && a.nearestUnlock.length > 0) {
+    const hasAny = a.nearestUnlock.some((x) => x.solvesInDomain > 0);
+    authBody += `<h3 style="margin-top:14px; color:var(--muted); font-size:12px; text-transform:uppercase">Closest to unlock (gateway view)</h3>`;
+    if (hasAny) {
+      authBody += `<table style="width:100%"><thead><tr><th>Domain</th><th>Verified solves</th><th>Progress</th></tr></thead><tbody>` +
+        a.nearestUnlock.map((x) => {
+          const pct = Math.min(100, (x.solvesInDomain / 50) * 100);
+          return `<tr><td><code>${escapeHtml(x.domain)}</code></td><td>${x.solvesInDomain}/50</td><td><div class="bar-bg"><div class="bar-fill-rep" style="width:${pct}%"></div></div></td></tr>`;
+        }).join("") + `</tbody></table>`;
+    } else {
+      authBody += `<p class="muted">All ${a.nearestUnlock.length} tracked domains have 0 verified solves so far — quorum hasn't cleared any of our submissions yet (network-side bottleneck).</p>`;
+    }
+  }
+  document.getElementById("authorship-status").innerHTML = authBody;
+  renderExperiments();
+}
+
+// ─── render: exec/collab experiments ───
+function renderExperiments() {
+  const el = document.getElementById("experiments-card");
+  if (!el) return;
+  const x = experimentsData;
+  if (!x || !x.exec) { el.innerHTML = `<h2>Reputation experiments</h2><div class="empty">No experiment data yet.</div>`; return; }
+  const e = x.exec, c = x.collab, t = x.trend;
+  const matchPct = e.reruns ? Math.round((e.matchTrue / e.reruns) * 100) : 0;
+  const execCls = (x.dims && x.dims.exec > 0) ? "good" : "bad";
+  const collabCls = (x.dims && x.dims.collab > 0) ? "good" : "bad";
+  const recentRows = (e.recent || []).map((r) =>
+    `<tr><td>${escapeHtml((r.ts||"").slice(11,19))}</td><td><code>${escapeHtml(String(r.submissionId).slice(0,8))}</code></td>`
+    + `<td class="${r.match===true?'good':r.match===false?'bad':'muted'}">${r.match===true?'match':r.match===false?'MISMATCH':'?'}</td>`
+    + `<td class="muted">${escapeHtml(String(r.original??'').slice(0,40))} → ${escapeHtml(String(r.rerun??'').slice(0,40))}</td></tr>`
+  ).join("");
+  el.innerHTML =
+    `<h2>Reputation experiments — exec &amp; collab</h2>`
+    + `<p class="explainer">Two probes for the zeroed builder dims. <strong>exec</strong> = re-running others' verifiable artifacts; <strong>collab</strong> = peer reviews / contributions. Tracking whether the levers actually move the dims.</p>`
+    + `<div class="grid">`
+    + `<div class="card"><h3>exec dim</h3><div class="big ${execCls}">${x.dims?x.dims.exec:'?'}</div><div class="sub">${e.reruns} reruns • ${e.matchTrue} matched (${matchPct}%) • ${e.matchFalse} mismatch • ${e.abstains} abstained • ${e.landed} landed</div></div>`
+    + `<div class="card"><h3>collab dim</h3><div class="big ${collabCls}">${x.dims?x.dims.collab:'?'}</div><div class="sub">${escapeHtml(c.note)}</div></div>`
+    + `<div class="card"><h3>Trend (${t?t.snapshots:0} snapshots)</h3><div class="big">${t?(t.execDelta>=0?'+':'')+t.execDelta:'?'}<span class="muted" style="font-size:13px"> exec</span></div><div class="sub">collab Δ ${t?t.collabDelta:'?'} • score Δ ${t?t.scoreDelta:'?'} • since ${t?fmtAge(t.firstTs):'?'}</div></div>`
+    + `</div>`
+    + ((c.reviewsGiven && c.reviewsGiven.length) ? `<p class="explainer" style="margin-top:8px"><strong>Reviews given (collab probe):</strong> ${c.reviewsGiven.length} on-chain</p><table style="width:100%"><thead><tr><th>Date</th><th>Project</th><th>Author</th><th>Verdict</th></tr></thead><tbody>${c.reviewsGiven.slice().reverse().map((r) => `<tr><td>${escapeHtml((r.ts||'').slice(0,10))}</td><td>${escapeHtml(String(r.project).slice(0,42))}</td><td>${escapeHtml(String(r.author))}</td><td>${escapeHtml(r.verdict)}</td></tr>`).join('')}</tbody></table>` : '')
+    + `<p class="explainer" style="margin-top:8px"><strong>Verdict (exec):</strong> ${escapeHtml(e.verdict)}</p>`
+    + (recentRows ? `<table style="width:100%"><thead><tr><th>UTC</th><th>sub</th><th>rerun</th><th>original → rerun outcome</th></tr></thead><tbody>${recentRows}</tbody></table>` : `<p class="muted">No reruns recorded yet.</p>`);
+}
+
+// ─── render: overview ───
+function renderWinningPanel() {
+  const w = snapshot.winning;
+  const el = document.getElementById("winning-panel");
+  if (!el) return;
+  if (!w) {
+    el.innerHTML = `<div class="empty">No verdict data yet.</div>`;
+    return;
+  }
+  const cls = w.status === "winning" ? "good" : w.status === "mixed" ? "warn" : "bad";
+  const metrics = w.metrics ?? {};
+  el.innerHTML = `
+    <div class="verdict-panel">
+      <div>
+        <div class="verdict-status ${cls}">${escapeHtml(w.status).toUpperCase()} ${Math.round(w.score ?? 0)}</div>
+        <div class="legend">${escapeHtml(w.headline ?? "")}</div>
+        <div class="legend">
+          submit ${Math.round((metrics.submitRate ?? 0) * 100)}% ·
+          error ${Math.round((metrics.errorRate ?? 0) * 100)}% ·
+          v0 ${Math.round((metrics.networkV0Pct ?? 0) * 100)}%
+        </div>
+      </div>
+      <div>
+        <strong>Evidence</strong>
+        <ul class="verdict-list">${(w.reasons ?? []).map((r) => `<li>${escapeHtml(r)}</li>`).join("") || "<li>No positive evidence yet.</li>"}</ul>
+      </div>
+      <div>
+        <strong>Next best moves</strong>
+        <ul class="verdict-list">${(w.nextActions ?? []).map((r) => `<li>${escapeHtml(r)}</li>`).join("") || "<li>Keep current loops running.</li>"}</ul>
+      </div>
+    </div>
+  `;
+}
+
+function renderMoneyCards() {
+  const m = snapshot.money ?? {};
+  const w = m.wallet;
+  const cards = [
+    {
+      label: "Credits",
+      big: `<span class="muted">${fmt(m.credits?.balance ?? 0, 2)}</span>`,
+      sub: `gateway service fees<br>spent ${fmt(m.credits?.lifetimeSpent ?? 0, 1)} / earned ${fmt(m.credits?.lifetimeEarned ?? 0, 1)}`,
+    },
+    {
+      label: "Wallet NOOK (on Base)",
+      big: w
+        ? `<span class="good">${fmt(w.nook, 2)}</span>`
+        : '<span class="muted">—</span>',
+      sub: w
+        ? `block #${w.blockNumber}<br>refreshed ${fmtAge(w.fetchedAt)}`
+        : "RPC fetch failed",
+    },
+    {
+      label: "Wallet ETH (for gas)",
+      big: w
+        ? `<span class="${w.eth >= 0.001 ? 'good' : w.eth > 0 ? 'warn' : 'bad'}">${(w.eth ?? 0).toFixed(5)}</span>`
+        : '<span class="muted">—</span>',
+      sub: w
+        ? (w.eth >= 0.001 ? "enough for self-paid txs" : w.eth > 0 ? "low — relays still gasless" : "0 ETH — relays still gasless")
+        : "",
+    },
+    {
+      label: "NOOK staked",
+      big: `<span class="accent">${fmt(m.nookStaked ?? 0)}</span>`,
+      sub: `locked in MiningStake<br>${tierPill(snapshot.stake?.tier)} × ${snapshot.stake?.multiplier ?? 1}`,
+    },
+    {
+      label: "NOOK earned (lifetime)",
+      big: `<span class="good">${fmt(m.nookTotalEarned ?? 0, 0)}</span>`,
+      sub: `${snapshot.stake?.totalVerifications ?? 0} verifications + ${snapshot.stake?.totalSolves ?? 0} solves`,
+    },
+    {
+      label: "NOOK off-chain claimable",
+      big: `<span class="${(m.nookOffChainClaimable ?? 0) > 0 ? 'warn' : 'muted'}">${fmt(m.nookOffChainClaimable ?? 0, 0)}</span>`,
+      sub: `gateway-ledger IOU<br>auto-claims every 30 min`,
+    },
+    {
+      label: "NOOK on-chain unclaimed",
+      big: m.onChainProof
+        ? `<span class="${m.onChainProof.unclaimedThisEpoch > 0 ? 'warn' : 'good'}">${fmt(m.onChainProof.unclaimedThisEpoch, 0)}</span>`
+        : '<span class="muted">—</span>',
+      sub: m.onChainProof
+        ? `Merkle epoch ${m.onChainProof.epochNumber} • cumulative ${fmt(m.onChainProof.cumulativeAmount, 0)}<br>${m.onChainProof.unclaimedThisEpoch > 0 ? "auto-claims gaslessly" : "fully claimed"}`
+        : "no proof published yet",
+    },
+  ];
+  // === USD view (live NOOK market price) ===
+  const u = m.usd;
+  if (u && u.nookPriceUsd > 0) {
+    const chg = u.priceChange7d;
+    const chgStr = chg == null ? "" : `<span class="${chg >= 0 ? 'good' : 'bad'}">${chg >= 0 ? "▲" : "▼"} ${Math.abs(chg).toFixed(1)}% 7d</span>`;
+    cards.push(
+      {
+        label: "Earnings / day (USD)",
+        big: `<span class="good">${usdFmt(u.dailyUsdAvg7d)}</span>`,
+        sub: `7-day avg • ${fmt(u.dailyNookAvg7d, 0)} NOOK/day<br>last epoch ${usdFmt(u.lastDayUsd)}`,
+      },
+      {
+        label: "NOOK price (USD)",
+        big: `<span class="accent">${usdFmt(u.nookPriceUsd)}</span>`,
+        sub: `${chgStr}<br><span class="muted">${u.priceSource}</span>`,
+      },
+      {
+        label: "USD claimed (lifetime)",
+        big: `<span class="good">${usdFmt(u.cumulativeClaimedUsd)}</span>`,
+        sub: `${fmt(u.cumulativeClaimedNook, 0)} NOOK claimed on-chain<br>at current price`,
+      },
+    );
+  } else {
+    cards.push({
+      label: "Earnings / day (USD)",
+      big: '<span class="muted">price unavailable</span>',
+      sub: "CoinGecko fetch failed<br>set NOOK_USD_PRICE to pin a price",
+    });
+  }
+  document.getElementById("money-cards").innerHTML = cards
+    .map((c) => `<div class="card"><h3>${c.label}</h3><div class="big">${c.big}</div><div class="sub">${c.sub}</div></div>`)
+    .join("");
+}
+
+// ─── render: activity ───
+function colorizeLogLine(line) {
+  const lower = line.toLowerCase();
+  if (line.includes("✅") || / verified | claimed | passed | tx=0x/.test(line)) return "good";
+  if (line.includes("⚠") || lower.includes(" error") || lower.includes("failed") || lower.includes("revert")) return "bad";
+  if (line.includes("🌐")) return "network";
+  if (line.includes("💎")) return "mine";
+  if (line.includes("⛏") || line.includes("🛡") || line.includes("🛰") || line.includes("🎯") || line.includes("🔎") || line.includes("📚") || line.includes("✍") || line.includes("🧪") || line.includes("🧠") || line.includes("📦")) return "diamond";
+  if (line.includes("⏳") || line.includes("🔍") || line.includes("·")) return "muted";
+  return "";
+}
+
+function renderActivity() {
+  // Side-tracks grid
+  if (sidetracks) {
+    const t = sidetracks.total ?? {};
+    const today = sidetracks.last24h ?? {};
+    const items = [
+      { label: "Endorsements", total: t.endorsements, today: today.endorsements },
+      { label: "Knowledge published", total: t.knowledgePublished, today: today.knowledgePublished },
+      { label: "Learnings posted", total: t.learningsPosted, today: today.learningsPosted },
+      { label: "Predictions", total: t.predictions, today: today.predictions },
+      { label: "Crowd-jury", total: t.crowdJury, today: today.crowdJury },
+      { label: "Engagement", total: t.engagement, today: today.engagement },
+      { label: "RLM spot-checks", total: t.rlmSpotchecks, today: today.rlmSpotchecks },
+      { label: "Mining claims", total: t.miningClaims, today: today.miningClaims },
+      { label: "Paper-repro opps", total: t.paperReproOpportunities, today: today.paperReproOpportunities },
+      { label: "Citation events", total: t.citationVelocity, today: today.citationVelocity },
+      { label: "Workspaces created", total: t.workspaceSolves, today: today.workspaceSolves },
+      { label: "Votes (up)", total: t.votes, today: today.votes },
+      { label: "Follows", total: t.follows, today: today.follows },
+      { label: "Comments", total: t.comments, today: today.comments },
+      { label: "Onboarding actions", total: t.onboarding, today: null },
+      { label: "Network snapshots", total: t.networkStatusSnapshots, today: null },
+      { label: "Bounty A/B apps", total: t.abApplications, today: null },
+    ];
+    document.getElementById("sidetracks-grid").innerHTML = items.map((i) => {
+      const tcls = (i.total ?? 0) > 0 ? "good" : "muted";
+      const todayHtml = i.today === null ? "" : `<div class="sub">${i.today ?? 0} in last 24h</div>`;
+      return `<div class="card"><h3>${i.label}</h3><div class="big"><span class="${tcls}">${i.total ?? 0}</span></div>${todayHtml}</div>`;
+    }).join("");
+  }
+
+  // Paper-repro opportunities
+  const opps = snapshot.paperReproOpportunities ?? [];
+  const oppEl = document.getElementById("paper-repro-list");
+  if (oppEl) {
+    if (opps.length === 0) {
+      oppEl.innerHTML = `<span class="muted">No paper-reproduction challenges discovered yet. Bot polls every 30 min.</span>`;
+    } else {
+      oppEl.innerHTML = opps.map((o) => `
+        <div class="method">
+          <span class="effort med">${(o.difficulty ?? '?').toUpperCase().slice(0,4)}</span>
+          <div class="body">
+            <strong>${escapeHtml(o.title ?? o.challengeId.slice(0,12))}</strong>
+            <div class="detail">
+              ${o.estimatedReward ? fmt(o.estimatedReward,0) + ' NOOK est • ' : ''}
+              ${o.arxivIds && o.arxivIds.length ? 'arXiv: ' + o.arxivIds.slice(0,3).map((a) => `<code>${escapeHtml(a)}</code>`).join(', ') : 'no arXiv ID'}
+              • dossier at <code>knowledge-vault/research/paper-repro-${escapeHtml(o.challengeId.slice(0,12))}.md</code>
+              • ${fmtAge(o.ts)}
+            </div>
+          </div>
+        </div>
+      `).join("");
+    }
+  }
+
+  // Log feed
+  if (logFeed) {
+    const lines = logFeed.lines ?? [];
+    document.getElementById("log-meta").textContent = `${lines.length} lines from ${logFeed.path} • most recent at bottom`;
+    document.getElementById("log-feed").innerHTML = lines
+      .map((l) => `<div class="log-line ${colorizeLogLine(l)}">${escapeHtml(l)}</div>`)
+      .join("");
+    // Scroll to bottom
+    const feed = document.getElementById("log-feed");
+    feed.scrollTop = feed.scrollHeight;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// ─── render: credits ───
+function renderCredits() {
+  if (!credits) return;
+  const b = credits.balance ?? {};
+  document.getElementById("credits-summary").innerHTML = [
+    { label: "Available", big: `<span class="accent">${fmt(b.balance, 2)}</span>`, sub: `status: ${b.budgetStatus ?? "?"}` },
+    { label: "Lifetime spent", big: `<span class="bad">${fmt(b.lifetimeSpent, 2)}</span>`, sub: "" },
+    { label: "Lifetime earned", big: `<span class="good">${fmt(b.lifetimeEarned, 2)}</span>`, sub: "" },
+    { label: "Burn rate (last 20 tx)", big: (() => {
+      const txs = credits.transactions ?? [];
+      const spend = txs.filter((t) => t.amountCredits < 0).reduce((a, t) => a + Math.abs(t.amountCredits), 0) / 100; // amountCredits is in stored units (×100)
+      return `<span class="muted">${fmt(spend, 1)}</span>`;
+    })(), sub: "credits across the last 20 actions" },
+  ]
+    .map((c) => `<div class="card"><h3>${c.label}</h3><div class="big">${c.big}</div><div class="sub">${c.sub}</div></div>`)
+    .join("");
+
+  // Ways to get more
+  document.getElementById("credits-methods").innerHTML = (credits.waysToGetMore ?? [])
+    .map((m) => `<div class="method"><span class="effort ${m.effort}">${m.effort.toUpperCase()}</span><div class="body"><strong>${m.method}</strong><div class="detail">${m.detail}</div></div></div>`)
+    .join("");
+
+  // Packs
+  document.getElementById("credit-packs").innerHTML = (credits.packs ?? [])
+    .map((p) => `<div class="pack">
+      <div class="pack-name">${p.name}</div>
+      <div class="pack-price">$${p.usdcPrice} USDC</div>
+      <div class="pack-credits">${p.credits} credits • ${p.nookDiscount}% NOOK discount</div>
+    </div>`).join("");
+  document.getElementById("credit-pack-legend").innerHTML = `CreditPurchase: <code>${credits.creditPurchaseContract ?? "?"}</code> on Base • NOOK token: <code>${credits.nookTokenAddress ?? "?"}</code>`;
+
+  // Transactions
+  const tbody = document.querySelector("#credits-tx-tbl tbody");
+  const txs = credits.transactions ?? [];
+  if (txs.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="4" class="empty">No transactions yet.</td></tr>`;
+  } else {
+    tbody.innerHTML = txs.map((t) => {
+      const amt = t.amountCredits / 100;
+      const cls = amt < 0 ? "bad" : "good";
+      const bal = (t.balanceAfter / 100).toFixed(2);
+      return `<tr><td>${fmtAge(t.createdAt)}</td><td>${t.type}</td><td class="${cls}">${amt >= 0 ? "+" : ""}${amt.toFixed(2)}</td><td>${bal}</td></tr>`;
+    }).join("");
+  }
+}
+
+function renderToday() {
+  const ep = epochProgress;
+  const sub = document.getElementById("epoch-sub");
+  if (!ep || !ep.epoch) { if (sub) sub.textContent = "No epoch data yet."; return; }
+  const card = (label, big, s) => `<div class="card"><h3>${label}</h3><div class="big">${big}</div><div class="sub">${s}</div></div>`;
+  const fmt = (n) => Math.round(n ?? 0).toLocaleString();
+  const e = ep.epoch;
+  const pct = Math.round((e.elapsedFrac ?? 0) * 100);
+
+  document.getElementById("epoch-title").textContent = `Epoch ${e.number ?? "?"} · ${e.status ?? ""}`;
+  document.getElementById("epoch-bar-fill").style.width = `${pct}%`;
+  sub.innerHTML = `⏳ <strong>${e.humanRemaining ?? "?"}</strong> left · ${pct}% through this epoch (resets 02:00 UTC)`;
+
+  // NOOK from the already-fetched daily-earnings series (credited, lags real work)
+  const series = (dailyEarnings && dailyEarnings.series) || [];
+  const today = series[series.length - 1] || null;
+  const yest = series[series.length - 2] || null;
+  const srcStr = (d) => d && d.sources
+    ? Object.entries(d.sources).map(([k, v]) => `${k.replace('epoch_', '').replace('_claim', '')} ${Math.round(v / 1000)}k`).join(' · ')
+    : '—';
+
+  const cap = ep.caps.solve, vcap = ep.caps.verify, frac = e.elapsedFrac ?? 0;
+  const expSolves = Math.round(frac * cap), expVer = Math.round(frac * vcap);
+  const paceCls = (used, exp, max) => used >= max ? 'good' : used >= exp * 0.8 ? 'good' : used >= exp * 0.4 ? 'warn' : 'bad';
+  const paceNote = (used, exp, max) => used >= max ? 'maxed ✓' : used >= exp ? 'on pace' : `~${exp} expected by now`;
+  const cs = ep.current.solves;
+  document.getElementById("epoch-current").innerHTML = [
+    card("Solves used", `<span class="${paceCls(cs.submitted, expSolves, cap)}">${cs.submitted} / ${cap}</span>`, `${paceNote(cs.submitted, expSolves, cap)}${cs.pending ? ` · ${cs.pending} pending` : ''}`),
+    card("Verifies used", `<span class="${paceCls(ep.current.verifications, expVer, vcap)}">${ep.current.verifications} / ${vcap}</span>`, paceNote(ep.current.verifications, expVer, vcap)),
+    card("NOOK credited today", fmt(today?.nook), `$${(today?.usd ?? 0).toFixed(2)} · ${srcStr(today)}`),
+  ].join("");
+
+  const ls = ep.last.solves;
+  document.getElementById("epoch-last").innerHTML = [
+    card("Solves", `${ls.submitted}`, `submitted → <span class="good">${ls.paid} paid</span> · ${ls.pending} pending · ${ls.rejected} rej · ${ls.expired} exp`),
+    card("Verifies", `${ep.last.verifications}`, `${fmt(ls.paidNook)} NOOK from paid solves`),
+    card("NOOK credited", fmt(yest?.nook), `$${(yest?.usd ?? 0).toFixed(2)} · ${srcStr(yest)}`),
+  ].join("");
+
+  const pl = ep.pools;
+  document.getElementById("epoch-pools").innerHTML = [
+    card("Daily emission", fmt(pl.dailyEmission), "total NOOK this epoch"),
+    card("Solver pool", fmt(pl.agent), "all solvers share"),
+    card("Verifier pool", fmt(pl.verification), "all verifiers share"),
+    card("Guild pool", fmt(pl.guild), "guild mining"),
+    card("Poster pool", fmt(pl.poster), "challenge posting"),
+  ].join("");
+}
+
+function renderSolveFunnel() {
+  const el = document.getElementById("solve-funnel");
+  if (!el) return;
+  const f = solveFunnel;
+  if (!f || !f.buckets) { el.innerHTML = `<div class="empty">No submission data yet.</div>`; return; }
+  const b = f.buckets;
+  const total = (b.paid + b.pending + b.rejected + b.expired) || 1;
+  const pct = (n) => (n / total * 100).toFixed(1);
+  const paidRate = f.paidRate != null ? Math.round(f.paidRate * 100) : 0;
+  const expRate = f.expiredRate != null ? Math.round(f.expiredRate * 100) : 0;
+  const expCls = expRate >= 25 ? "bad" : expRate >= 15 ? "warn" : "good";
+  const seg = (n, color, label) => n > 0
+    ? `<div class="funnel-seg" style="width:${pct(n)}%;background:${color}" title="${label}: ${n} (${pct(n)}%)"></div>` : "";
+  el.innerHTML = `
+    <div class="funnel-bar">
+      ${seg(b.paid, 'var(--good)', 'Paid')}
+      ${seg(b.pending, 'var(--accent)', 'Pending')}
+      ${seg(b.rejected, 'var(--muted)', 'Rejected')}
+      ${seg(b.expired, 'var(--bad)', 'Expired')}
+    </div>
+    <div class="funnel-stats">
+      <span><span class="dot" style="background:var(--good)"></span>Paid ${b.paid}</span>
+      <span><span class="dot" style="background:var(--accent)"></span>Pending ${b.pending}</span>
+      <span><span class="dot" style="background:var(--muted)"></span>Rejected ${b.rejected}</span>
+      <span><span class="dot" style="background:var(--bad)"></span>Expired ${b.expired}</span>
+    </div>
+    <div class="legend">
+      Paid rate <strong class="good">${paidRate}%</strong> ·
+      Expired (forfeit) <strong class="${expCls}">${expRate}%</strong>${expRate >= 25 ? ' ← consider verifiable tilt' : ''} ·
+      ${(f.paidNookSum ?? 0).toLocaleString()} NOOK paid ·
+      pending median ${f.pending?.medianAgeH ?? '?'}h / oldest ${f.pending?.oldestAgeH ?? '?'}h ·
+      last ${f.windowSize} subs
+    </div>
+  `;
+}
+
+function renderProjectReview() {
+  const card = document.getElementById("project-review-card");
+  const el = document.getElementById("project-review");
+  if (!card || !el) return;
+  const p = projectReview && projectReview.pending;
+  if (!p) { card.style.display = "none"; return; }
+  card.style.display = "";
+  el.innerHTML = `
+    <div class="big" style="font-size:18px">${p.name}</div>
+    <div class="legend" style="margin:6px 0">${p.sourceCount} grounded sources · topic <code>${p.tag}</code> · drafted ${new Date(p.createdAt).toLocaleString()}</div>
+    <div class="legend"><strong>How it compares to peers:</strong> ${p.assessment || "(no peer data)"}</div>
+    <pre style="white-space:pre-wrap; background:var(--panel-2); border:1px solid var(--border); border-radius:6px; padding:10px; margin-top:8px; font-size:12px; max-height:220px; overflow:auto">${(p.excerpt || "").replace(/</g,"&lt;")}</pre>
+    <div class="legend" style="margin-top:8px">Decide from a terminal:
+      <code>npm run projects -- review</code> (full draft) ·
+      <code>npm run projects -- submit ${p.slug}</code> (approve) ·
+      <code>npm run projects -- pass ${p.slug}</code> (skip)
+    </div>`;
+}
+
+function renderMyProjects() {
+  const card = document.getElementById("my-projects-card");
+  const el = document.getElementById("my-projects");
+  if (!card || !el) return;
+  const ps = (myProjects && myProjects.projects) || [];
+  if (ps.length === 0) { card.style.display = "none"; return; }
+  card.style.display = "";
+  const badge = (st) => {
+    const cls = st === "approved" ? "good" : st === "rejected" ? "bad" : "warn";
+    return `<span class="${cls}">${st}</span>`;
+  };
+  el.innerHTML = ps.map((p) => `
+    <div style="padding:8px 0; border-bottom:1px solid var(--border)">
+      <div class="big" style="font-size:15px">${p.name} ${badge(p.reviewStatus)}</div>
+      <div class="legend">${p.commits} commit(s) · +${p.linesAdded} lines · ${p.approvals}✓/${p.rejections}✗ reviews · files: ${(p.files||[]).map((f)=>`<code>${f}</code>`).join(" ")}</div>
+    </div>`).join("");
+}
+
+function renderInbox() {
+  const card = document.getElementById("inbox-card");
+  const el = document.getElementById("inbox-panel");
+  const meta = document.getElementById("inbox-meta");
+  if (!card || !el) return;
+  const d = inboxData;
+  const threads = (d && d.threads) || [];
+  if (!d || threads.length === 0) { card.style.display = "none"; return; }
+  card.style.display = "";
+  const age = d.ageMinutes == null ? "" : ` · updated ${d.ageMinutes}m ago`;
+  if (meta) meta.textContent = `— ${d.unread} unread across ${d.threadCount} threads${age}`;
+  el.innerHTML = threads.map((t) => `
+    <div style="padding:8px 0; border-bottom:1px solid var(--border)">
+      <div><strong>${(t.from||"?").replace(/</g,"&lt;")}</strong>
+        <code style="font-size:10px">${(t.otherAddress||"").slice(0,12)}</code>
+        <span class="legend" style="text-transform:none">· ${t.messageType||"dm"} · ${t.unreadCount||0} unread</span></div>
+      <div class="legend" style="margin-top:2px; text-transform:none">${(t.preview||"").replace(/</g,"&lt;")}</div>
+    </div>`).join("") +
+    `<div class="legend" style="margin-top:8px; text-transform:none">Reply via <code>nookplot inbox send --to &lt;addr&gt; --message "…"</code> (operator decision). Flat list endpoint 500s; this reads <code>/v1/inbox/threads</code>.</div>`;
+}
+
+function renderCapacity() {
+  const card = document.getElementById("capacity-card");
+  const el = document.getElementById("capacity-panel");
+  const meta = document.getElementById("capacity-meta");
+  if (!card || !el) return;
+  const d = capacityData;
+  if (!d || !d.days || d.days.length === 0) { card.style.display = "none"; return; }
+  card.style.display = "";
+  if (meta) meta.textContent = `— wasting ~${d.wasted.miningPerDay} mining + ~${d.wasted.verifyPerDay} verify slots/day (14d avg)`;
+  const cellBar = (used, cap, pct) => {
+    const col = pct >= 90 ? "var(--green, #3fb950)" : pct >= 70 ? "var(--amber, #d6a132)" : "var(--red, #e5534b)";
+    const w = Math.max(2, Math.min(100, pct));
+    return `<div style="display:flex;align-items:center;gap:8px">
+      <div style="width:54px;font-family:var(--mono);font-size:11px">${used}/${cap}</div>
+      <div style="flex:1;background:var(--panel-2);height:9px;border-radius:5px;overflow:hidden"><div style="width:${w}%;height:100%;background:${col}"></div></div>
+      <div style="width:36px;text-align:right;font-family:var(--mono);font-size:11px;color:${col}">${pct}%</div></div>`;
+  };
+  const rows = d.days.slice().reverse().map((r) => `
+    <div style="padding:6px 0;border-bottom:1px solid var(--border)">
+      <div class="legend" style="text-transform:none;margin-bottom:3px">${r.date}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+        <div><div class="legend" style="text-transform:none;font-size:10px">mining</div>${cellBar(r.miningUsed, r.miningCap, r.miningPct)}</div>
+        <div><div class="legend" style="text-transform:none;font-size:10px">verify</div>${cellBar(r.verifyUsed, r.verifyCap, r.verifyPct)}</div>
+      </div>
+    </div>`).join("");
+  const warn = d.underuse ? `<div style="margin-bottom:8px;color:var(--red,#e5534b)">⚠ ${d.underuse}</div>` : "";
+  el.innerHTML = warn + rows;
+}
+
+function renderOverview() {
+  const s = snapshot;
+  renderProjectReview();
+  renderMyProjects();
+  renderInbox();
+  renderCapacity();
+  renderWinningPanel();
+  renderSolveFunnel();
+  renderMoneyCards();
+  const claimableTotal = Object.values(s.claimable).reduce((a, b) => a + b, 0);
+  const cards = [
+    {
+      label: "Pending solver subs",
+      big: `<span class="${s.mine?.pendingCount >= 5 ? 'warn' : 'accent'}">${s.mine?.pendingCount ?? 0}</span>`,
+      sub: `avg ${(s.mine?.avgVerifierCount ?? 0).toFixed(1)} verifiers • quorum=3`,
+    },
+    {
+      label: "Verifications done",
+      big: `<span class="good">${s.stake?.totalVerifications ?? 0}</span>`,
+      sub: "total all-time",
+    },
+    {
+      label: "RLM spot-checks",
+      big: `${s.rlm?.dailyDone ?? 0}/${s.rlm?.dailyCap ?? 10}`,
+      sub: `${s.rlm?.pending ?? 0} pending • gateway-enforced cap (per-wallet, doesn't scale with tier)`,
+    },
+    {
+      label: "Network epoch",
+      big: `<span class="muted">#${s.network?.epoch ?? "?"}</span>`,
+      sub: `${s.network?.epochStatus ?? "?"}${s.network?.emergencyReserve ? ' • <span class="bad">🚨 reserve</span>' : ""}`,
+    },
+    {
+      label: "Network v0%",
+      big: `<span class="${s.network?.blockedPct >= 0.7 ? "bad" : s.network?.blockedPct >= 0.4 ? "warn" : "good"}">${Math.round((s.network?.blockedPct ?? 0) * 100)}%</span>`,
+      sub: `${s.network?.pool?.total ?? 0} subs • ${s.network?.distinctSolvers ?? 0} solvers`,
+    },
+    {
+      label: "Specialization",
+      big: s.botMode?.specializeDomains?.length > 0
+        ? `<span class="magenta">${s.botMode.specializeDomains.join(",")}</span>`
+        : `<span class="muted">broad CS</span>`,
+      sub: s.botMode?.specializeDomains?.length > 0
+        ? `match=${s.botMode.specializeMatchMode} • racing to 50 verified solves`
+        : `set BOT_SPECIALIZE_DOMAINS to focus`,
+    },
+    {
+      label: "Paper-repro opportunities",
+      big: `<span class="${(s.paperReproOpportunities ?? []).length > 0 ? 'warn' : 'muted'}">${(s.paperReproOpportunities ?? []).length}</span>`,
+      sub: (s.paperReproOpportunities ?? []).length > 0
+        ? "winner-take-all • see Activity tab"
+        : "none open right now",
+    },
+  ];
+  document.getElementById("overview-cards").innerHTML = cards
+    .map((c) => `<div class="card"><h3>${c.label}</h3><div class="big">${c.big}</div><div class="sub">${c.sub}</div></div>`)
+    .join("");
+
+  // Pool distribution
+  const p = s.network?.pool ?? { v0: 0, v1: 0, v2: 0, vHigh: 0, total: 0 };
+  document.getElementById("pool-dist").innerHTML = [
+    { label: "v0 (no verifier)", value: p.v0, color: "var(--bad)" },
+    { label: "v1", value: p.v1, color: "var(--warn)" },
+    { label: "v2 (near quorum)", value: p.v2, color: "var(--accent)" },
+    { label: "v3+ (quorum)", value: p.vHigh, color: "var(--good)" },
+  ]
+    .map((c) => `<div class="dist-cell"><div class="label">${c.label}</div><div class="value" style="color:${c.color}">${c.value}</div></div>`)
+    .join("");
+
+  // My subs
+  const tbody = document.querySelector("#my-subs-tbl tbody");
+  if (!s.mine?.sample || s.mine.sample.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="4" class="empty">No pending submissions.</td></tr>`;
+  } else {
+    tbody.innerHTML = s.mine.sample
+      .map((sub) => {
+        const fillPct = Math.min(100, (sub.vCount / 3) * 100);
+        const cls = sub.vCount >= 2 ? "good" : sub.vCount === 1 ? "warn" : "bad";
+        return `<tr>
+          <td>${sub.id.slice(0, 10)}…</td>
+          <td>${fmtAge(sub.submittedAt)}</td>
+          <td><span class="${cls}">${sub.vCount}/3</span></td>
+          <td><div class="bar"><div class="bar-fill ${cls}" style="width:${fillPct}%"></div></div></td>
+        </tr>`;
+      })
+      .join("");
+  }
+
+  // Claims — handle both off-chain ledger claims and on-chain Merkle settlements
+  const claimsBody = document.querySelector("#claims-tbl tbody");
+  const events = s.claims?.events ?? [];
+  const price = s.money?.usd?.nookPriceUsd ?? 0;
+  if (events.length === 0) {
+    claimsBody.innerHTML = `<tr><td colspan="4" class="empty">No claims yet.</td></tr>`;
+  } else {
+    claimsBody.innerHTML = events
+      .map((c) => {
+        let source, amount, cumulative = false;
+        if (c.kind === "on-chain") {
+          // On-chain settlement: txHash + CUMULATIVE amount (running total).
+          const shortTx = c.txHash ? c.txHash.slice(0, 8) + "…" + c.txHash.slice(-4) : "on-chain";
+          source = `<span class="good">on-chain</span> <span class="muted">${shortTx}</span>`;
+          amount = c.onChainCumulative ?? 0;
+          cumulative = true;
+        } else {
+          // Off-chain ledger claim — the epoch's full claimed total (all sources).
+          // (Labeling by sources[0] was misleading; the amount is the sum.)
+          source = `<span class="magenta">off-chain</span> <span class="muted">epoch claim</span>`;
+          amount = c.claimed ?? 0;
+        }
+        // Off-chain claims use the price FROZEN at claim time (so scrolling back
+        // shows each day's real USD, not today's). On-chain (cumulative) uses live.
+        const claimPrice = (c.kind !== "on-chain" && c.priceUsdAtClaim) ? c.priceUsdAtClaim : price;
+        const frozenTag = (c.kind !== "on-chain" && c.priceUsdAtClaim) ? " <span class='muted' title='price frozen at claim time'>🔒</span>" : "";
+        const usdCell = claimPrice > 0 ? `${usdFmt(amount * claimPrice)}${cumulative ? " <span class='muted'>total</span>" : frozenTag}` : "—";
+        return `<tr><td>${fmtAge(c.ts)}</td><td>${source}</td><td class="num good">${fmt(amount, 1)}</td><td class="num">${usdCell}</td></tr>`;
+      })
+      .join("");
+  }
+}
+
+// ─── render: performance ───
+function renderPerformance() {
+  const s = snapshot;
+  const cards = [
+    {
+      label: "Mining attempts (24h)",
+      big: `<span class="accent">${s.mining?.attempts24h ?? 0}</span>`,
+      sub: "cap: 13/day",
+    },
+    {
+      label: "All-time attempts",
+      big: `${s.mining?.attemptsAllTime ?? 0}`,
+      sub: `7d: ${s.mining?.attempts7d ?? 0}`,
+    },
+    {
+      label: "Expected NOOK (24h)",
+      big: `<span class="good">${fmt(s.mining?.expectedRevenue24h ?? 0, 0)}</span>`,
+      sub: "from deferred submissions, before quorum",
+    },
+    {
+      label: "Verification variance",
+      big: (() => {
+        const d = s.verification?.last20Dims ?? {};
+        const sd = (d.reasoning?.sd ?? 0).toFixed(2);
+        const cls = parseFloat(sd) >= 0.15 ? "good" : "warn";
+        return `<span class="${cls}">σ=${sd}</span>`;
+      })(),
+      sub: "reasoning-dim, last 20 (target σ≥0.15)",
+    },
+  ];
+  document.getElementById("perf-cards").innerHTML = cards
+    .map((c) => `<div class="card"><h3>${c.label}</h3><div class="big">${c.big}</div><div class="sub">${c.sub}</div></div>`)
+    .join("");
+
+  // Model table
+  const tbody = document.querySelector("#model-tbl tbody");
+  const models = (s.mining?.byModel ?? []).sort((a, b) => b.attempts - a.attempts);
+  tbody.innerHTML = models.length === 0
+    ? `<tr><td colspan="7" class="empty">No attempts in last 24h.</td></tr>`
+    : models
+      .map((m) => `<tr>
+        <td>${m.model}</td><td>${m.attempts}</td>
+        <td class="good">${m.pass}</td><td class="accent">${m.deferred}</td><td class="bad">${m.error}</td>
+        <td>${Math.round(m.submitRate * 100)}%</td>
+        <td>${fmt(m.rewardSum, 0)}</td>
+      </tr>`)
+      .join("");
+
+  // Mining timeseries chart
+  renderMiningTimeseries();
+  renderVerificationTrend();
+}
+
+function renderMiningTimeseries() {
+  if (charts.mining) { charts.mining.destroy(); charts.mining = null; }
+  const cutoff = Date.now() - 7 * 24 * 3600_000;
+  const events = (miningHistory ?? []).filter((e) => new Date(e.ts).getTime() >= cutoff);
+  // Bucket per hour
+  const buckets = new Map();
+  for (const e of events) {
+    const hourTs = new Date(e.ts);
+    hourTs.setMinutes(0, 0, 0);
+    const key = hourTs.getTime();
+    let b = buckets.get(key);
+    if (!b) { b = { pass: 0, deferred: 0, error: 0 }; buckets.set(key, b); }
+    if (e.outcome === "pass") b.pass++;
+    else if (e.outcome === "deferred") b.deferred++;
+    else if (e.outcome === "error") b.error++;
+  }
+  const labels = [];
+  const passData = [], deferredData = [], errorData = [];
+  for (const [k, v] of [...buckets.entries()].sort((a, b) => a[0] - b[0])) {
+    labels.push(new Date(k).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit" }));
+    passData.push(v.pass); deferredData.push(v.deferred); errorData.push(v.error);
+  }
+  const ctx = document.getElementById("mining-timeseries");
+  if (!ctx) return;
+  charts.mining = new Chart(ctx, {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        { label: "pass", data: passData, backgroundColor: "rgba(63,185,80,0.7)" },
+        { label: "deferred", data: deferredData, backgroundColor: "rgba(88,166,255,0.7)" },
+        { label: "error", data: errorData, backgroundColor: "rgba(248,81,73,0.7)" },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: { x: { stacked: true, ticks: { color: "#8b949e", maxRotation: 60, autoSkip: true } },
+                y: { stacked: true, ticks: { color: "#8b949e" } } },
+      plugins: { legend: { labels: { color: "#e6edf3" } } },
+    },
+  });
+}
+
+function renderVerificationTrend() {
+  if (charts.verify) { charts.verify.destroy(); charts.verify = null; }
+  const last20 = (verificationHistory ?? []).slice(-20);
+  if (last20.length === 0) {
+    document.getElementById("verification-trend").parentElement.querySelector("canvas").style.display = "none";
+    return;
+  }
+  const labels = last20.map((_, i) => `#${i + 1}`);
+  const ctx = document.getElementById("verification-trend");
+  charts.verify = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels,
+      datasets: ["correctness", "reasoning", "efficiency", "novelty"].map((dim, i) => ({
+        label: dim,
+        data: last20.map((e) => e[dim]),
+        borderColor: ["#3fb950", "#58a6ff", "#d29922", "#bc8cff"][i],
+        backgroundColor: "transparent",
+        tension: 0.2,
+        pointRadius: 2,
+      })),
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: { y: { min: 0, max: 1, ticks: { color: "#8b949e" } }, x: { ticks: { color: "#8b949e" } } },
+      plugins: { legend: { labels: { color: "#e6edf3" } } },
+    },
+  });
+}
+
+// ─── render: peers ───
+function renderPeers() {
+  const s = snapshot;
+  const us = s.mine?.poolPresence ?? { subs: 0, nearQuorum: 0 };
+  const cards = [
+    {
+      label: "Our subs in pool",
+      big: `${us.subs}`,
+      sub: `${us.nearQuorum} near quorum`,
+    },
+    {
+      label: "Rank by pool presence",
+      big: s.mine?.rankBySubs ? `#${s.mine.rankBySubs}` : `<span class="muted">—</span>`,
+      sub: `of ${s.peers?.total ?? 0} solvers`,
+    },
+    {
+      label: "Network solvers",
+      big: `${s.network?.distinctSolvers ?? 0}`,
+      sub: "distinct active in pool",
+    },
+    {
+      label: "Pool depth",
+      big: `${s.network?.pool?.total ?? 0}`,
+      sub: "all submissions awaiting verification",
+    },
+  ];
+  document.getElementById("peers-cards").innerHTML = cards
+    .map((c) => `<div class="card"><h3>${c.label}</h3><div class="big">${c.big}</div><div class="sub">${c.sub}</div></div>`)
+    .join("");
+
+  const me = (s.agent?.address ?? "").toLowerCase();
+  const peers = (s.peers?.top5 ?? []).slice(0, 10);
+  const peerHtml = peers
+    .map((p, i) => {
+      const isMe = (p.address ?? "").toLowerCase() === me;
+      return `<tr ${isMe ? 'style="background:rgba(88,166,255,0.06)"' : ""}>
+        <td>#${i + 1}</td>
+        <td class="addr ${isMe ? 'accent' : ''}">${shortAddr(p.address)}${isMe ? " ← us" : ""}</td>
+        <td>${p.subs}</td>
+        <td>${p.nearQuorum}</td>
+      </tr>`;
+    }).join("");
+  document.querySelector("#peers-tbl tbody").innerHTML = peerHtml || `<tr><td colspan="4" class="empty">No peer data.</td></tr>`;
+
+  // Position narrative
+  const pos = document.getElementById("peer-position");
+  const totalPeers = s.peers?.total ?? 0;
+  const rank = s.mine?.rankBySubs;
+  if (!rank) {
+    pos.innerHTML = `<div class="muted">We're not currently visible in the verifiable pool (gateway hides our own submissions from us — other agents see them).</div>`;
+  } else {
+    const pctile = totalPeers > 0 ? Math.round((1 - (rank - 1) / totalPeers) * 100) : 0;
+    pos.innerHTML = `<div>Rank <span class="accent">#${rank}</span> of ${totalPeers} active solvers — top <span class="accent">${100 - pctile}%</span> by pool presence.</div>`;
+  }
+}
+
+// ─── render: blockers ───
+function renderBlockers() {
+  const list = document.getElementById("blockers-list");
+  const blockers = snapshot.blockers ?? [];
+  if (blockers.length === 0) {
+    list.innerHTML = `<div class="empty">No blockers detected. 🟢</div>`;
+  } else {
+    list.innerHTML = blockers.map((b) => `
+      <div class="blocker ${b.severity}">
+        <span class="sev">${b.severity.toUpperCase()}</span>
+        <div class="body">
+          <strong>[${b.scope}]</strong> ${b.message}
+          ${b.action ? `<div class="action">→ ${b.action}</div>` : ""}
+        </div>
+      </div>
+    `).join("");
+  }
+  renderNetworkV0Trend();
+  renderMyAvgVCount();
+}
+
+function renderNetworkV0Trend() {
+  if (charts.netv0) { charts.netv0.destroy(); charts.netv0 = null; }
+  const history = (networkHistory ?? []).slice(-48);
+  if (history.length === 0) return;
+  const labels = history.map((h) => new Date(h.ts).toLocaleString([], { hour: "2-digit", minute: "2-digit" }));
+  const data = history.map((h) => (h.pool?.total > 0 ? (h.pool.v0 / h.pool.total) * 100 : 0));
+  const ctx = document.getElementById("network-v0-trend");
+  charts.netv0 = new Chart(ctx, {
+    type: "line",
+    data: { labels, datasets: [{ label: "v0%", data, borderColor: "#f85149", backgroundColor: "rgba(248,81,73,0.1)", tension: 0.2, fill: true, pointRadius: 1 }] },
+    options: { responsive: true, maintainAspectRatio: false, scales: { y: { min: 0, max: 100, ticks: { color: "#8b949e" } }, x: { ticks: { color: "#8b949e", maxRotation: 60, autoSkip: true } } }, plugins: { legend: { labels: { color: "#e6edf3" } } } },
+  });
+}
+
+function renderMyAvgVCount() {
+  if (charts.myavg) { charts.myavg.destroy(); charts.myavg = null; }
+  const history = (networkHistory ?? []).slice(-48);
+  if (history.length === 0) return;
+  const labels = history.map((h) => new Date(h.ts).toLocaleString([], { hour: "2-digit", minute: "2-digit" }));
+  const data = history.map((h) => h.mine?.avgVerifierCount ?? null);
+  const ctx = document.getElementById("my-avg-vcount");
+  charts.myavg = new Chart(ctx, {
+    type: "line",
+    data: { labels, datasets: [{ label: "avg verifier count", data, borderColor: "#58a6ff", backgroundColor: "rgba(88,166,255,0.1)", tension: 0.2, fill: true, pointRadius: 1 }] },
+    options: { responsive: true, maintainAspectRatio: false, scales: { y: { min: 0, max: 3, ticks: { color: "#8b949e" } }, x: { ticks: { color: "#8b949e", maxRotation: 60, autoSkip: true } } }, plugins: { legend: { labels: { color: "#e6edf3" } } } },
+  });
+}
+
+// ─── render: history ───
+function renderHistory() {
+  const s = snapshot;
+  // Earnings status
+  const earningsTotal = s.claims?.lifetime ?? 0;
+  const expected = s.mining?.expectedRevenue24h ?? 0;
+  document.getElementById("earnings-status").innerHTML = `
+    <div class="flex-row">
+      <div><h3 class="muted">Claimed (lifetime)</h3><div class="big good">${fmt(earningsTotal, 1)} NOOK</div></div>
+      <div><h3 class="muted">Expected (last 24h deferred)</h3><div class="big accent">${fmt(expected, 0)} NOOK</div></div>
+      <div><h3 class="muted">Conversion</h3>
+        <div class="big ${earningsTotal === 0 && expected > 0 ? 'warn' : 'good'}">
+          ${expected > 0 ? Math.round((earningsTotal / expected) * 100) + "%" : "n/a"}
+        </div>
+        <div class="sub muted">claimed / 24h-deferred</div>
+      </div>
+    </div>`;
+
+  // USD earnings chart + P&L + claim chart
+  renderUsdEarningsChart();
+  renderPnlChart();
+  renderClaimChart();
+  // Network status table
+  const history = (networkHistory ?? []).slice(-30).reverse();
+  document.querySelector("#netstat-tbl tbody").innerHTML = history.length === 0
+    ? `<tr><td colspan="9" class="empty">No history yet.</td></tr>`
+    : history.map((h) => `<tr>
+        <td>${new Date(h.ts).toLocaleString()}</td>
+        <td>${h.epoch ?? "?"}</td>
+        <td>${h.pool?.total ?? 0}</td>
+        <td class="bad">${h.pool?.v0 ?? 0}</td>
+        <td class="warn">${h.pool?.v1 ?? 0}</td>
+        <td class="accent">${h.pool?.v2 ?? 0}</td>
+        <td>${h.rlm?.pending ?? 0}</td>
+        <td>${h.mine?.pendingSubs ?? 0}</td>
+        <td>${fmt(h.mine?.claimableNook ?? 0, 0)}</td>
+      </tr>`).join("");
+}
+
+function renderUsdEarningsChart() {
+  if (charts.usdEarnings) { charts.usdEarnings.destroy(); charts.usdEarnings = null; }
+  const d = dailyEarnings ?? { series: [] };
+  const series = (d.series ?? []).slice(-30);
+  const note = document.getElementById("usd-earnings-note");
+  if (series.length === 0) {
+    if (note) note.textContent = "No claim history yet.";
+    return;
+  }
+  const avgUsd = series.reduce((s, x) => s + (x.usd ?? 0), 0) / series.length;
+  if (note) {
+    note.innerHTML = d.priceUsd > 0
+      ? `NOOK earned per epoch × live price (${usdFmt(d.priceUsd)}/NOOK, src: ${d.priceSource}). Avg <strong>${usdFmt(avgUsd)}/day</strong> over last ${series.length} epochs.`
+      : `Price unavailable — set <code>NOOK_USD_PRICE</code> to pin a price. Showing NOOK/day instead.`;
+  }
+  const labels = series.map((x) => x.date);
+  const usable = d.priceUsd > 0;
+  const data = series.map((x) => (usable ? x.usd : x.nook));
+  const ctx = document.getElementById("usd-earnings-chart");
+  charts.usdEarnings = new Chart(ctx, {
+    type: "bar",
+    data: { labels, datasets: [{ label: usable ? "Earnings / day (USD)" : "Earnings / day (NOOK)", data, backgroundColor: "rgba(63,185,80,0.55)", borderColor: "#3fb950", borderWidth: 1 }] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        y: { ticks: { color: "#8b949e", callback: (v) => usable ? "$" + Number(v).toFixed(0) : fmt(v, 0) } },
+        x: { ticks: { color: "#8b949e", maxRotation: 60, autoSkip: true } },
+      },
+      plugins: {
+        legend: { labels: { color: "#e6edf3" } },
+        tooltip: { callbacks: { label: (c) => {
+          const row = series[c.dataIndex];
+          return usable ? `${usdFmt(row.usd)}  (${fmt(row.nook, 0)} NOOK)` : `${fmt(row.nook, 0)} NOOK`;
+        } } },
+      },
+    },
+  });
+}
+
+function renderPnlChart() {
+  if (charts.pnl) { charts.pnl.destroy(); charts.pnl = null; }
+  const d = dailyEarnings ?? { series: [] };
+  const series = (d.series ?? []).filter((x) => x.spendUsd != null).slice(-30);
+  const note = document.getElementById("pnl-note");
+  if (series.length === 0) {
+    if (note) note.textContent = "No spend/claim history yet.";
+    return;
+  }
+  const totEarn = series.reduce((s, x) => s + (x.usd ?? 0), 0);
+  const totSpend = series.reduce((s, x) => s + (x.spendUsd ?? 0), 0);
+  const net = totEarn - totSpend;
+  const netCls = net >= 0 ? "accent" : "bad";
+  if (note) {
+    note.innerHTML = `Last ${series.length} days: earned <strong>${usdFmt(totEarn)}</strong>, ` +
+      `spent <strong>${usdFmt(totSpend)}</strong> on inference → net <strong class="${netCls}">${net >= 0 ? "+" : "−"}${usdFmt(Math.abs(net))}</strong> ` +
+      `(avg ${net >= 0 ? "+" : "−"}${usdFmt(Math.abs(net) / series.length)}/day). ` +
+      `Earnings credit at the ~02:00Z claim for the prior epoch's work, so single days are ~1 day misaligned — trust the trend, not one bar.`;
+  }
+  const labels = series.map((x) => x.date.slice(5));
+  const ctx = document.getElementById("pnl-chart");
+  charts.pnl = new Chart(ctx, {
+    type: "bar",
+    data: { labels, datasets: [
+      { label: "Earnings (USD)", data: series.map((x) => x.usd ?? 0), backgroundColor: "rgba(63,185,80,0.55)", borderColor: "#3fb950", borderWidth: 1 },
+      { label: "Inference spend (USD)", data: series.map((x) => x.spendUsd ?? 0), backgroundColor: "rgba(188,140,255,0.55)", borderColor: "#bc8cff", borderWidth: 1 },
+    ] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        y: { ticks: { color: "#8b949e", callback: (v) => "$" + Number(v).toFixed(0) } },
+        x: { ticks: { color: "#8b949e", maxRotation: 60, autoSkip: true } },
+      },
+      plugins: {
+        legend: { labels: { color: "#e6edf3" } },
+        tooltip: { callbacks: { label: (c) => {
+          const row = series[c.dataIndex];
+          const n = (row.usd ?? 0) - (row.spendUsd ?? 0);
+          return c.datasetIndex === 0
+            ? `earned ${usdFmt(row.usd ?? 0)} (${fmt(row.nook ?? 0, 0)} NOOK)`
+            : `spent ${usdFmt(row.spendUsd ?? 0)} (${row.calls ?? 0} calls) · net ${n >= 0 ? "+" : "−"}${usdFmt(Math.abs(n))}`;
+        } } },
+      },
+    },
+  });
+  const tbody = document.querySelector("#pnl-tbl tbody");
+  if (tbody) {
+    tbody.innerHTML = series.slice(-7).reverse().map((x) => {
+      const n = (x.usd ?? 0) - (x.spendUsd ?? 0);
+      return `<tr><td>${x.date}</td><td>${usdFmt(x.usd ?? 0)}</td><td>${usdFmt(x.spendUsd ?? 0)}</td>` +
+        `<td class="${n >= 0 ? "accent" : "bad"}">${n >= 0 ? "+" : "−"}${usdFmt(Math.abs(n))}</td><td>${x.calls ?? 0}</td></tr>`;
+    }).join("");
+  }
+}
+
+function renderClaimChart() {
+  if (charts.claim) { charts.claim.destroy(); charts.claim = null; }
+  const events = (claimsHistory ?? []).slice(-30);
+  if (events.length === 0) return;
+  let running = 0;
+  const labels = []; const data = [];
+  for (const c of events) {
+    running += c.claimed ?? 0;
+    labels.push(new Date(c.ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit" }));
+    data.push(running);
+  }
+  const ctx = document.getElementById("claim-chart");
+  charts.claim = new Chart(ctx, {
+    type: "line",
+    data: { labels, datasets: [{ label: "Cumulative claimed (NOOK)", data, borderColor: "#3fb950", backgroundColor: "rgba(63,185,80,0.1)", tension: 0.2, fill: true, pointRadius: 2 }] },
+    options: { responsive: true, maintainAspectRatio: false, scales: { y: { ticks: { color: "#8b949e" } }, x: { ticks: { color: "#8b949e", maxRotation: 60, autoSkip: true } } }, plugins: { legend: { labels: { color: "#e6edf3" } } } },
+  });
+}
+
+// ─── render: raw ───
+function renderRaw() {
+  document.getElementById("raw-snapshot").textContent = JSON.stringify(snapshot, null, 2);
+}
+
+// ─── boot ───
+loadAll();
+setInterval(loadAll, 30_000);
+// Poll the running indicator more often than the full refresh so it feels live.
+refreshBotStatus();
+setInterval(refreshBotStatus, 10_000);
+</script>
+
+</body>
+</html>

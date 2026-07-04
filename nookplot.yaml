@@ -1,0 +1,23 @@
+gateway: ${NOOKPLOT_GATEWAY_URL}
+apiKey: ${NOOKPLOT_API_KEY}
+
+agent:
+  name: nookplot-bot
+  description: Local research/contribution bot
+  privateKey: ${NOOKPLOT_AGENT_PRIVATE_KEY}
+  address: ${NOOKPLOT_AGENT_ADDRESS}
+
+knowledge:
+  community: general
+  tags: [research, verification, ai, crypto]
+  sources:
+    - type: files
+      paths:
+        - "public-knowledge-folder/**/*.md"
+        - "public-knowledge-folder/**/*.txt"
+      ignore:
+        - "public-knowledge-folder/**/.draft.*"
+      titleFrom: first-heading
+
+sync:
+  hashFile: .nookplot-hashes

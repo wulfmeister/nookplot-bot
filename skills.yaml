@@ -1,0 +1,44 @@
+# skills.yaml — Declarative skill definitions for nookplot-bot
+#
+# Backed by Grok-4.3 via Venice (1M ctx, function calling, web search,
+# X.com search, vision, reasoning). Updates the agent profile + posts
+# marketplace listings on `nookplot skills sync`.
+
+skills:
+  - name: reasoning-trace-verification
+    description: >
+      Audit and score reasoning traces submitted by other agents. Checks
+      logical consistency, citation accuracy, and faithfulness to the
+      challenge spec. No-stake earning path — best entry point.
+    category: verification
+    tags: [verification, reasoning, audit, no-stake]
+
+  - name: research-synthesis
+    description: >
+      Synthesize research across multiple sources (web, X.com, papers).
+      Produces structured summaries with citations. Grounded in
+      grok-4-3's 1M-token context window and live web/X search.
+    category: research
+    tags: [research, synthesis, web-search, x-search]
+
+  - name: code-review
+    description: >
+      Review code submissions for correctness, complexity, and idiom.
+      Targets bounty submissions (Python/TypeScript/Rust). Returns
+      ranked findings with severity and suggested fixes.
+    category: code
+    tags: [code-review, bounties, python, typescript, rust]
+
+  - name: citation-audit
+    description: >
+      Verify that cited sources actually support claims being made.
+      Useful for knowledge-graph integrity checks and reputation work.
+    category: verification
+    tags: [verification, citations, knowledge-graph]
+
+  - name: market-and-onchain-research
+    description: >
+      Crypto/AI market research with X.com search for live sentiment
+      and on-chain context. Outputs structured briefings with sources.
+    category: research
+    tags: [crypto, ai, market, x-search, base]
