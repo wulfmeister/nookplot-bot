@@ -40,6 +40,7 @@ import { veniceCostSummary } from "./venice-cost.js";
 import { driftSummary } from "./specialization-drift.js";
 import { auditSummary, recentAudit } from "./audit.js";
 import { getRuntime } from "./runtime.js";
+import { isLean, runsInLean } from "./lean.js";
 import { readCapacity, capacityUnderuse, MINING_DAILY_CAP } from "./capacity.js";
 import { readDailySpend } from "./pnl.js";
 
@@ -427,8 +428,12 @@ async function buildSnapshot() {
       // USD view — live NOOK price × earnings. See getNookPriceUsd().
       usd,
     },
-    // Bot-mode flags (which optional surfaces are on/off + specialization)
+    // Bot-mode flags (which optional surfaces are on/off + specialization).
+    // Lean-skippable surfaces are AND-ed with runsInLean(track) so the panel
+    // reflects what the daemon ACTUALLY registered under BOT_LEAN=1, not just
+    // the env flag.
     botMode: {
+      lean: isLean(),
       specializeDomains: (process.env.BOT_SPECIALIZE_DOMAINS ?? "")
         .split(",")
         .map((s) => s.trim())
@@ -436,16 +441,16 @@ async function buildSnapshot() {
       specializeMatchMode: process.env.BOT_SPECIALIZE_MATCH_MODE === "all" ? "all" : "any",
       specializeStrict: process.env.BOT_SPECIALIZE_STRICT === "1",
       bountyFitThreshold: Number(process.env.BOT_BOUNTY_FIT_THRESHOLD ?? 0.75),
-      bountyApply: process.env.BOT_BOUNTY_APPLY !== "0",
-      paperReproduction: process.env.BOT_PAPER_REPRODUCTION !== "0",
+      bountyApply: process.env.BOT_BOUNTY_APPLY !== "0" && runsInLean("bounty"),
+      paperReproduction: process.env.BOT_PAPER_REPRODUCTION !== "0" && runsInLean("paperReproduction"),
       workspaceSolve: process.env.BOT_WORKSPACE_SOLVE !== "0",
-      citationVelocity: process.env.BOT_CITATION_VELOCITY !== "0",
+      citationVelocity: process.env.BOT_CITATION_VELOCITY !== "0" && runsInLean("citationVelocity"),
       rlmSpotcheck: process.env.BOT_RLM_SPOTCHECK !== "0",
       autoJoinGuild: process.env.BOT_AUTO_JOIN_GUILD !== "0",
       onChainClaim: process.env.BOT_AUTO_ONCHAIN_CLAIM !== "0",
-      voteLoop: process.env.BOT_VOTE_LOOP !== "0",
-      followLoop: process.env.BOT_FOLLOW_LOOP !== "0",
-      commentLoop: process.env.BOT_COMMENT_LOOP !== "0",
+      voteLoop: process.env.BOT_VOTE_LOOP !== "0" && runsInLean("socialEngagement"),
+      followLoop: process.env.BOT_FOLLOW_LOOP !== "0" && runsInLean("socialEngagement"),
+      commentLoop: process.env.BOT_COMMENT_LOOP !== "0" && runsInLean("socialEngagement"),
       onboarding: process.env.BOT_ONBOARDING !== "0",
       verifyThresholdOverride: process.env.BOT_VERIFY_THRESHOLD,
     },

@@ -4,6 +4,7 @@ import { config, getRuntime } from "./runtime.js";
 import { initBotLog } from "./bot-log.js";
 import { chat, VENICE_WEB_SEARCH, assertVeniceKey } from "./venice.js";
 import { pickModel, pickModelAB } from "./models.js";
+import { runsInLean, leanBanner } from "./lean.js";
 import { NOOK_DIR, appendJsonl, extractJson, sleep } from "./util.js";
 import { webSearch, arxivSearch, formatResultsForPrompt, type SearchResult } from "./research.js";
 import { refine } from "./refine.js";
@@ -2267,41 +2268,47 @@ async function startWeeklyRewardsLoop(runtime: ReturnType<typeof getRuntime>) {
   // via real MCP dispatch every 6h and shout the moment any flips live.
   setTimeout(() => safe("earningSurfacesTick", () => runEarningSurfacesTick(runtime)), 28 * 60_000);
   setInterval(() => safe("earningSurfacesTick", () => runEarningSurfacesTick(runtime)), 6 * 3600_000);
-  // Tier-3 aggregation mining (P2.1). Dormant no-op until the gateway ships the
-  // endpoint; submits only when BOT_AGGREGATION_AUTO=1. 2/day cap enforced inside.
-  setTimeout(() => safe("aggregationTick", () => discoverAndSolveAggregations(runtime)), 14 * 60_000);
-  setInterval(() => safe("aggregationTick", () => discoverAndSolveAggregations(runtime)), 30 * 60_000);
-  // Tier-1 embedding mining (P2.2). Dormant until the endpoint ships AND a local
-  // Ollama nomic-embed model is reachable; submits only when BOT_EMBEDDING_AUTO=1.
-  setTimeout(() => safe("embeddingTick", () => discoverAndSolveEmbeddings(runtime)), 16 * 60_000);
-  setInterval(() => safe("embeddingTick", () => discoverAndSolveEmbeddings(runtime)), 30 * 60_000);
-  // API-marketplace selling (P2.3). Dormant until the marketplace actions ship;
-  // onboards a metered listing only when BOT_API_ONBOARD_AUTO=1 + listing config set.
-  setTimeout(() => safe("apiMarketplaceTick", () => runApiMarketplaceTick(runtime)), 18 * 60_000);
-  setInterval(() => safe("apiMarketplaceTick", () => runApiMarketplaceTick(runtime)), 30 * 60_000);
-  // Projects / reputation (Path A). When BOT_PROJECTS_AUTO_PREVIEW=1, drafts ONE
-  // grounded project + peer comparison and enqueues it for your review — never
-  // submits. Keeps one pending at a time; you approve/pass via `npm run projects`.
-  setTimeout(() => safe("projectsReviewTick", () => runProjectsReviewTick(runtime)), 35 * 60_000);
-  // One draft per 24h (slow enough to review + post each before the next) — and it
-  // no-ops anyway while one is still pending, so drafts never pile up.
-  setInterval(() => safe("projectsReviewTick", () => runProjectsReviewTick(runtime)), 24 * 3600_000);
-  // Peer-review (Path B / collab). Drafts ONE review of another agent's commit per
-  // day for your approval (BOT_PEER_REVIEW_AUTO=1); never submits on its own.
-  setTimeout(() => safe("peerReviewTick", () => runPeerReviewTick(runtime)), 45 * 60_000);
-  setInterval(() => safe("peerReviewTick", () => runPeerReviewTick(runtime)), 24 * 3600_000);
-  // Exec dimension (Path A cont.). Re-runs each approved project's tests in-project
-  // via exec_code({projectId}) to grow `exec` — and logs the gateway keyset so we
-  // can see whether project-attributed runs actually move the dimension (it read 0).
-  // Gated by BOT_EXEC_SCORING_AUTO=1.
-  setTimeout(() => safe("execScoringTick", () => runExecScoringTick(runtime)), 50 * 60_000);
-  setInterval(() => safe("execScoringTick", () => runExecScoringTick(runtime)), 8 * 3600_000);
-  // Bounties (human-gated apply). When BOT_BOUNTY_REVIEW_AUTO=1, drafts ONE
-  // application for a qualifying open native bounty and enqueues it for your
-  // review — never submits. Native supply is sporadic, so check more often than
-  // daily; one-pending + daily-cap guards keep it from piling up.
-  setTimeout(() => safe("bountyReviewTick", () => runBountyReviewTick(runtime)), 25 * 60_000);
-  setInterval(() => safe("bountyReviewTick", () => runBountyReviewTick(runtime)), 6 * 3600_000);
+  // ── Inference-y drafting + dormant surfaces ────────────────────────────
+  // These either draft with an LLM (project/peer/exec/bounty-review) or probe
+  // not-yet-live surfaces (aggregation/embedding/API mining). Lean mode skips
+  // the whole block — only the royalty engine + free housekeeping above run.
+  if (runsInLean("draftingAndDormant")) {
+    // Tier-3 aggregation mining (P2.1). Dormant no-op until the gateway ships the
+    // endpoint; submits only when BOT_AGGREGATION_AUTO=1. 2/day cap enforced inside.
+    setTimeout(() => safe("aggregationTick", () => discoverAndSolveAggregations(runtime)), 14 * 60_000);
+    setInterval(() => safe("aggregationTick", () => discoverAndSolveAggregations(runtime)), 30 * 60_000);
+    // Tier-1 embedding mining (P2.2). Dormant until the endpoint ships AND a local
+    // Ollama nomic-embed model is reachable; submits only when BOT_EMBEDDING_AUTO=1.
+    setTimeout(() => safe("embeddingTick", () => discoverAndSolveEmbeddings(runtime)), 16 * 60_000);
+    setInterval(() => safe("embeddingTick", () => discoverAndSolveEmbeddings(runtime)), 30 * 60_000);
+    // API-marketplace selling (P2.3). Dormant until the marketplace actions ship;
+    // onboards a metered listing only when BOT_API_ONBOARD_AUTO=1 + listing config set.
+    setTimeout(() => safe("apiMarketplaceTick", () => runApiMarketplaceTick(runtime)), 18 * 60_000);
+    setInterval(() => safe("apiMarketplaceTick", () => runApiMarketplaceTick(runtime)), 30 * 60_000);
+    // Projects / reputation (Path A). When BOT_PROJECTS_AUTO_PREVIEW=1, drafts ONE
+    // grounded project + peer comparison and enqueues it for your review — never
+    // submits. Keeps one pending at a time; you approve/pass via `npm run projects`.
+    setTimeout(() => safe("projectsReviewTick", () => runProjectsReviewTick(runtime)), 35 * 60_000);
+    // One draft per 24h (slow enough to review + post each before the next) — and it
+    // no-ops anyway while one is still pending, so drafts never pile up.
+    setInterval(() => safe("projectsReviewTick", () => runProjectsReviewTick(runtime)), 24 * 3600_000);
+    // Peer-review (Path B / collab). Drafts ONE review of another agent's commit per
+    // day for your approval (BOT_PEER_REVIEW_AUTO=1); never submits on its own.
+    setTimeout(() => safe("peerReviewTick", () => runPeerReviewTick(runtime)), 45 * 60_000);
+    setInterval(() => safe("peerReviewTick", () => runPeerReviewTick(runtime)), 24 * 3600_000);
+    // Exec dimension (Path A cont.). Re-runs each approved project's tests in-project
+    // via exec_code({projectId}) to grow `exec` — and logs the gateway keyset so we
+    // can see whether project-attributed runs actually move the dimension (it read 0).
+    // Gated by BOT_EXEC_SCORING_AUTO=1.
+    setTimeout(() => safe("execScoringTick", () => runExecScoringTick(runtime)), 50 * 60_000);
+    setInterval(() => safe("execScoringTick", () => runExecScoringTick(runtime)), 8 * 3600_000);
+    // Bounties (human-gated apply). When BOT_BOUNTY_REVIEW_AUTO=1, drafts ONE
+    // application for a qualifying open native bounty and enqueues it for your
+    // review — never submits. Native supply is sporadic, so check more often than
+    // daily; one-pending + daily-cap guards keep it from piling up.
+    setTimeout(() => safe("bountyReviewTick", () => runBountyReviewTick(runtime)), 25 * 60_000);
+    setInterval(() => safe("bountyReviewTick", () => runBountyReviewTick(runtime)), 6 * 3600_000);
+  }
 }
 
 async function startTeachingLoop(runtime: ReturnType<typeof getRuntime>) {
@@ -2380,6 +2387,7 @@ async function main() {
     console.log("💬 message:", event.data);
   });
   runtime.events?.subscribe?.("bounty.new", (event: any) => {
+    if (!runsInLean("bounty")) return; // lean skips bounty drafting (LLM + on-chain apply)
     handleNewBountyEvent(runtime, (event.data ?? event) as Record<string, unknown>);
   });
   runtime.events?.subscribe?.("bounty.application.approved" as any, (event: any) => {
@@ -2393,42 +2401,51 @@ async function main() {
     console.log("🎯 opportunity:", event.data);
     const opp = (event.data || event) as OpportunityEvent;
     const t = (opp.actionType || opp.type || "").toLowerCase();
-    if (t.includes("verification")) handleVerificationOpportunity(runtime, opp);
-    else if (t.includes("bounty")) handleBountyOpportunity(runtime, opp);
+    // Lean skips the verification + bounty grind even when pushed via the
+    // proactive channel — these run LLM inference + on-chain writes that the
+    // loop-level gating alone would not catch.
+    if (t.includes("verification") && runsInLean("verification")) handleVerificationOpportunity(runtime, opp);
+    else if (t.includes("bounty") && runsInLean("bounty")) handleBountyOpportunity(runtime, opp);
   });
 
   runtime.proactive?.onActionRequest?.((req: any) => {
     console.log("🎯 action request:", req);
     const opp = req as OpportunityEvent;
     const t = (opp.actionType || "").toLowerCase();
-    if (t.includes("verification")) handleVerificationOpportunity(runtime, opp);
-    else if (t.includes("bounty")) handleBountyOpportunity(runtime, opp);
+    if (t.includes("verification") && runsInLean("verification")) handleVerificationOpportunity(runtime, opp);
+    else if (t.includes("bounty") && runsInLean("bounty")) handleBountyOpportunity(runtime, opp);
   });
 
-  await startRewardLoop(runtime);
-  await startBountyPoller(runtime);
-  await startKnowledgePublishLoop(runtime);
-  await startVerificationLoop(runtime);
-  await startMiningLoop(runtime);
-  await startCrowdJuryLoop(runtime);
-  await startLearningsLoop(runtime);
-  await startPredictionsLoop(runtime);
-  await startSocialLoop(runtime);
-  await startEngagementLoop(runtime);
-  await startObservationLoop(runtime);
-  await startNetworkStatusLoop(runtime, myAddress);
-  startCitationVelocityLoops(runtime, myAddress);
-  startPaperReproductionLoop(runtime);
-  startSocialEngagementLoops(runtime);
+  // Loop registration. LEAN_KEEP loops (net-positive royalty engine + reward
+  // claims + cheap read-only housekeeping) run unconditionally; the inference
+  // "grind" is wrapped in runsInLean(<track>) — a no-op off-lean (unchanged
+  // behavior), skipped under BOT_LEAN=1. See src/lean.ts.
+  const banner = leanBanner();
+  if (banner) console.log(banner);
+  await startRewardLoop(runtime); // claimRewards — collect earnings (kept)
+  if (runsInLean("bountyLifecycle")) await startBountyPoller(runtime);
+  if (runsInLean("knowledgePublish")) await startKnowledgePublishLoop(runtime);
+  if (runsInLean("verification")) await startVerificationLoop(runtime);
+  if (runsInLean("mining")) await startMiningLoop(runtime);
+  if (runsInLean("crowdJury")) await startCrowdJuryLoop(runtime);
+  if (runsInLean("learnings")) await startLearningsLoop(runtime);
+  if (runsInLean("predictions")) await startPredictionsLoop(runtime);
+  if (runsInLean("social")) await startSocialLoop(runtime);
+  if (runsInLean("engagement")) await startEngagementLoop(runtime);
+  if (runsInLean("observation")) await startObservationLoop(runtime);
+  await startNetworkStatusLoop(runtime, myAddress); // networkStatus — read-only (kept)
+  startCitationVelocityLoops(runtime, myAddress); // citationVelocity — passive, 0 LLM (kept)
+  if (runsInLean("paperReproduction")) startPaperReproductionLoop(runtime);
+  if (runsInLean("socialEngagement")) startSocialEngagementLoops(runtime);
   // MCP-derived tracks (every callback swallows its own errors)
-  await startBountyLoop(runtime);
-  await startClarificationsLoop(runtime);
-  await startSwarmsLoop(runtime);
-  await startWeeklyRewardsLoop(runtime);
-  await startTeachingLoop(runtime);
-  await startAttentionLoop(runtime);
-  await startDiagnosticsLoop(runtime);
-  await startEcosystemLoop(runtime);
+  if (runsInLean("bounty")) await startBountyLoop(runtime);
+  if (runsInLean("clarifications")) await startClarificationsLoop(runtime);
+  if (runsInLean("swarms")) await startSwarmsLoop(runtime);
+  await startWeeklyRewardsLoop(runtime); // weeklyRewards — royalty engine + housekeeping (kept; inner grind gated)
+  if (runsInLean("teaching")) await startTeachingLoop(runtime);
+  if (runsInLean("attention")) await startAttentionLoop(runtime);
+  await startDiagnosticsLoop(runtime); // diagnostics — local health (kept)
+  await startEcosystemLoop(runtime); // ecosystem — read-only stats (kept)
   // Fire-and-forget — one-shot, idempotent, must never block boot.
   // DRY_RUN-gated: these are REAL on-chain writes (marketplace listing +
   // project creation), and a first-time user's "dry run" must not sign

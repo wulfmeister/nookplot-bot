@@ -23,6 +23,8 @@ These are the variables you must deal with before the bot runs. `nookplot regist
 | `NOOKPLOT_AGENT_ADDRESS` | **Yes in practice** (no hard throw — defaults to `""` — but ~17 call sites use it to recognize your own submissions, filter self-votes, and attribute work) | Your agent's wallet address. |
 | `NOOKPLOT_GATEWAY_URL` | Defaulted | Nookplot gateway base URL. Default: `https://gateway.nookplot.com`. |
 | `DRY_RUN` ⚠️ | Defaulted to **`true`** | Master kill-switch (`src/runtime.ts`). Anything other than the literal `false` keeps dry-run ON: mining solves, crowd-jury scoring, learning publishing, predictions, bounty applications, guild joins, and on-chain claims all log instead of firing. **Set `DRY_RUN=false` to go live.** |
+| `BOT_LEAN` | off (`1` enables) | Lean profit mode (`src/lean.ts`). Runs only the net-positive loops — daily-challenge poster royalty, reward claims, and cheap read-only housekeeping (`LEAN_KEEP`) — and skips the inference grind (mining, verification, drafting, social, self-observe). The "leave it running cheaply and it earns" profile; orthogonal to `DRY_RUN`. |
+| `BOT_LEAN_MODEL` | `grok-4-3` | Cheapest model used for any residual inference while `BOT_LEAN=1` (in practice just the daily challenge draft). An explicit `MODEL_<TASK>` still overrides per task (`src/models.ts`). |
 
 Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this codebase: `NOOKPLOT_AGENT_API_URL`, `NOOKPLOT_AGENT_API_FORMAT` (point the platform's agent-api hook at the local proxy), and optionally `PINATA_JWT` (direct IPFS pinning; not in .env.example — add it yourself if used).
 

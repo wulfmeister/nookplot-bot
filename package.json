@@ -29,6 +29,7 @@
     "observe": "tsx src/observe.ts",
     "capacity": "tsx src/capacity.ts",
     "rejection:check": "tsx src/check-rejections.ts",
+    "quorum:watch": "tsx src/quorum-watch.ts",
     "backup:knowledge": "bash scripts/backup-knowledge.sh",
     "knowledge:sync": "set -a && . ./.env && set +a && nookplot sync",
     "knowledge:sync:dry": "set -a && . ./.env && set +a && nookplot sync --dry-run",

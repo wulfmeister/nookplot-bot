@@ -19,6 +19,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { pickModel, pickModelAB, effortFor } from "../models.js";
+import { runsInLean, LEAN_KEEP, leanBanner, isLean, type LeanTrack } from "../lean.js";
+import { analyzeQuorumHealth, type NsEntry } from "../quorum-watch.js";
 import { extractJson, extractJsonObj } from "../util.js";
 import {
   isPermanentFailure,
@@ -155,6 +157,145 @@ describe("models", () => {
     assert.equal(effortFor("gemini-3-1-pro-preview"), "xhigh");
     assert.equal(effortFor("openai-gpt-55"), "high");
     assert.equal(effortFor("unknown-model"), undefined);
+  });
+
+  it("pickModel forces the cheap model under BOT_LEAN unless MODEL_<TASK> is set", () => {
+    const savedLean = process.env.BOT_LEAN;
+    const savedOv = process.env.MODEL_MINING_SOLVE;
+    try {
+      delete process.env.MODEL_MINING_SOLVE;
+      process.env.BOT_LEAN = "1";
+      // residual inference (e.g. the daily challenge draft) drops to the cheap model
+      assert.equal(pickModel("mining_solve"), "grok-4-3");
+      assert.equal(pickModel("bounty_draft"), "grok-4-3");
+      // an explicit per-task override still wins in lean
+      process.env.MODEL_MINING_SOLVE = "claude-opus-4-8";
+      assert.equal(pickModel("mining_solve"), "claude-opus-4-8");
+    } finally {
+      if (savedLean === undefined) delete process.env.BOT_LEAN;
+      else process.env.BOT_LEAN = savedLean;
+      if (savedOv === undefined) delete process.env.MODEL_MINING_SOLVE;
+      else process.env.MODEL_MINING_SOLVE = savedOv;
+    }
+  });
+
+  it("pickModelAB also honors BOT_LEAN (the real A/B-routed draft path), not just pickModel", () => {
+    const savedLean = process.env.BOT_LEAN;
+    const savedOv = process.env.MODEL_BOUNTY_DRAFT;
+    try {
+      delete process.env.MODEL_BOUNTY_DRAFT;
+      process.env.BOT_LEAN = "1";
+      // bounty_draft has a non-empty A/B pool; lean must force the cheap model
+      // instead of sampling opus/gpt from the pool (the gap the old test missed).
+      const p = pickModelAB("bounty_draft");
+      assert.equal(p.model, "grok-4-3");
+      assert.equal(p.pool, "lean");
+      // an explicit per-task override still wins in lean on the A/B path
+      process.env.MODEL_BOUNTY_DRAFT = "claude-opus-4-8";
+      assert.equal(pickModelAB("bounty_draft").model, "claude-opus-4-8");
+    } finally {
+      if (savedLean === undefined) delete process.env.BOT_LEAN;
+      else process.env.BOT_LEAN = savedLean;
+      if (savedOv === undefined) delete process.env.MODEL_BOUNTY_DRAFT;
+      else process.env.MODEL_BOUNTY_DRAFT = savedOv;
+    }
+  });
+});
+
+// ── lean.ts ────────────────────────────────────────────────────────────
+
+describe("lean profit mode (BOT_LEAN)", () => {
+  const saved = process.env.BOT_LEAN;
+  const restore = () => {
+    if (saved === undefined) delete process.env.BOT_LEAN;
+    else process.env.BOT_LEAN = saved;
+  };
+
+  // The inference "grind" — every one of these must be skipped in lean.
+  const GRIND: LeanTrack[] = [
+    "mining", "verification", "crowdJury", "bounty", "bountyLifecycle",
+    "social", "socialEngagement", "engagement", "observation", "predictions",
+    "learnings", "teaching", "attention", "paperReproduction", "clarifications",
+    "swarms", "knowledgePublish", "draftingAndDormant",
+  ];
+
+  it("off by default → every track runs and the banner is empty", () => {
+    delete process.env.BOT_LEAN;
+    assert.equal(isLean(), false);
+    for (const t of [...LEAN_KEEP, ...GRIND]) {
+      assert.equal(runsInLean(t), true, `${t} should run when lean is off`);
+    }
+    assert.equal(leanBanner(), "");
+    restore();
+  });
+
+  it("on → only the LEAN_KEEP allowlist runs; the grind is skipped", () => {
+    process.env.BOT_LEAN = "1";
+    assert.equal(isLean(), true);
+    for (const t of LEAN_KEEP) assert.equal(runsInLean(t), true, `${t} kept in lean`);
+    for (const t of GRIND) assert.equal(runsInLean(t), false, `${t} skipped in lean`);
+    assert.ok(leanBanner().includes("BOT_LEAN=1"));
+    restore();
+  });
+
+  it("keeps the profitable core (royalty engine + reward claims), never in the grind", () => {
+    process.env.BOT_LEAN = "1";
+    assert.equal(runsInLean("claimRewards"), true);
+    assert.equal(runsInLean("weeklyRewards"), true); // wrapper for challenge posting
+    // guard against a future edit moving a profitable track into the skip set
+    assert.ok(LEAN_KEEP.has("claimRewards") && LEAN_KEEP.has("weeklyRewards"));
+    for (const core of ["claimRewards", "weeklyRewards"] as LeanTrack[]) assert.ok(!GRIND.includes(core));
+    restore();
+  });
+});
+
+// ── quorum-watch.ts ──────────────────────────────────────────────────────
+
+describe("quorum-watch.analyzeQuorumHealth (verification stall detector)", () => {
+  const base = Date.parse("2026-07-06T00:00:00.000Z");
+  const mk = (hour: number, v2: number, pendingSubs = 20): NsEntry => ({
+    ts: new Date(base + hour * 3_600_000).toISOString(),
+    epoch: 109,
+    epochStatus: "closed",
+    pool: { v2, quorumReady: 0, distinctSolvers: 30, byDifficulty: { expert: 100 }, total: 100 },
+    mine: { pendingSubs, claimableNook: v2 > 0 ? 100000 : 0 },
+  });
+
+  it("returns no-data on empty input", () => {
+    assert.equal(analyzeQuorumHealth([]).status, "no-data");
+  });
+
+  it("healthy when latest v2 > 0 (submissions progressing toward quorum)", () => {
+    const h = analyzeQuorumHealth([mk(0, 12), mk(1, 14), mk(2, 16)]);
+    assert.equal(h.status, "healthy");
+    assert.equal(h.latestV2, 16);
+    assert.equal(h.stallHours, 0);
+  });
+
+  it("stalled when v2 has been pinned at 0 for >= stallHours", () => {
+    // one healthy reading, then 7 hourly zeros (7h span) vs default 6h threshold
+    const rows = [mk(0, 14), mk(1, 0), mk(2, 0), mk(3, 0), mk(4, 0), mk(5, 0), mk(6, 0), mk(7, 0)];
+    const h = analyzeQuorumHealth(rows);
+    assert.equal(h.status, "stalled");
+    assert.equal(h.latestV2, 0);
+    assert.ok(h.stallHours >= 6, `stallHours=${h.stallHours}`);
+    assert.ok(h.lines.join("\n").includes("STALL"));
+  });
+
+  it("a short v2=0 blip under the threshold is not a stall", () => {
+    const h = analyzeQuorumHealth([mk(0, 14), mk(1, 0), mk(2, 0)], { stallHours: 6 });
+    assert.equal(h.status, "healthy"); // only ~1h of zeros
+  });
+
+  it("recovering when v2 returns > 0 after a recent 0-run", () => {
+    const h = analyzeQuorumHealth([mk(0, 0), mk(1, 0), mk(2, 0), mk(3, 5)]);
+    assert.equal(h.status, "recovering");
+    assert.equal(h.latestV2, 5);
+  });
+
+  it("tolerates out-of-order and malformed rows", () => {
+    const h = analyzeQuorumHealth([mk(2, 0), mk(0, 9), { ts: "not-a-date" } as NsEntry, mk(1, 0)]);
+    assert.equal(h.latestV2, 0); // hour-2 row is latest after sort
   });
 });
 

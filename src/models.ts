@@ -9,6 +9,8 @@
  *   openai-gpt-55, openai-gpt-55-pro, kimi-k2-6, deepseek-v4-pro
  */
 
+import { isLean } from "./lean.js";
+
 export type Task =
   | "bounty_draft"          // bounty application — medium value, low volume
   | "bounty_work"           // approved-bounty deliverables — high value
@@ -120,9 +122,21 @@ export function effortFor(model: string): ReasoningEffort | undefined {
   return MODEL_EFFORT[model];
 }
 
+// Lean mode's cheapest capable model, overridable via BOT_LEAN_MODEL. Read live
+// (like isLean) so a value set after this module loads is still honored.
+function leanModel(): string {
+  return process.env.BOT_LEAN_MODEL || "grok-4-3";
+}
+
 export function pickModel(task: Task): string {
   const envKey = `MODEL_${task.toUpperCase()}`;
-  return process.env[envKey] ?? DEFAULTS[task];
+  const override = process.env[envKey];
+  if (override) return override;
+  // Lean profit mode (BOT_LEAN=1): force the cheapest model on any residual
+  // inference — in lean the only recurring LLM call is the daily challenge
+  // draft. An explicit MODEL_<TASK> above still wins.
+  if (isLean()) return leanModel();
+  return DEFAULTS[task];
 }
 
 export interface ModelPick {
@@ -191,6 +205,13 @@ export function pickModelAB(
   if (process.env[`MODEL_${task.toUpperCase()}`]) {
     const model = process.env[`MODEL_${task.toUpperCase()}`]!;
     return { model, pool: "override", reasoning_effort: effortFor(model) };
+  }
+  // Lean profit mode: force the cheapest model instead of sampling the A/B pool
+  // (an explicit MODEL_<TASK> above still wins). Keeps the "any residual
+  // inference uses the cheapest model" guarantee on A/B-routed tasks too.
+  if (isLean()) {
+    const model = leanModel();
+    return { model, pool: "lean", reasoning_effort: effortFor(model) };
   }
   // Apply circuit-breaker if caller supplied failure-rate data
   const effectivePool = failureRates
