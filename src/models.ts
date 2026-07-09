@@ -4,9 +4,11 @@
  * Each task gets the model best suited for its value/volume tradeoff.
  * Override at runtime by setting MODEL_<TASK> env vars (uppercased).
  *
- * Venice catalog confirmed live (probed 2026-05-22):
- *   grok-4-3, grok-4-20, claude-opus-4-8, claude-opus-4-7, claude-sonnet-4-6,
- *   openai-gpt-55, openai-gpt-55-pro, kimi-k2-6, deepseek-v4-pro
+ * Venice catalog confirmed live (re-probed 2026-07-09, 100 models):
+ *   grok-4-3, grok-4-5, grok-4-20, claude-opus-4-8, claude-fable-5,
+ *   claude-sonnet-5, zai-org-glm-5-2, openai-gpt-55, openai-gpt-56-sol,
+ *   gemini-3-1-pro-preview, deepseek-v4-pro. All four mining arms below
+ *   probed 200 + non-empty on 2026-07-09.
  */
 
 import { isLean } from "./lean.js";
@@ -62,26 +64,27 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   bounty_work: undefined,
   bounty_critique: undefined,
   bounty_revise: undefined,
-  // Mining A/B (4-way as of 2026-06-15):
-  //   claude-opus-4-8        — Opus arm; replaced claude-fable-5 (Venice 500s,
-  //     functionally gone 2026-06-15) and the superseded claude-opus-4-7.
-  //     reasoning_effort=high (see MODEL_EFFORT).
-  //   openai-gpt-55          — struggling @ 8% (re-eval after spec-gate + xhigh→high)
-  //   grok-4-3               — proven on bounty drafts; 1M ctx + xSearch
-  //   gemini-3-1-pro-preview — Google flagship, 1M ctx, multimodal + reasoning effort
-  //   deepseek-v4-pro        — SIDELINED 2026-06-11: 40% submit rate (2/5,
-  //     worst in pool) while gemini/gpt-55 ran 100%. Epoch slots are the
-  //     scarce resource (12/day, failures burn slots) — a low-submit-rate
-  //     model in rotation is direct NOOK loss. The verifiable-kind override
-  //     now also respects the parse-fail circuit-breaker (mining.ts), so it
-  //     won't route there while deepseek is failing; re-add here if it recovers.
-  // At 13/day cap that's ~3.2 attempts per model per day; mining-stats has
-  // power to recommend pruning at gap ≥20pp once total n ≥ 5 per arm.
+  // Mining A/B (4-way, operator-directed refresh 2026-07-09): the prior pool
+  // had collapsed to 2 live arms — gpt-55, gemini-3-1, and deepseek-v4 all
+  // parse-failed and were circuit-broken, leaving only grok-4-3 + opus-4-8. This
+  // rotation swaps in four newer models, all re-probed 200 + non-empty:
+  //   grok-4-5          — xAI's newer grok; 500k ctx (down from 4-3's 1M), pricier
+  //     on output ($2.27/$6.80). reasoning_effort=xhigh.
+  //   zai-org-glm-5-2   — GLM-5.2, 1M ctx, $1.40/$4.40 — replaces the sidelined
+  //     deepseek-v4-pro (40% submit rate, worst in pool). effort=high.
+  //   claude-fable-5    — Claude 5 flagship; back on Venice (no longer 500s) but
+  //     2× opus cost ($12/$60). On trial per operator; effort=xhigh.
+  //   openai-gpt-56-sol — GPT-5.6 "Sol", 1M ctx, $6.25/$37.5. effort=high (OpenAI
+  //     reasoning models empty-trace at xhigh — see MODEL_EFFORT note).
+  // The parse-fail circuit-breaker (filterPoolByParseFailure) sidelines any arm
+  // that fails ≥30% over ≥5 attempts, and DEFAULTS.mining_solve (opus-4-8) is the
+  // safe fallback if all four get filtered. At 12/day that's ~3 attempts/arm/day;
+  // mining-stats recommends pruning at gap ≥20pp once n ≥ 5 per arm.
   mining_solve: [
-    "claude-opus-4-8",
-    "openai-gpt-55",
-    "grok-4-3",
-    "gemini-3-1-pro-preview",
+    "grok-4-5",
+    "zai-org-glm-5-2",
+    "claude-fable-5",
+    "openai-gpt-56-sol",
   ],
   mining_learning: undefined,
   verification_score: undefined,
@@ -110,7 +113,12 @@ const MODEL_EFFORT: Record<string, ReasoningEffort> = {
   "claude-fable-5": "xhigh",
   "claude-opus-4-7": "xhigh",
   "grok-4-3": "xhigh",
+  "grok-4-5": "xhigh",
   "openai-gpt-55": "high",
+  // OpenAI reasoning models empty-trace at xhigh (observed on gpt-55) — keep
+  // gpt-56-sol at high. GLM-5.2 at high pending its own calibration.
+  "openai-gpt-56-sol": "high",
+  "zai-org-glm-5-2": "high",
   // Probed live 2026-05-24: both accept xhigh and return non-empty.
   "gemini-3-1-pro-preview": "xhigh",
   "deepseek-v4-pro": "xhigh",

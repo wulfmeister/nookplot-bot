@@ -122,26 +122,43 @@ import { veniceRateLimited429Today } from "../venice-cost.js";
 
 describe("models", () => {
   it("pickModel returns the configured default for each task", () => {
-    // mining_solve default reverted to claude-opus-4-8 on 2026-06-15 — Venice
-    // still lists claude-fable-5 but it 500s on every inference (functionally
-    // gone); high-value tasks default to opus-4-8, volume tasks stay grok.
-    assert.equal(pickModel("mining_solve"), process.env.MODEL_MINING_SOLVE ?? "claude-opus-4-8");
-    assert.equal(pickModel("verification_score"), process.env.MODEL_VERIFICATION_SCORE ?? "grok-4-3");
+    // Non-lean default routing. Clear ambient BOT_LEAN (a local .env may set it)
+    // so this asserts the DEFAULTS map, not the lean cheap-model override.
+    const savedLean = process.env.BOT_LEAN;
+    delete process.env.BOT_LEAN;
+    try {
+      // High-value tasks default to opus-4-8 (the safe fallback under the A/B
+      // pool); volume tasks stay on grok-4-3.
+      assert.equal(pickModel("mining_solve"), process.env.MODEL_MINING_SOLVE ?? "claude-opus-4-8");
+      assert.equal(pickModel("verification_score"), process.env.MODEL_VERIFICATION_SCORE ?? "grok-4-3");
+    } finally {
+      if (savedLean === undefined) delete process.env.BOT_LEAN;
+      else process.env.BOT_LEAN = savedLean;
+    }
   });
 
   it("pickModelAB returns a model from the pool for tasks with an A/B set", () => {
-    // Pool as of 2026-06-15: fable→opus-4-8 (fable Venice-500s), opus-4-7
-    // consolidated into opus-4-8, deepseek sidelined (40% submit rate)
+    // Non-lean A/B sampling (lean would force the cheap model, pool="lean").
+    const savedLean = process.env.BOT_LEAN;
+    delete process.env.BOT_LEAN;
+    // Pool as of 2026-07-09 (operator-directed refresh): the prior arms had
+    // collapsed to 2 live models (rest parse-failed), so this rotates in four
+    // newer models — grok-4-5, glm-5.2, fable-5 (back on Venice), gpt-5.6 Sol.
     const allowed = new Set([
-      "claude-opus-4-8",
-      "openai-gpt-55",
-      "grok-4-3",
-      "gemini-3-1-pro-preview",
+      "grok-4-5",
+      "zai-org-glm-5-2",
+      "claude-fable-5",
+      "openai-gpt-56-sol",
     ]);
-    for (let i = 0; i < 20; i++) {
-      const pick = pickModelAB("mining_solve");
-      assert.equal(pick.pool, "ab");
-      assert.ok(allowed.has(pick.model), `unexpected model: ${pick.model}`);
+    try {
+      for (let i = 0; i < 20; i++) {
+        const pick = pickModelAB("mining_solve");
+        assert.equal(pick.pool, "ab");
+        assert.ok(allowed.has(pick.model), `unexpected model: ${pick.model}`);
+      }
+    } finally {
+      if (savedLean === undefined) delete process.env.BOT_LEAN;
+      else process.env.BOT_LEAN = savedLean;
     }
   });
 
