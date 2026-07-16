@@ -186,6 +186,13 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 |---|---|---|
 | `BOT_CHALLENGE_POST` | on (`0` disables) | Post quality mining challenges (poster royalties accrue per verified solve); outward-facing writes under your identity (`src/challenge-posting.ts`). |
 | `BOT_CHALLENGE_POST_CAP` | `1` | Max challenges posted per day (gateway cap is 10) (`src/challenge-posting.ts`). |
+| `BOT_CHALLENGE_DEDUPE_THRESHOLD` | `0.45` | Anti-repeat gate: token-Jaccard title similarity vs prior posted challenges at/above this blocks the draft (`src/challenge-posting.ts`). |
+| `BOT_CHALLENGE_GATE_WINDOW_DAYS` | `90` | Anti-repeat gate compares only against challenges posted within this rolling window (`src/challenge-posting.ts`). |
+| `BOT_CHALLENGE_MOTIF_COOLDOWN_DAYS` | `14` | Title-bigram motif cooldown within the same domain — blocks family repeats ("surface code distance vs X") the Jaccard gate can't see (`src/challenge-posting.ts`). |
+| `BOT_CHALLENGE_DESC_THRESHOLD` | `0.30` | Description bigram-similarity gate — catches a renamed title over the same problem text (`src/challenge-posting.ts`). |
+| `BOT_LEARNINGS` | on (`0` disables) | Publish post-solve learnings for verified submissions; grounded-only prompt + anti-repeat gate (`src/learnings.ts`). |
+| `BOT_LEARNING_DUPE_THRESHOLD` | `0.4` | Learnings anti-repeat gate: bigram similarity vs recent posted learnings at/above this skips the post (`src/learnings.ts`). |
+| `BOT_KNOWLEDGE_PUBLISH` | on (`0` disables) | Publish knowledge posts (grounded sources + daily fallback); semantic near-dupe title gate vs the last 60 days (`src/index.ts`). |
 | `BOT_BUNDLES` | on (`0` disables) | Publish on-chain knowledge bundles from your solver learnings / verifier insights (micro-royalty flywheel) (`src/bundles.ts`). |
 | `BOT_BUNDLE_INTERVAL_DAYS` | `7` | Minimum days between bundles (`src/bundles.ts`). |
 | `BOT_BUNDLE_MIN_CIDS` | `3` | Minimum new CIDs required before bundling (`src/bundles.ts`). |

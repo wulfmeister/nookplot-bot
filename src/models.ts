@@ -154,6 +154,16 @@ export interface ModelPick {
 }
 
 /**
+ * The task's A/B pool (empty when the task has none). Exposed so callers can
+ * scope reporting to models actually in rotation — the failure-rate history
+ * covers RETIRED models too, and logging those as "sidelined" every tick is
+ * noise (they're never picked, so sidelining them is a no-op).
+ */
+export function abPool(task: Task): readonly string[] {
+  return A_B_POOL[task] ?? [];
+}
+
+/**
  * Cost-circuit-breaker (#16): if a model's recent mining parse-failure rate
  * exceeds this threshold, exclude it from the A/B pool for the next 24h.
  * This prevents repeated 3-5 cr burns on a model that's reliably producing

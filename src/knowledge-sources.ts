@@ -14,7 +14,7 @@
  * Returns null all-around if nothing grounded is ready. The caller decides
  * whether to fall back to a generic post (max once per week).
  */
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { NookplotRuntime } from "@nookplot/runtime";
 import { chat, VENICE_WEB_SEARCH } from "./venice.js";
@@ -97,8 +97,11 @@ function readVerificationNotes(maxAgeMs: number): VerificationNote[] {
     const insightMatch = body.match(/## Insight submitted\s*\n+([\s\S]*?)(?:\n##|\n*$)/);
     const insight = (insightMatch?.[1] ?? "").trim().slice(0, 500);
     const scores = scoresMatch[1].split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n));
-    // Use file mtime as proxy for ts
-    const stat = (existsSync(join(dir, f)) ? Date.now() : 0); // simplification
+    // Real file mtime. The old "existsSync ? Date.now() : 0" placeholder made
+    // every note pass the recency cutoff forever, so the synthesis prompt's
+    // "Trace count in last 14 days: N" was an all-time count — the pipeline
+    // itself fabricating the recency claim its grounding rules forbid.
+    const stat = statSync(join(dir, f)).mtimeMs;
     if (stat < cutoff) continue;
     notes.push({
       submissionId: subMatch[1],
@@ -135,28 +138,25 @@ async function verificationSynthesis(): Promise<KnowledgePost | null> {
   if (!chosen) return null;
 
   const sample = chosen.notes.slice(0, 10);
-  const sys = `You write a "what I observed verifying N traces in <domain>" synthesis post for a knowledge network. The post is grounded in actual verifications — every claim must reference at least one specific submission by ID.
+  // Prompt rewritten 2026-07-15: the old REQUIRED four-heading structure was
+  // reproduced verbatim in 47 of 192 published posts — peers flagged the
+  // output as templated. Structure is now the writer's choice; grounding
+  // rules are tightened instead (fabricated "measured results" were the other
+  // audit finding).
+  const sys = `You write a "what I observed verifying N traces in <domain>" synthesis post for a knowledge network. The post is grounded in actual verifications.
 
 OUTPUT JSON ONLY:
-{"title": "5-14 word title naming the domain + the observation", "body": "<markdown body 800-1300 words>"}
+{"title": "5-14 word title naming the domain + the observation", "body": "<markdown body — as long as the material supports, 300-1300 words>"}
 
-REQUIRED structure for body:
-## Setup
-What I verified, how many, over what period. Be specific.
+LENGTH: write ONLY as much as the material supports. Never pad — no restating earlier points, no re-listing the same IDs, no "to elaborate"/"furthermore" recaps. A tight 350-word synthesis of 5 traces beats a padded 900-word one. End when the material is exhausted.
 
-## What stood out
-3-5 numbered observations. EACH must cite at least one submission ID (8-char prefix is enough). Concrete patterns, not vague claims.
+GROUNDING (hard rules):
+- Every claim must reference at least one specific submission by ID (8-char prefix). Never fake a citation.
+- Every number must come from the sample data below — score ranges, trace counts. NEVER invent benchmark results, latencies, or throughput figures, and never present a challenge's TARGET numbers as measured outcomes.
+- Concrete counts ("4 of 7 traces", "scores ranged 0.35-0.82"), not "many"/"some".
+- End with a list of every submissionId referenced.
 
-## What I'd grade harder next time
-1-2 calibration notes — patterns I noticed I might've been over-generous on.
-
-## Citations
-Numbered list of every submissionId you referenced.
-
-REQUIREMENTS:
-- Cite specific submissionIds (8-char prefix). Never fake a citation.
-- Concrete numbers ("4 of 7 traces", "scores ranged 0.35-0.82"), not "many" / "some".
-- No fluff. No "in conclusion." No greetings.`;
+STRUCTURE: your choice — organize the post around what the observations themselves suggest (a single thread, a contrast, a ranked list, a narrative). Do NOT use a fixed section template; do not reuse the same headings across posts; headings are optional. No fluff, no "in conclusion", no greetings.`;
 
   const userMsg = `Domain: ${chosen.domain}
 Trace count in last 14 days: ${chosen.notes.length}
@@ -219,28 +219,25 @@ async function miningPostmortem(): Promise<KnowledgePost | null> {
   if (!existsSync(vaultFile)) return null;
   const vault = readFileSync(vaultFile, "utf8");
 
+  // Prompt rewritten 2026-07-15: the old five-heading skeleton appeared
+  // verbatim in 137 of 192 published posts, and its "single most concrete
+  // thing" phrasing became a boilerplate opener in 95 — the exact template
+  // reuse peers were calling out. Structure is now free; grounding rules
+  // replace it (identical fabricated benchmark numbers across unrelated
+  // domains were the worst audit finding on this surface).
   const sys = `You write a public knowledge post that postmortems a mining challenge solve. The audience is other agents who will face similar problems. The post must cite the specific challengeId + the IPFS-pinned trace.
 
 OUTPUT JSON ONLY:
-{"title":"5-14 word title naming the specific technique or pitfall", "body":"<markdown 700-1100 words>"}
+{"title":"5-14 word title naming the specific technique or pitfall", "body":"<markdown — as long as the material supports, 300-1100 words>"}
 
-Body structure:
-## What the challenge asked
-Brief restatement (3-5 sentences).
+LENGTH: write ONLY as much as the note supports. Never pad — no restating, no recap paragraphs. End when the material is exhausted.
 
-## My approach
-What I tried. Be specific about choices and tradeoffs.
+GROUNDING (hard rules):
+- Every number in the post must come from the vault note below. NEVER invent measurements, and never restate the challenge's TARGET figures (throughput/latency/cache-rate goals) as if they were achieved results. If the note has no concrete outcome numbers, write the post without any.
+- The vault note may itself contain the trace's OWN claimed measurements ("Result: 92% hit rate", "measured 1.8x speedup") — these were never validated by anyone. Either omit them or attribute them explicitly as the trace's unverified claims ("the trace reports X, unverified"); NEVER present them as achieved or measured results. A number is only a result if the note's verification outcome section confirms it.
+- Cite the challengeId (and traceCid if known) at the end; cite any papers/learnings the note itself references. Never fake a citation.
 
-## What surprised me
-The single most concrete thing I learned. Cite numbers or behaviors.
-
-## What I'd do differently
-1-2 specific changes for next time.
-
-## Citations
-- challengeId: <id>
-- traceCid: <cid if known>
-- Any papers/learnings I cited`;
+STRUCTURE: your choice — let the solve's actual story dictate the shape (lead with the pitfall, or the technique, or the wrong turn). Do NOT use a fixed section template; do not reuse the same headings across posts. No boilerplate openers or "in conclusion".`;
 
   const userMsg = `Challenge ID: ${candidate.challengeId}
 Submission ID: ${candidate.submissionId}

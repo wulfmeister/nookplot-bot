@@ -114,7 +114,13 @@ import { compareChallengePriority, challengeValueTier, isTransientGenerationErro
 import { pickAlternateModel } from "../models.js";
 import { selectBundleCids, bundleDue, sanitizeBundleTags, registeredPublishedCids } from "../bundles.js";
 import { countWithinDays, cohortAddresses } from "../cohort-benchmark.js";
-import { postedToday, isDuplicateTitle, rotateDomain, epochDay, nextSettlementMs } from "../challenge-posting.js";
+import {
+  postedToday, isDuplicateTitle, rotateDomain, epochDay, nextSettlementMs,
+  titleSimilarity, findNearDuplicate, recentPostedTitles, rotateGrounding,
+  recentGroundingKeys, noteKey, titleTokenList, gateCorpus, findMotifCollision,
+  descriptionSimilarity, isGateRelaxed, fallbackDomainOrder,
+} from "../challenge-posting.js";
+import { findRepetitiveLearning, findLearningMotifCollision } from "../learnings.js";
 import { scoreIntentFit } from "../manifest-intents.js";
 import { veniceRateLimited429Today } from "../venice-cost.js";
 
@@ -1566,6 +1572,271 @@ describe("challenge-posting helpers", () => {
     assert.equal(rotateDomain(d, 0), "a");
     assert.equal(rotateDomain(d, 4), "b");
     assert.equal(rotateDomain([], 5), "algorithms");
+  });
+});
+
+describe("challenge-posting anti-repeat gate", () => {
+  // Real near-dupe pairs from the first 40 posted challenges (the measured
+  // 45%-repetition incident, 2026-07-15) — the gate MUST catch these.
+  const realDupes: Array<[string, string]> = [
+    [
+      "Tuning Deopt/Respec Thresholds to Stop a JIT Oscillation",
+      "Tuning Deopt/Respec Thresholds to Stop Oscillation in a Tracing JIT",
+    ],
+    [
+      "Taming Deopt Oscillation in a Speculative JIT: Threshold Tuning vs. Guard Stability",
+      "Taming Deopt Oscillation in a Speculative Tracing JIT",
+    ],
+    [
+      "DP-SGD Budget Allocation: RDP Accountant vs Subsampled Gaussian Composition",
+      "DP-SGD Budget Allocation: RDP Accountant vs Fixed-Noise Under a Fixed Compute Cap",
+    ],
+    [
+      "Cuckoo vs Robin Hood Hashing: Termination-Safe Insert Path Under 0.92 Load",
+      "Cuckoo vs Robin Hood Hashing: Insertion Termination Under 0.85 Load Factor",
+    ],
+    // Caught ONLY with plural-stemming + numeric-drop (0.36 unstemmed — the
+    // adversarial design review's escape case; 0.46 with the pinned tokenizer).
+    [
+      "Recall-vs-Memory Showdown: Tuning `HNSW` Against `Multi-Probe LSH` at 50M Vectors",
+      "Tuning LSH Bands vs HNSW Layers for 50M-Vector ANN Recall",
+    ],
+  ];
+  // Legitimately-distinct pairs from the same corpus — must NOT be blocked.
+  const realDistinct: Array<[string, string]> = [
+    [
+      "Recall-vs-Memory Showdown: Tuning `HNSW` Against `Multi-Probe LSH` at 50M Vectors",
+      "Quorum Sizing vs Tail Latency: Diagnosing a Stalled Geo-Replicated Write Path",
+    ],
+    [
+      "Substring Search Under a Latency Budget: KMP vs Rolling-Hash on Streamed Logs",
+      "Surface-Code Distance vs Shot-Budget: Reaching 10^-9 Logical Error for a 2000-Cycle Algorithm",
+    ],
+    [
+      "Rate Limiter Showdown: Fixed-Window vs Sliding-Window-Log Under Burst Load",
+      "HLC vs Vector-Clock Causality Under a 6-Node Partition with Clock Skew",
+    ],
+  ];
+
+  it("titleSimilarity catches every real observed dupe pair at >= 0.45", () => {
+    for (const [a, b] of realDupes) {
+      const s = titleSimilarity(a, b);
+      assert.ok(s >= 0.45, `expected >=0.45 for real dupe pair, got ${s.toFixed(2)}: "${a}" / "${b}"`);
+    }
+  });
+
+  it("titleSimilarity passes legitimately-distinct titles well under the threshold", () => {
+    for (const [a, b] of realDistinct) {
+      const s = titleSimilarity(a, b);
+      assert.ok(s < 0.30, `expected <0.30 for distinct pair, got ${s.toFixed(2)}: "${a}" / "${b}"`);
+    }
+  });
+
+  it("findNearDuplicate returns the closest colliding title and skips the skip-placeholder", () => {
+    const prior = [
+      { title: "(no acceptable draft)" },
+      { title: "Taming Deopt Oscillation in a Speculative JIT: Threshold Tuning vs. Guard Stability" },
+      { title: "Rate Limiter Showdown: Fixed-Window vs Sliding-Window-Log Under Burst Load" },
+    ];
+    const hit = findNearDuplicate("Taming Deopt Oscillation in a Speculative Tracing JIT", prior);
+    assert.ok(hit, "expected a near-dupe hit");
+    assert.match(hit!.title, /Taming Deopt Oscillation/);
+    assert.ok(hit!.similarity >= 0.45);
+    assert.equal(findNearDuplicate("Bloom-Filter Sizing for a 10M-Key Distributed Cache", prior), null);
+  });
+
+  it("an exact duplicate scores 1.0 — the semantic gate subsumes exact dedupe", () => {
+    assert.equal(titleSimilarity("Optimize Raft log compaction!", "optimize raft log compaction"), 1);
+  });
+
+  it("recentPostedTitles keeps only posted entries within the window", () => {
+    const prior = [
+      { ts: "2026-07-01T03:00:00Z", title: "old", outcome: "posted" },
+      { ts: "2026-07-14T03:00:00Z", title: "fresh", outcome: "posted" },
+      { ts: "2026-07-14T04:00:00Z", title: "skipped-entry", outcome: "skipped" },
+    ];
+    assert.deepEqual(recentPostedTitles(prior, "2026-07-15T12:00:00Z", 14), ["fresh"]);
+  });
+
+  it("rotateGrounding prefers unused notes and pads with used ones", () => {
+    const notes = [
+      { path: "/v/research/a.md" },
+      { path: "/v/research/b.md" },
+      { path: "/v/research/c.md" },
+      { path: "/v/research/d.md" },
+    ];
+    const used = new Set(["a", "b", "c"]);
+    const picked = rotateGrounding(notes, used, 3).map((n) => n.path);
+    // d is the only fresh note — it must come first; used notes pad the rest.
+    assert.deepEqual(picked, ["/v/research/d.md", "/v/research/a.md", "/v/research/b.md"]);
+    // Nothing used → straight top-N.
+    assert.deepEqual(rotateGrounding(notes, new Set(), 2).map((n) => n.path), ["/v/research/a.md", "/v/research/b.md"]);
+  });
+
+  it("recentGroundingKeys unions note keys within the window only", () => {
+    const prior = [
+      { ts: "2026-06-01T03:00:00Z", groundingNotes: ["stale"] },
+      { ts: "2026-07-10T03:00:00Z", groundingNotes: ["x", "y"] },
+      { ts: "2026-07-14T03:00:00Z" }, // no grounding recorded (pre-migration entry)
+    ];
+    const keys = recentGroundingKeys(prior, "2026-07-15T12:00:00Z", 30);
+    assert.deepEqual([...keys].sort(), ["x", "y"]);
+  });
+
+  it("noteKey strips directory and extension", () => {
+    assert.equal(noteKey("/Users/x/vault/research/verification-b207.md"), "verification-b207");
+    assert.equal(noteKey("plain.md"), "plain");
+  });
+
+  it("titleTokenList drops pure numbers and stems trailing plural-s (the fake-novelty levers)", () => {
+    const toks = titleTokenList("Surface-Code Distance for 1,200 Qubits at 0.92 Load");
+    assert.ok(!toks.includes("1200") && !toks.includes("200") && !toks.includes("92"), `numbers kept: ${toks}`);
+    assert.ok(toks.includes("qubit"), `expected stemmed "qubit" in ${toks}`);
+    // Real dupes differed ONLY in numbers — tokenization must make them identical.
+    assert.equal(
+      titleSimilarity(
+        "Surface Code Distance vs. T-Gate Throughput Budget on a 1,000-Qubit Superconducting Chip",
+        "Surface Code Distance vs. T-Gate Throughput Budget on a 1,200-Qubit Superconducting Chip",
+      ),
+      1,
+    );
+  });
+
+  it("gateCorpus keeps only live rows (posted/posting) inside the rolling window", () => {
+    const now = "2026-07-15T12:00:00Z";
+    const prior = [
+      { ts: "2026-07-10T03:00:00Z", title: "live", outcome: "posted" },
+      { ts: "2026-07-11T03:00:00Z", title: "inflight", outcome: "posting" },
+      { ts: "2026-07-12T03:00:00Z", title: "never seen by peers", outcome: "skipped" },
+      { ts: "2026-07-13T03:00:00Z", title: "gateway 500d", outcome: "error" },
+      { ts: "2026-03-01T03:00:00Z", title: "ancient", outcome: "posted" },
+      { ts: "2026-07-14T03:00:00Z", title: "(no acceptable draft)", outcome: "posted" },
+    ];
+    assert.deepEqual(gateCorpus(prior, now, 90).map((p) => p.title), ["live", "inflight"]);
+  });
+
+  it("findMotifCollision blocks same-domain family repeats that Jaccard misses", () => {
+    const now = "2026-07-15T12:00:00Z";
+    const corpus = [
+      { ts: "2026-07-12T03:00:00Z", title: "Surface-Code Distance vs. Error-Mitigation Budget for a 50-Qubit VQE Run", domain: "quantum" },
+    ];
+    // Different problem (decoder latency vs error mitigation) but the same
+    // "surface code distance" motif within the cooldown — blocked in-domain…
+    const hit = findMotifCollision("Surface-Code Distance vs Decoder-Latency Budget", "quantum", corpus, now);
+    assert.ok(hit, "expected motif collision");
+    assert.match(hit!.bigram, /surface code|code distance/);
+    // …but NOT blocked in a different domain, and not after the cooldown.
+    assert.equal(findMotifCollision("Surface-Code Distance vs Decoder-Latency Budget", "compilers", corpus, now), null);
+    assert.equal(findMotifCollision("Surface-Code Distance vs Decoder-Latency Budget", "quantum", corpus, "2026-08-30T12:00:00Z"), null);
+  });
+
+  it("descriptionSimilarity flags same-recipe descriptions, passes distinct ones", () => {
+    const a = "Compare `HNSW` recall against `LSH` at 50M vectors under a 15ms p99 latency budget with a 64GB memory cap.";
+    const same = "Compare `HNSW` recall against `LSH` at 80M vectors under a 20ms p99 latency budget with a 32GB memory cap.";
+    const diff = "Diagnose a stalled geo-replicated write path where quorum sizing interacts with tail latency under clock skew.";
+    assert.ok(descriptionSimilarity(a, same) >= 0.3, `same-recipe scored ${descriptionSimilarity(a, same)}`);
+    assert.ok(descriptionSimilarity(a, diff) < 0.3, `distinct scored ${descriptionSimilarity(a, diff)}`);
+  });
+
+  it("isGateRelaxed inside 4h of settlement and on rescue", () => {
+    assert.equal(isGateRelaxed(Date.parse("2026-07-15T23:30:00Z"), false), true);  // 02:00Z is 2.5h away
+    assert.equal(isGateRelaxed(Date.parse("2026-07-15T12:00:00Z"), false), false); // 14h away
+    assert.equal(isGateRelaxed(Date.parse("2026-07-15T12:00:00Z"), true), true);   // rescue always
+  });
+
+  it("fallbackDomainOrder: primary first, stalest next, never a domain already posted today", () => {
+    const now = "2026-07-15T12:00:00Z";
+    const prior = [
+      { ts: "2026-07-15T03:00:00Z", domain: "quantum", outcome: "posted" },   // today
+      { ts: "2026-07-13T03:00:00Z", domain: "compilers", outcome: "posted" }, // 2d ago
+      { ts: "2026-07-01T03:00:00Z", domain: "ml", outcome: "posted" },        // stale
+    ];
+    const order = fallbackDomainOrder(["quantum", "compilers", "ml", "distributed"], prior, now, "compilers");
+    assert.deepEqual(order, ["compilers", "distributed", "ml"]); // quantum excluded (posted today); never-posted "distributed" is stalest
+    // Primary itself already posted today → excluded too (rescue case).
+    assert.deepEqual(fallbackDomainOrder(["quantum", "ml"], prior, now, "quantum"), ["ml"]);
+  });
+
+  it("titleSimilarity blocks the real SSRF knowledge-post permutations", () => {
+    // 16 of these shipped in a month under exact-match dedupe — the semantic
+    // gate must catch the permutation game.
+    const pairs: Array<[string, string]> = [
+      ["SSRF Defense Using DNS Resolution and IP-Range Filtering", "SSRF Defense via DNS Resolution and IP-Range Blocking"],
+      ["SSRF Mitigation Through Strict DNS and IP-Range Validation", "SSRF Mitigation Through DNS Lookup and IP-Range Blocking"],
+      ["DNS Resolution and IP Range Blocking for SSRF Safe Fetching", "SSRF Defense Using DNS Resolution and IP-Range Filtering"],
+    ];
+    for (const [a, b] of pairs) {
+      const s = titleSimilarity(a, b);
+      assert.ok(s >= 0.45, `expected >=0.45, got ${s.toFixed(2)}: "${a}" / "${b}"`);
+    }
+  });
+
+  it("findRepetitiveLearning catches a retold story with different invented numbers", () => {
+    // Real audit case: the same Dinic's-beats-Edmonds-Karp tale, retold 2 days
+    // apart with different made-up speedups (4.5x vs 9.4x). Numbers are
+    // dropped by the tokenizer, so the retelling collides.
+    const prior = [
+      "Switching from Edmonds-Karp to Dinic's algorithm on the max-flow challenge gave a 4.5x speedup; the level-graph BFS phases avoided redundant augmenting-path scans on the dense layered network.",
+    ];
+    const retold =
+      "On the max-flow challenge, replacing Edmonds-Karp with Dinic's algorithm was a 9.4x speedup — level-graph BFS phases cut the redundant augmenting-path scans on the dense layered network.";
+    const hit = findRepetitiveLearning(retold, prior);
+    assert.ok(hit, "expected the retold learning to be flagged");
+    assert.ok(hit!.similarity >= 0.4);
+    // A genuinely different insight passes.
+    const fresh =
+      "The verifier's hidden tests included a zero-capacity self-loop, which my adjacency-matrix representation silently dropped; an explicit edge-list with per-edge residuals handled it.";
+    assert.equal(findRepetitiveLearning(fresh, prior), null);
+  });
+
+  it("findLearningMotifCollision blocks paraphrased retellings via their anchor bigrams", () => {
+    // The verify pass measured the Jaccard gate INERT on paraphrases (real
+    // corpus max pair 0.11) — the motif gate must catch what it can't: the
+    // technique bigram survives any rewording.
+    const priorSummaries = [
+      "Dijkstra with a binary heap beat Bellman-Ford by a wide margin once negative edges were ruled out.",
+      "Union-find with path compression turned the connectivity checks near-constant.",
+    ];
+    const retold = "Ruling out negative weights allowed swapping Bellman-Ford for heap-based Dijkstra, a large win.";
+    const hit = findLearningMotifCollision(retold, priorSummaries);
+    assert.ok(hit, "expected the bellman-ford retelling to be flagged");
+    assert.equal(hit!.bigram, "bellman ford");
+    // Generic-only shared bigrams ("edge case", "hidden test") do NOT block.
+    const generic = "An edge case in the hidden tests required clamping the output to the valid range.";
+    assert.equal(
+      findLearningMotifCollision(generic, ["Another edge case appeared in the hidden tests for the parser challenge."]),
+      null,
+    );
+    // A fresh technique passes.
+    assert.equal(findLearningMotifCollision("Kahan summation fixed the float drift on the 1e6-term series.", priorSummaries), null);
+  });
+
+  it("postedToday counts orphaned posting-intents but not finalized ones", () => {
+    const now = "2026-07-15T12:00:00Z";
+    // Intent + its finalizing posted row = ONE post, not two.
+    assert.equal(
+      postedToday(
+        [
+          { ts: "2026-07-15T03:00:00Z", outcome: "posting", title: "X" },
+          { ts: "2026-07-15T03:00:05Z", outcome: "posted", title: "X" },
+        ],
+        now,
+      ),
+      1,
+    );
+    // Orphaned intent (crash mid-POST) counts as a post — conservative.
+    assert.equal(postedToday([{ ts: "2026-07-15T03:00:00Z", outcome: "posting", title: "X" }], now), 1);
+    // Intent finalized as error (gateway rejected) = zero posts.
+    assert.equal(
+      postedToday(
+        [
+          { ts: "2026-07-15T03:00:00Z", outcome: "posting", title: "X" },
+          { ts: "2026-07-15T03:00:05Z", outcome: "error", title: "X" },
+        ],
+        now,
+      ),
+      0,
+    );
   });
 });
 

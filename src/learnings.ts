@@ -1,8 +1,10 @@
 import { join } from "node:path";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import type { NookplotRuntime } from "@nookplot/runtime";
 import { chat } from "./venice.js";
 import { pickModel } from "./models.js";
-import { writeNote } from "./vault.js";
+import { writeNote, VAULT_DIR } from "./vault.js";
+import { descriptionSimilarity, titleBigrams } from "./challenge-posting.js";
 import { NOOK_DIR, readJsonl, appendJsonl } from "./util.js";
 
 type RuntimeLike = Pick<NookplotRuntime, "connection">;
@@ -46,8 +48,144 @@ interface LearningEntry {
   specificityScore?: number;
   status: "posted" | "skipped" | "error" | "rejection-analyzed" | "expired";
   notes?: string;
+  /** Posted summary — the anti-repeat gate compares new drafts against these. */
+  summary?: string;
 }
 
+// ── Anti-repeat gate (2026-07-15) ─────────────────────────────────────────
+// The audit found the same story beats retold across learnings with different
+// invented numbers (the same Dinic's-beats-Edmonds-Karp tale twice in 3 days
+// at "4.5x" then "9.4x"). Two complementary checks — a skipped learning costs
+// nothing, the 9th union-find-path-compression post costs credibility:
+//  1. Bigram-Jaccard vs recent texts — catches near-verbatim clones (a
+//     numbers-swapped clone scores ~0.76 since the tokenizer drops numerics).
+//     Measured on the real 203-note corpus this ALONE is inert against
+//     paraphrased retellings (max real pair 0.11), hence:
+//  2. Technique-motif cooldown — a distinctive bigram ("union find",
+//     "bellman ford") shared with a recent learning's summary blocks the
+//     draft, the same family mechanism the challenge poster needed for
+//     repeats that live under any Jaccard threshold.
+
+export const LEARNING_DUPE_THRESHOLD = Number(process.env.BOT_LEARNING_DUPE_THRESHOLD ?? 0.4);
+export const LEARNING_MOTIF_COOLDOWN_DAYS = Number(process.env.BOT_LEARNING_MOTIF_COOLDOWN_DAYS ?? 14);
+
+/** Bigram-Jaccard the draft against recent learning texts; null = fresh. */
+export function findRepetitiveLearning(
+  draftText: string,
+  priorTexts: string[],
+  threshold = LEARNING_DUPE_THRESHOLD,
+): { similarity: number; prior: string } | null {
+  let best: { similarity: number; prior: string } | null = null;
+  for (const p of priorTexts) {
+    const s = descriptionSimilarity(draftText, p);
+    if (s >= threshold && (!best || s > best.similarity)) best = { similarity: s, prior: p };
+  }
+  return best;
+}
+
+/**
+ * Tokens too generic to identify a technique family — a bigram made ONLY of
+ * these ("edge case", "hidden test") is not a motif; one distinctive token
+ * ("union find", "max flow") makes it one.
+ */
+const GENERIC_LEARNING_TOKENS = new Set([
+  "edge", "case", "hidden", "test", "verifier", "challenge", "solution",
+  "problem", "approach", "algorithm", "python", "code", "function", "input",
+  "output", "result", "time", "complexity", "performance", "solve",
+  "submission", "trace", "solver", "constraint", "large", "small", "faster",
+  "slower", "speedup", "handled", "correct", "learning", "insight",
+]);
+
+/**
+ * Motif cooldown: does the draft summary share a DISTINCTIVE technique bigram
+ * with any recent learning summary? Paraphrased retellings keep their anchor
+ * bigrams ("dinic algorithm", "path compression") even when every sentence is
+ * reworded, which is exactly what Jaccard can't see.
+ */
+export function findLearningMotifCollision(
+  draftSummary: string,
+  priorSummaries: string[],
+): { bigram: string; prior: string } | null {
+  const distinctive = (b: string): boolean => {
+    const [x, y] = b.split(" ");
+    return !(GENERIC_LEARNING_TOKENS.has(x) && GENERIC_LEARNING_TOKENS.has(y));
+  };
+  const draftBigrams = new Set([...titleBigrams(draftSummary)].filter(distinctive));
+  if (draftBigrams.size === 0) return null;
+  for (const p of priorSummaries) {
+    for (const b of titleBigrams(p)) {
+      if (draftBigrams.has(b)) return { bigram: b, prior: p };
+    }
+  }
+  return null;
+}
+
+/**
+ * Recent learning texts for the verbatim-clone gate: summaries stored in the
+ * log (new entries) backfilled with the ## Summary/## Content sections of the
+ * newest vault learning notes — so the gate is armed on day one instead of
+ * waiting for post-rewrite entries to accumulate.
+ */
+export function recentLearningTexts(max = 25): string[] {
+  const out: string[] = [];
+  for (const e of readJsonl<LearningEntry>(LEARNING_LOG).slice(-max)) {
+    if (e.status === "posted" && e.summary) out.push(e.summary);
+  }
+  try {
+    const dir = join(VAULT_DIR, "research");
+    const files = readdirSync(dir)
+      .filter((f) => f.startsWith("learning-") && f.endsWith(".md"))
+      .map((f) => ({ f, m: statSync(join(dir, f)).mtimeMs }))
+      .sort((a, b) => b.m - a.m)
+      .slice(0, max);
+    for (const { f } of files) {
+      const raw = readFileSync(join(dir, f), "utf8");
+      const body = raw.split(/^## Summary$/m)[1];
+      if (body) out.push(body.replace(/^## Content$/m, " ").replace(/\s+/g, " ").trim().slice(0, 1200));
+    }
+  } catch {
+    /* vault dir missing — log summaries alone still gate */
+  }
+  return out.slice(0, max * 2);
+}
+
+/**
+ * Summaries of learnings posted within the motif-cooldown window (log entries
+ * + vault notes by mtime) — the corpus for findLearningMotifCollision.
+ */
+export function recentLearningSummaries(days = LEARNING_MOTIF_COOLDOWN_DAYS): string[] {
+  const cutoff = Date.now() - days * 86_400_000;
+  const out: string[] = [];
+  for (const e of readJsonl<LearningEntry>(LEARNING_LOG)) {
+    if (e.status === "posted" && e.summary && new Date(e.ts).getTime() >= cutoff) out.push(e.summary);
+  }
+  try {
+    const dir = join(VAULT_DIR, "research");
+    for (const f of readdirSync(dir)) {
+      if (!f.startsWith("learning-") || !f.endsWith(".md")) continue;
+      if (statSync(join(dir, f)).mtimeMs < cutoff) continue;
+      const raw = readFileSync(join(dir, f), "utf8");
+      const m = raw.match(/^## Summary\s*\n+([\s\S]*?)(?:\n## |$)/m);
+      if (m) out.push(m[1].replace(/\s+/g, " ").trim().slice(0, 400));
+    }
+  } catch {
+    /* vault dir missing — log summaries alone still gate */
+  }
+  return out;
+}
+
+/**
+ * Prompt rewritten 2026-07-15 after a corpus audit of the 203 published
+ * learnings: 187 followed one 4-beat template dictated by the old prompt
+ * ("surprised you when the verifier ran" became a literal section in 19/19
+ * recent posts), the old few-shot example LEAKED verbatim into public posts
+ * ("EvalPlus" named on challenges that never involved it), and several posts
+ * carried fabricated process claims ("4 iterations on verifier feedback" —
+ * this pipeline submits exactly once). The new prompt is grounding-first
+ * (every fact must exist in the supplied material), template-free, and may
+ * decline ({"skip":true}) when the material is too thin — a skipped learning
+ * costs nothing, a fabricated one costs reputation.
+ */
 async function generateLearning(args: {
   challengeTitle: string;
   challengeDescription: string;
@@ -55,30 +193,35 @@ async function generateLearning(args: {
   reasoning: string;
   outcome: Record<string, unknown>;
   hiddenTests?: unknown;
-}): Promise<{ content: string; summary: string } | null> {
-  const sys = `You write a post-solve learning for the Nookplot mining network. Be SPECIFIC: concrete numbers, named techniques, edge cases you handled, things that surprised you when the verifier ran. Generic prose scores low — specifics rank higher in challenge_related_learnings.
+}): Promise<{ content: string; summary: string } | "skip" | null> {
+  const sys = `You are writing a short post-solve note for other agents on a mining network, attached to a verified submission of yours.
 
-Length: 400-900 chars of markdown content; 80-200 char summary.
-Output JSON only:
-{"content": "<markdown body>", "summary": "<one-paragraph specific summary>"}
+HARD GROUNDING RULE: every number, test count, tool name, and behavior you mention MUST appear in the material below (challenge, your submit-time reasoning, verifier outcome, revealed tests). If it is not in the material, it does not exist. Do NOT invent timings, iteration counts, test totals, benchmark results, or process details — this pipeline submits exactly once, so never describe feedback loops, reruns, or "iterations". Do not name harnesses or tools unless the material names them.
 
-Good example: "For nth-decagonal-number (n*(4n-3)), the obvious recurrence d(n) = d(n-1) + (8n-7) is 2x slower than the closed form on n>10000. The EvalPlus harness adds large-n edge cases the vanilla MBPP misses; tested up to n=1e7."
+NUMBER PROVENANCE: numbers in the challenge DESCRIPTION are requirements/targets the challenge asked for — if you mention one, attribute it that way ("the challenge required X"). Only numbers appearing in the verifier outcome or revealed tests may be stated as results or observed behavior. If the outcome contains no numbers, your note states no result numbers.
 
-Bad example: "I used Python and followed best practices. Edge cases are important."`;
+CONTENT: extract the ONE most transferable insight from THIS solve — a technique that mattered, a pitfall, an unexpected verifier behavior. Quote the concrete evidence from the material. If the material is too thin to support a concrete, non-generic insight, output {"skip":true} instead of padding.
 
-  const userMsg = `Challenge: ${args.challengeTitle}\nVerifier kind: ${args.verifierKind}\n\nDescription:\n${args.challengeDescription.slice(0, 1500)}\n\nMy reasoning at submit time:\n${args.reasoning}\n\nVerifier outcome:\n${JSON.stringify(args.outcome).slice(0, 1500)}${args.hiddenTests ? `\n\nNow-revealed hidden tests:\n${JSON.stringify(args.hiddenTests).slice(0, 1500)}` : ""}`;
+STYLE: plain engineer-to-engineer prose, 400-900 chars. No headings, no fixed sections, no boilerplate openers (never start with the network's name or "Post-solve learning"). Do not reuse a rigid structure — write the way the insight itself wants to be written.
+
+Output JSON only: {"content":"<markdown>","summary":"<80-200 chars>"} or {"skip":true}`;
+
+  const userMsg = `Challenge: ${args.challengeTitle}\nVerifier kind: ${args.verifierKind}\n\nDescription:\n${args.challengeDescription.slice(0, 1500)}\n\nMy reasoning at submit time:\n${args.reasoning.slice(0, 4000)}\n\nVerifier outcome:\n${JSON.stringify(args.outcome).slice(0, 1500)}${args.hiddenTests ? `\n\nNow-revealed hidden tests:\n${JSON.stringify(args.hiddenTests).slice(0, 1500)}` : ""}`;
 
   const res = await chat([
     { role: "system", content: sys },
     { role: "user", content: userMsg },
-  ], { max_tokens: 700, temperature: 0.4, model: pickModel("mining_learning") });
+    // 0.7 (was 0.4): with the template gone, low temperature was still
+    // converging on near-identical phrasing across notes.
+  ], { max_tokens: 700, temperature: 0.7, model: pickModel("mining_learning") });
 
   const cleaned = res.content.trim().replace(/```json|```/g, "");
   const first = cleaned.indexOf("{");
   const last = cleaned.lastIndexOf("}");
   if (first === -1 || last <= first) return null;
   try {
-    const parsed = JSON.parse(cleaned.slice(first, last + 1)) as { content?: string; summary?: string };
+    const parsed = JSON.parse(cleaned.slice(first, last + 1)) as { content?: string; summary?: string; skip?: boolean | string };
+    if (parsed.skip === true || parsed.skip === "true") return "skip";
     if (!parsed.content || !parsed.summary) return null;
     return {
       content: parsed.content,
@@ -181,6 +324,13 @@ export async function publishPostSolveLearnings(
   runtime: RuntimeLike,
   opts: { dryRun?: boolean } = {},
 ): Promise<void> {
+  // Kill-switch (2026-07-15): a corpus audit found 187/203 published learnings
+  // on one 4-beat template, the generation prompt's few-shot example leaking
+  // verbatim into posts ("EvalPlus" named on unrelated challenges), and
+  // fabricated process claims ("4 iterations on verifier feedback" — the
+  // pipeline submits once). Paused via BOT_LEARNINGS=0 until the prompt is
+  // rewritten and an anti-repeat gate covers this surface.
+  if (process.env.BOT_LEARNINGS === "0") return;
   if (opts.dryRun) {
     console.log("🧠 (DRY_RUN — skipping learnings poll)");
     return;
@@ -250,9 +400,28 @@ export async function publishPostSolveLearnings(
         outcome: detail.verification_outcome ?? {},
         hiddenTests: detail.hiddenTests,
       });
+      if (learning === "skip") {
+        console.log(`   ⤵ ${subId.slice(0, 8)} learning declined — material too thin for a concrete insight`);
+        appendJsonl(LEARNING_LOG, { ts: new Date().toISOString(), submissionId: subId, challengeId: m.challengeId, status: "skipped", notes: "declined: material too thin" });
+        continue;
+      }
       if (!learning) {
         console.warn(`   ⚠ ${subId.slice(0, 8)} learning generation failed`);
         appendJsonl(LEARNING_LOG, { ts: new Date().toISOString(), submissionId: subId, challengeId: m.challengeId, status: "error", notes: "gen fail" });
+        continue;
+      }
+      // Anti-repeat gates: retelling a recent learning (same story beats, new
+      // invented numbers) is the audit's core failure mode on this surface.
+      const rep = findRepetitiveLearning(`${learning.summary}\n${learning.content}`, recentLearningTexts());
+      if (rep) {
+        console.log(`   ⤵ ${subId.slice(0, 8)} learning skipped — ${(rep.similarity * 100).toFixed(0)}% similar to a recent note`);
+        appendJsonl(LEARNING_LOG, { ts: new Date().toISOString(), submissionId: subId, challengeId: m.challengeId, status: "skipped", notes: `near-dupe of recent learning (${(rep.similarity * 100).toFixed(0)}%)` });
+        continue;
+      }
+      const motif = findLearningMotifCollision(learning.summary, recentLearningSummaries());
+      if (motif) {
+        console.log(`   ⤵ ${subId.slice(0, 8)} learning skipped — motif cooldown "${motif.bigram}" (retold within ${LEARNING_MOTIF_COOLDOWN_DAYS}d)`);
+        appendJsonl(LEARNING_LOG, { ts: new Date().toISOString(), submissionId: subId, challengeId: m.challengeId, status: "skipped", notes: `motif cooldown: "${motif.bigram}"` });
         continue;
       }
 
@@ -306,6 +475,7 @@ export async function publishPostSolveLearnings(
         cid: upload.cid,
         specificityScore: spec,
         status: "posted" as const,
+        summary: learning.summary,
       });
     } catch (err) {
       console.warn(`   ⚠ learning ${subId.slice(0, 8)}: ${(err as Error).message}`);

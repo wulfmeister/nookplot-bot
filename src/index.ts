@@ -5,7 +5,7 @@ import { initBotLog } from "./bot-log.js";
 import { chat, VENICE_WEB_SEARCH, assertVeniceKey } from "./venice.js";
 import { pickModel, pickModelAB } from "./models.js";
 import { runsInLean, leanBanner } from "./lean.js";
-import { NOOK_DIR, appendJsonl, extractJson, sleep } from "./util.js";
+import { NOOK_DIR, appendJsonl, extractJson, readJsonl, sleep } from "./util.js";
 import { webSearch, arxivSearch, formatResultsForPrompt, type SearchResult } from "./research.js";
 import { refine } from "./refine.js";
 import { traceTextFromIpfsPayload, isWellFormedCid, cidRejectReason, isPermanentCidError, extractTraceCid, cidBearingKeys, type CidStatus } from "./trace-payload.js";
@@ -61,7 +61,7 @@ import { runClarificationsTick, generateClarificationAnswer } from "./clarificat
 import { runSwarmsTick, heartbeatHeldSubtasks, runSwarmsAutoSolveTick } from "./swarms.js";
 import { runWeeklyRewardsTick } from "./weekly-rewards.js";
 import { runBundleTick } from "./bundles.js";
-import { runChallengePostTick } from "./challenge-posting.js";
+import { runChallengePostTick, findNearDuplicate } from "./challenge-posting.js";
 import { runManifestTick, runIntentsTick, pendingSubsFromSnapshot } from "./manifest-intents.js";
 import { runInboxWatchTick } from "./inbox-watch.js";
 import { runCohortBenchmarkTick } from "./cohort-benchmark.js";
@@ -85,6 +85,24 @@ const EVENTS_FILE = join(NOOK_DIR, "events.jsonl");
 const AB_LOG = join(NOOK_DIR, "ab-applications.jsonl");
 const AB_OUTCOMES = join(NOOK_DIR, "ab-outcomes.jsonl");
 const KNOWLEDGE_LOG = join(NOOK_DIR, "knowledge-published.jsonl");
+
+// Challenge IDs we posted (royalty engine). The gateway 403s any attempt to
+// verify submissions on your own challenge ("conflict of interest") — pre-skip
+// them to save the trace fetch + verify attempt (observed 2026-07-15: repeated
+// 403 burns against our posted challenges' submissions). 10-min cache; the
+// file only grows by ~1 entry/day.
+let ownChallengeCache: { ids: Set<string>; at: number } | null = null;
+function isOwnChallenge(challengeId: string): boolean {
+  if (!ownChallengeCache || Date.now() - ownChallengeCache.at > 10 * 60_000) {
+    const ids = new Set(
+      readJsonl<{ challengeId?: string; outcome?: string }>(join(NOOK_DIR, "challenges-posted.jsonl"))
+        .filter((e) => e.challengeId && (e.outcome === "posted" || e.outcome === "posting"))
+        .map((e) => e.challengeId!),
+    );
+    ownChallengeCache = { ids, at: Date.now() };
+  }
+  return ownChallengeCache.ids.has(challengeId);
+}
 
 interface NookplotEvent {
   type?: string;
@@ -779,6 +797,13 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
       console.log(`💎 ${sub.id.slice(0, 8)} — diversity skip (${recentCount} prior on solver ${sub.solver_address.slice(0, 10)})`);
       return;
     }
+  }
+  // Own-challenge guard — must precede BOTH verify paths (the artifact rerun
+  // path hits the same gateway 403).
+  if (sub.challenge_id && isOwnChallenge(sub.challenge_id)) {
+    verifiedSubmissions.add(sub.id);
+    console.log(`💎 ${sub.id.slice(0, 8)} — own-challenge skip (we posted ${sub.challenge_id.slice(0, 8)})`);
+    return;
   }
   if (tryArtifacts) {
     await verifyArtifactSubmission(runtime, sub);
@@ -1976,7 +2001,9 @@ async function generateKnowledgeBody(title: string, angle: string): Promise<stri
       {
         role: "system",
         content:
-          "Write a substantive 1200-1500 word technical markdown post. Concrete, opinionated, well-structured (use ## headings). No greeting, no meta-commentary, no 'In conclusion'. Lead with the strongest claim. Include specific named tools/protocols/papers/numbers where applicable. End with a short 'Open questions' section listing 2-3 unresolved threads. Markdown only.",
+          "Write a substantive 1200-1500 word technical markdown post. Concrete, opinionated, well-structured. No greeting, no meta-commentary, no 'In conclusion'. Lead with the strongest claim. " +
+          "GROUNDING: you have web search — any specific number, benchmark, or measured claim MUST come from a real source found via search and be attributed to it inline (name the source). If you cannot source a number, make the point without one. NEVER invent measurements or present estimates as measured results. " +
+          "Vary the structure to fit the argument (do not reuse a fixed heading template). End with a short 'Open questions' section listing 2-3 unresolved threads. Markdown only.",
       },
       { role: "user", content: `Title: ${title}\n\nAngle: ${angle}\n\nWrite the post.` },
     ],
@@ -1986,6 +2013,13 @@ async function generateKnowledgeBody(title: string, angle: string): Promise<stri
 }
 
 async function publishOneKnowledgeItem(runtime: ReturnType<typeof getRuntime>) {
+  // Kill-switch (2026-07-15): corpus audit found 96% of the 192 published
+  // posts on two rigid scaffolds, ~18% of the vault re-telling 3 security
+  // topics (16 SSRF permutations), and identical fabricated benchmark numbers
+  // presented as measurements across unrelated domains. Paused via
+  // BOT_KNOWLEDGE_PUBLISH=0 until the pipeline gets scaffold variation and an
+  // anti-repeat gate.
+  if (process.env.BOT_KNOWLEDGE_PUBLISH === "0") return;
   if (config.dryRun) {
     console.log("📚 (DRY_RUN — skipping knowledge publish)");
     return;
@@ -2012,8 +2046,11 @@ async function publishOneKnowledgeItem(runtime: ReturnType<typeof getRuntime>) {
       const topic = await generateKnowledgeTopic();
       if (!topic) continue;
       const titleKey = topic.title.toLowerCase().trim();
+      // Check only — adding to the cache here made the post-generation dup
+      // check below ALWAYS fire on our own key, so every fallback post was
+      // generated (LLM spend) and then discarded before publish. The cache
+      // add happens after all gates pass, below.
       if (publishedTitles.has(titleKey)) continue;
-      publishedTitles.add(titleKey);
       const body = await generateKnowledgeBody(topic.title, topic.angle);
       post = {
         title: topic.title,
@@ -2033,6 +2070,22 @@ async function publishOneKnowledgeItem(runtime: ReturnType<typeof getRuntime>) {
   const titleKey = post.title.toLowerCase().trim();
   if (publishedTitles.has(titleKey)) {
     console.log(`📚 dup title (already in cache); skipping`);
+    return;
+  }
+  // Semantic near-dupe gate (2026-07-15): exact-match dedupe let 16 SSRF
+  // title-permutations through in a month ("ssrf-defense-using-…-filtering" /
+  // "ssrf-defense-via-…-blocking" / "ssrf-mitigation-through-…"), all the same
+  // recipe. Same tokenizer+threshold as the challenge poster, vs the last 60
+  // days of published titles.
+  const priorKnowledge = readJsonl<{ ts: string; title?: string; error?: string }>(KNOWLEDGE_LOG)
+    .filter((e) => e.title && !e.error)
+    .map((e) => ({ ts: e.ts, title: e.title! }));
+  const cutoff = Date.now() - 60 * 86_400_000;
+  const knowledgeCorpus = priorKnowledge.filter((e) => new Date(e.ts).getTime() >= cutoff);
+  const nearDupe = findNearDuplicate(post.title, knowledgeCorpus);
+  if (nearDupe) {
+    console.log(`📚 near-dupe of "${nearDupe.title.slice(0, 60)}" (${(nearDupe.similarity * 100).toFixed(0)}%); skipping [${post.source}]`);
+    recordAnchor({ source: post.source, key: post.anchorKey, title: post.title });
     return;
   }
   publishedTitles.add(titleKey);

@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import type { NookplotRuntime } from "@nookplot/runtime";
 import { chat, VENICE_WEB_SEARCH } from "./venice.js";
-import { pickModel, pickModelAB, pickAlternateModel, effortFor, PARSE_FAIL_RATE_THRESHOLD, PARSE_FAIL_MIN_ATTEMPTS } from "./models.js";
+import { pickModel, pickModelAB, pickAlternateModel, effortFor, abPool, PARSE_FAIL_RATE_THRESHOLD, PARSE_FAIL_MIN_ATTEMPTS } from "./models.js";
 import { writeNote } from "./vault.js";
 import { NOOK_DIR, readJsonl, appendJsonl, extractJsonObj, sleep } from "./util.js";
 import { gatherMiningContext, type MiningContext } from "./mining-context.js";
@@ -1220,8 +1220,13 @@ export async function discoverAndSolveMiningChallenges(
     const { parseFailureRateByModel } = await import("./venice-cost.js");
     const failureRates = parseFailureRateByModel(10);
     const abRaw = pickModelAB("mining_solve", failureRates);
+    // Only report models actually in rotation: the failure-rate history keeps
+    // stats for retired pool members forever (their last N calls never change
+    // once they stop being called), and logging those every tick reads as a
+    // live problem when it's just history.
+    const activePool = abPool("mining_solve");
     const sidelined = Object.entries(failureRates)
-      .filter(([_, r]) => r.attempts >= 5 && r.rate >= 0.30)
+      .filter(([m, r]) => activePool.includes(m) && r.attempts >= 5 && r.rate >= 0.30)
       .map(([m, r]) => `${m}=${(r.rate * 100).toFixed(0)}%`);
     if (sidelined.length > 0) {
       console.log(`   ⚠ models sidelined for parse-fail: ${sidelined.join(", ")}`);
