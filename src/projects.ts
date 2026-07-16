@@ -471,10 +471,14 @@ export async function submitDraft(runtime: ProjRuntime, slug: string, opts?: { v
     used.push(meta.tag);
     writeFileSync(USED_FILE, JSON.stringify(used));
   } catch { /* best effort */ }
-  // mark the review item approved (if it came through the queue)
+  // mark the review item approved (if it came through the queue). Prefer the
+  // PENDING row: redrafts reuse a slug, and plain find() hit the OLDEST
+  // duplicate — a 2026-07-16 submit flipped a passed 06-23 row while the live
+  // 07-02 pending row stayed pending, deadlocking the one-at-a-time drafter
+  // (same duplicate-slug class the auto-submit gate fixed via slug+createdAt).
   try {
     const q = loadQueue();
-    const item = q.find((i) => i.slug === slug);
+    const item = q.find((i) => i.slug === slug && i.status === "pending") ?? q.find((i) => i.slug === slug);
     if (item) { item.status = "approved"; saveQueue(q); }
   } catch { /* best effort */ }
   console.log(`📁 ✓ committed to project ${pid}`);
