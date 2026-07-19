@@ -805,6 +805,18 @@ async function trySolve(
  * BOT_VERIFIABLE_MODEL=<model> to force a specific code model (still subject to
  * the parse-fail breaker below).
  */
+/**
+ * Gateway-facing model name for the submission payload. The gateway's
+ * modelUsed validator 400s on Venice's org-prefixed catalog ids — observed
+ * 2026-07-17→19: every zai-org-glm-5-2 submission rejected with `modelUsed
+ * "zai-org-glm-5-2" doesn't look like a real model name` AFTER paying for the
+ * solve (15 burned solves in 3 days). Strip the vendor prefix for the wire;
+ * local logs keep the full Venice id for A/B attribution.
+ */
+export function gatewayModelName(model: string): string {
+  return model.replace(/^zai-org-/, "").replace(/^e2ee-/, "");
+}
+
 export function maybeOverrideModelForVerifiable(
   ch: Challenge,
   abPick: { model: string; reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" },
@@ -1388,6 +1400,7 @@ export async function discoverAndSolveMiningChallenges(
       }
 
       let submitSummary = s.traceSummary;
+      const gatewayModel = gatewayModelName(modelUsed);
       const doSubmit = async (): Promise<typeof sub> => {
         if (s.traceContent) {
           return (await runtime.connection.request(
@@ -1397,7 +1410,7 @@ export async function discoverAndSolveMiningChallenges(
               traceCid: cid,
               traceHash,
               traceSummary: submitSummary,
-              modelUsed,
+              modelUsed: gatewayModel,
               selfReportedWallMs: wallMs,
               ...(opts.guildId ? { guildId: opts.guildId } : {}),
             },
@@ -1412,7 +1425,7 @@ export async function discoverAndSolveMiningChallenges(
             artifact: s.artifact,
             reasoning: s.reasoning,
             traceSummary: submitSummary,
-            modelUsed,
+            modelUsed: gatewayModel,
             selfReportedWallMs: wallMs,
             ...(opts.guildId ? { guildId: opts.guildId } : {}),
           },

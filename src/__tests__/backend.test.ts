@@ -34,6 +34,7 @@ import {
   rollingCapState,
   pacingGate,
   maybeOverrideModelForVerifiable,
+  gatewayModelName,
   verifiableFailHint,
   parseVerifiableSolution,
   extractFencedCode,
@@ -392,6 +393,16 @@ describe("mining permanent/epoch classifier", () => {
       new Date(epochDayStartMs(Date.parse("2026-06-16T02:00:00.000Z"))).toISOString(),
       "2026-06-16T02:00:00.000Z",
     );
+  });
+});
+
+describe("mining.gatewayModelName (gateway modelUsed validator rejects org-prefixed ids)", () => {
+  it("strips vendor prefixes the gateway 400s on, passes normal ids through", () => {
+    assert.equal(gatewayModelName("zai-org-glm-5-2"), "glm-5-2"); // 15 rejected solves 07-17→19
+    assert.equal(gatewayModelName("e2ee-glm-5-2-p"), "glm-5-2-p");
+    assert.equal(gatewayModelName("claude-fable-5"), "claude-fable-5");
+    assert.equal(gatewayModelName("openai-gpt-56-sol"), "openai-gpt-56-sol");
+    assert.equal(gatewayModelName("grok-4-5"), "grok-4-5");
   });
 });
 
