@@ -43,7 +43,7 @@ import {
 import { aggregateCapacity, capacityUnderuse } from "../capacity.js";
 import { dailySpendSeries } from "../pnl.js";
 import { analyzeRejections } from "../check-rejections.js";
-import { dedupReadmeSections, isHighStakesTag } from "../projects.js";
+import { dedupReadmeSections, isHighStakesTag, isMechanicalGateFailure } from "../projects.js";
 import { tierBoost, tierNum, members, domainOverlap, rank, guildId } from "../guild.js";
 import { vcount } from "../network-status.js";
 import { normalizeModel } from "../rlm-spotcheck.js";
@@ -780,6 +780,25 @@ describe("projects.dedupReadmeSections (auto-fix the recurring duplicate-header 
   it("leaves a clean README's structure intact", () => {
     const out = dedupReadmeSections("# P\n\n## A\n\nx\n\n## B\n\ny\n");
     assert.ok(out.includes("## A") && out.includes("## B") && out.includes("x") && out.includes("y"));
+  });
+});
+
+describe("projects.isMechanicalGateFailure (transients auto-retry; substance waits for the human)", () => {
+  it("classifies the exact mechanical failure strings as retryable", () => {
+    // The three shapes autoSubmitGate produces for gate-side (not draft-side) failures.
+    assert.equal(isMechanicalGateFailure("review flagged: review output did not parse"), true); // 07-17 cache-store: froze the queue 2 days
+    assert.equal(isMechanicalGateFailure("could not read draft source for review"), true);
+    assert.equal(isMechanicalGateFailure("gate error: fetch failed"), true);
+  });
+
+  it("substantive verdicts are NOT retryable — the human decides", () => {
+    assert.equal(isMechanicalGateFailure("sandbox tests did not pass"), false);
+    assert.equal(isMechanicalGateFailure('high-stakes domain "appsec" — subtle-correctness territory, human review required'), false);
+    assert.equal(isMechanicalGateFailure("review confidence medium (auto-submit needs high)"), false);
+    // A REAL review finding that merely mentions parsing must not be misread
+    // as mechanical (the classifier is anchored, not substring-matched).
+    assert.equal(isMechanicalGateFailure("review flagged: input JSON did not parse before validation, allowing bypass"), false);
+    assert.equal(isMechanicalGateFailure(""), false);
   });
 });
 

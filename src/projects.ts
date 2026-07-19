@@ -583,10 +583,45 @@ async function autoSubmitGate(item: ReviewItem): Promise<{ decision: "submit" | 
   return { decision: "submit", reason: "tests pass + clean high-confidence review + low-stakes domain" };
 }
 
-/** Run the gate on the current pending draft (once) and either auto-submit or leave it for the human. */
+export const MAX_GATE_RETRIES = Number(process.env.BOT_PROJECTS_GATE_RETRIES ?? 3);
+
+/**
+ * Mechanical gate failures — the reviewer LLM's output was unparseable, the
+ * draft source was unreadable, or the gate itself threw — say nothing about
+ * the draft and self-heal on retry. Substantive verdicts (failing tests,
+ * unsafe review, low confidence, high-stakes domain) are the human's call.
+ * Anchored to the exact strings autoSubmitGate produces so a REAL review
+ * finding that merely mentions parsing can never be misread as mechanical.
+ */
+export function isMechanicalGateFailure(reason: string): boolean {
+  return (
+    reason === "review flagged: review output did not parse" ||
+    reason === "could not read draft source for review" ||
+    reason.startsWith("gate error: ")
+  );
+}
+
+/**
+ * Run the gate on the current pending draft and either auto-submit or leave
+ * it for the human. Substantive verdicts are stamped once; MECHANICAL
+ * failures re-run on later ticks (bounded) — a stamped-forever transient
+ * used to freeze the one-at-a-time queue for days (07-02 appsec draft: 14d
+ * behind a decided item; 07-17 cache-store draft: 2d behind a reviewer
+ * parse hiccup).
+ */
 async function maybeAutoSubmitPending(runtime: ProjRuntime): Promise<void> {
   const item = pendingReview();
-  if (!item || item.gateDecision) return; // no pending, or already gated this draft
+  if (!item) return;
+  const wasRetry = Boolean(item.gateDecision);
+  if (wasRetry) {
+    const retries = item.gateRetries ?? 0;
+    const retryable =
+      item.gateDecision === "escalate" &&
+      isMechanicalGateFailure(item.gateReason ?? "") &&
+      retries < MAX_GATE_RETRIES;
+    if (!retryable) return; // substantive verdict (or retries exhausted) — human's call
+    console.log(`📁🤖 re-running gate on "${item.name}" (mechanical failure, retry ${retries + 1}/${MAX_GATE_RETRIES}): ${item.gateReason}`);
+  }
   let gate: { decision: "submit" | "escalate"; reason: string };
   try {
     gate = await autoSubmitGate(item);
@@ -598,7 +633,12 @@ async function maybeAutoSubmitPending(runtime: ProjRuntime): Promise<void> {
   // alone stamped the decision on an old approved row (leaving the pending one
   // un-gated, so the review re-ran every tick).
   const qi = q.find((i) => i.slug === item.slug && i.createdAt === item.createdAt);
-  if (qi) { qi.gateDecision = gate.decision; qi.gateReason = gate.reason; saveQueue(q); }
+  if (qi) {
+    qi.gateDecision = gate.decision;
+    qi.gateReason = gate.reason;
+    if (wasRetry) qi.gateRetries = (qi.gateRetries ?? 0) + 1;
+    saveQueue(q);
+  }
   if (gate.decision === "submit") {
     try {
       const rp = join(DRAFTS_DIR, item.slug, "README.md");
@@ -618,11 +658,14 @@ interface ReviewItem {
   sourceCount: number;
   status: "pending" | "approved" | "passed";
   createdAt: string;
-  // Set once by the auto-submit gate (BOT_PROJECTS_AUTO_SUBMIT=1) so we don't
-  // re-run the LLM review each tick, and so the dashboard can show why a draft
-  // was escalated to the human instead of auto-shipped.
+  // Set by the auto-submit gate (BOT_PROJECTS_AUTO_SUBMIT=1) so substantive
+  // verdicts don't re-run the LLM review each tick, and so the dashboard can
+  // show why a draft was escalated. MECHANICAL failures (see
+  // isMechanicalGateFailure) are re-gated on later ticks, bounded by
+  // gateRetries < MAX_GATE_RETRIES.
   gateDecision?: "submit" | "escalate";
   gateReason?: string;
+  gateRetries?: number;
 }
 
 function loadQueue(): ReviewItem[] {
