@@ -193,6 +193,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `BOT_LEARNINGS` | on (`0` disables) | Publish post-solve learnings for verified submissions; grounded-only prompt + anti-repeat gate (`src/learnings.ts`). |
 | `BOT_LEARNING_DUPE_THRESHOLD` | `0.4` | Learnings anti-repeat gate: bigram similarity vs recent posted learnings at/above this skips the post (`src/learnings.ts`). |
 | `BOT_KNOWLEDGE_PUBLISH` | on (`0` disables) | Publish knowledge posts (grounded sources + daily fallback); semantic near-dupe title gate vs the last 60 days (`src/index.ts`). |
+| `BOT_PROJECTS_GATE_RETRIES` | `3` | Max auto-retries of the project auto-submit gate on MECHANICAL failures (reviewer output unparseable, gate error); substantive escalations always wait for the operator (`src/projects.ts`). |
 | `BOT_BUNDLES` | on (`0` disables) | Publish on-chain knowledge bundles from your solver learnings / verifier insights (micro-royalty flywheel) (`src/bundles.ts`). |
 | `BOT_BUNDLE_INTERVAL_DAYS` | `7` | Minimum days between bundles (`src/bundles.ts`). |
 | `BOT_BUNDLE_MIN_CIDS` | `3` | Minimum new CIDs required before bundling (`src/bundles.ts`). |
