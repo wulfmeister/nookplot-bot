@@ -122,6 +122,7 @@ import {
   descriptionSimilarity, isGateRelaxed, fallbackDomainOrder,
 } from "../challenge-posting.js";
 import { findRepetitiveLearning, findLearningMotifCollision } from "../learnings.js";
+import { findTemplateFingerprint, isFarmChallengeTitle, findNearDuplicateTrace, applyOffTopicClamp } from "../trace-fingerprint.js";
 import { scoreIntentFit } from "../manifest-intents.js";
 import { veniceRateLimited429Today } from "../venice-cost.js";
 
@@ -393,6 +394,63 @@ describe("mining permanent/epoch classifier", () => {
       new Date(epochDayStartMs(Date.parse("2026-06-16T02:00:00.000Z"))).toISOString(),
       "2026-06-16T02:00:00.000Z",
     );
+  });
+});
+
+describe("trace-fingerprint (anti-farm verification abstention)", () => {
+  // Strings quoted from the actual 2026-07-19 farm sample.
+  it("strong fingerprints fire alone", () => {
+    assert.ok(findTemplateFingerprint("achieving 150ms commit latency @ 20ms RTT across regions"));
+    assert.ok(findTemplateFingerprint("LSM tiered compaction reached 180K w/s vs B-tree 60K baseline"));
+    assert.ok(findTemplateFingerprint("validated over n=12 trials, CV<1% in all cases"));
+    assert.ok(findTemplateFingerprint("run config: salt=21080 applied to jitter"));
+    assert.ok(findTemplateFingerprint("payout to wallet=0xf73625 confirmed"));
+    assert.ok(findTemplateFingerprint("Raft pre-vote with batch+pipe Accept, then io_uring for the data plane"));
+    assert.ok(findTemplateFingerprint("as computed above [ref Brian-3f2a91cc-21115]"));
+  });
+
+  it("weak markers need corroboration — a legit ML trace with seed=42 passes", () => {
+    assert.equal(findTemplateFingerprint("We fixed seed=42 for reproducibility and reran the ablation."), null);
+    assert.equal(findTemplateFingerprint("session uid=9f3a2b1c logged"), null);
+    // Two weak markers together = generator jitter block.
+    assert.ok(findTemplateFingerprint("params: seed=143 uid=9f3a2b1c salt omitted"));
+  });
+
+  it("genuine technical prose does not trip the gate", () => {
+    const genuine =
+      "For RS(10,4) with LRC we model durability as a Markov birth-death chain; MTTDL falls to 2.1e9 hours when repair bandwidth is capped at 40MB/s per node, and the tradeoff against local-group repair cost dominates below 14 disks.";
+    assert.equal(findTemplateFingerprint(genuine), null);
+  });
+
+  it("isFarmChallengeTitle matches the generator pattern, never our real titles", () => {
+    assert.ok(isFarmChallengeTitle("Brian distributed-systems expert analysis 3f2a91"));
+    assert.ok(isFarmChallengeTitle("Kaiju8 cryptography specialist analysis deadbeef"));
+    for (const ours of [
+      "Dedup Pipeline: Rabin-Karp Rolling Hash vs Cuckoo Hashing Under a 512 MB Budget",
+      "LoRA Rank vs. Base-Weight Quantization Under a 24 GB VRAM Budget",
+      "Expert-Analysis: Resilience Patterns Using Circuit-Breakers and Bulkheads",
+      "SABRE vs. Token-Swapping Routing on a 127-Qubit Heavy-Hex Lattice",
+    ]) assert.equal(isFarmChallengeTitle(ours), false, `false positive: ${ours}`);
+  });
+
+  it("findNearDuplicateTrace catches a jittered sibling, passes distinct work", () => {
+    const seen = [
+      "Invariant: leader completeness holds. Failure injection: partition minority. Acceptance: 150ms commit at 20ms RTT, batch+pipe gives +3.5x. HNSW ef=64 reaches 95%@10 in 1.2ms vs IVF 88%. Validated over n=12 trials, CV<1%.",
+    ];
+    const sibling =
+      "Invariant: leader completeness holds. Failure injection: partition minority. Acceptance: 150ms commit at 20ms RTT, batch+pipe gives +3.7x. HNSW ef=64 reaches 95%@10 in 1.3ms vs IVF 89%. Validated over n=12 trials, CV<1%.";
+    assert.ok(findNearDuplicateTrace(sibling, seen), "jittered sibling should match");
+    const distinct =
+      "We prove the scheduler is starvation-free by exhibiting a variant function on the ready queue; the bound tightens from O(n^2) to O(n log n) when priorities are drawn from a bounded lattice.";
+    assert.equal(findNearDuplicateTrace(distinct, seen), null);
+  });
+
+  it("applyOffTopicClamp caps the other dims when correctness detects mismatch", () => {
+    const clamped = applyOffTopicClamp({ correctnessScore: 0.2, reasoningScore: 0.68, efficiencyScore: 0.72, noveltyScore: 0.5 });
+    assert.ok(clamped.reasoningScore <= 0.35 && clamped.efficiencyScore <= 0.35 && clamped.noveltyScore <= 0.35);
+    // On-topic scores untouched.
+    const ok = applyOffTopicClamp({ correctnessScore: 0.7, reasoningScore: 0.68, efficiencyScore: 0.72, noveltyScore: 0.5 });
+    assert.equal(ok.efficiencyScore, 0.72);
   });
 });
 

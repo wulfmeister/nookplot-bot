@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import type { NookplotRuntime } from "@nookplot/runtime";
 import { chat, VENICE_WEB_SEARCH } from "./venice.js";
 import { pickModel, pickModelAB, pickAlternateModel, effortFor, abPool, PARSE_FAIL_RATE_THRESHOLD, PARSE_FAIL_MIN_ATTEMPTS } from "./models.js";
+import { isFarmChallengeTitle } from "./trace-fingerprint.js";
 import { writeNote } from "./vault.js";
 import { NOOK_DIR, readJsonl, appendJsonl, extractJsonObj, sleep } from "./util.js";
 import { gatherMiningContext, type MiningContext } from "./mining-context.js";
@@ -1058,6 +1059,10 @@ export function passesSpecializationFilter(ch: Challenge): boolean {
 function challengeFitsBudget(ch: Challenge): boolean {
   if (ch.status && ch.status !== "open") return false;
   if (ch.submissionCount !== undefined && ch.maxSubmissions !== undefined && ch.submissionCount >= ch.maxSubmissions) return false;
+  // Sybil-farm challenges ("<Name> <domain> expert analysis <hex>", inflated
+  // to expert difficulty to bait the 500K base reward): a verified solve of
+  // one pays the FARM's poster royalty. Skip unless explicitly re-enabled.
+  if (process.env.BOT_SKIP_FARM_CHALLENGES !== "0" && isFarmChallengeTitle(ch.title ?? "")) return false;
   // Specialization is soft (preference via sort) unless BOT_SPECIALIZE_STRICT=1.
   // Soft is the default — we never idle when there's work.
   if (process.env.BOT_SPECIALIZE_STRICT === "1" && !passesSpecializationFilter(ch)) return false;

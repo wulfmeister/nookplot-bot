@@ -5,7 +5,8 @@ import { initBotLog } from "./bot-log.js";
 import { chat, VENICE_WEB_SEARCH, assertVeniceKey } from "./venice.js";
 import { pickModel, pickModelAB } from "./models.js";
 import { runsInLean, leanBanner } from "./lean.js";
-import { NOOK_DIR, appendJsonl, extractJson, readJsonl, sleep } from "./util.js";
+import { NOOK_DIR, appendJsonl, extractJson, readJsonl, readJsonlTail, sleep } from "./util.js";
+import { findTemplateFingerprint, findNearDuplicateTrace, applyOffTopicClamp } from "./trace-fingerprint.js";
 import { webSearch, arxivSearch, formatResultsForPrompt, type SearchResult } from "./research.js";
 import { refine } from "./refine.js";
 import { traceTextFromIpfsPayload, isWellFormedCid, cidRejectReason, isPermanentCidError, extractTraceCid, cidBearingKeys, type CidStatus } from "./trace-payload.js";
@@ -85,6 +86,35 @@ const EVENTS_FILE = join(NOOK_DIR, "events.jsonl");
 const AB_LOG = join(NOOK_DIR, "ab-applications.jsonl");
 const AB_OUTCOMES = join(NOOK_DIR, "ab-outcomes.jsonl");
 const KNOWLEDGE_LOG = join(NOOK_DIR, "knowledge-published.jsonl");
+
+// ── Anti-farm verification abstention (2026-07-19) ─────────────────────────
+// Quorum is a COUNT: scoring spam low still advances it toward payment, so
+// the only real rejection is not verifying at all. Fingerprinted or
+// near-duplicate traces are recorded (so future siblings match) and skipped
+// WITHOUT a /verify POST. See src/trace-fingerprint.ts for the evidence.
+const VERIFY_TRACE_CACHE = join(NOOK_DIR, "verify-trace-cache.jsonl");
+
+/** Reason to abstain from verifying this trace, or null to proceed. */
+function verifyAbstainReason(traceText: string): string | null {
+  if (traceText.length < 200) return null; // CID-broken paths handle themselves downstream
+  const fp = findTemplateFingerprint(traceText);
+  if (fp) return `template fingerprint "${fp}"`;
+  const prior = readJsonlTail<{ snippet?: string }>(VERIFY_TRACE_CACHE, 60).map((e) => e.snippet ?? "");
+  const dupe = findNearDuplicateTrace(traceText, prior);
+  if (dupe) return `${Math.round(dupe.similarity * 100)}% near-dupe of a recently seen trace`;
+  return null;
+}
+
+/** Remember every trace we saw (clean or abstained) for the near-dupe check. */
+function recordTraceSeen(subId: string, traceText: string, abstained: string | null): void {
+  if (traceText.length < 200) return;
+  appendJsonl(VERIFY_TRACE_CACHE, {
+    ts: new Date().toISOString(),
+    id: subId,
+    snippet: traceText.slice(0, 1500),
+    ...(abstained ? { abstained } : {}),
+  });
+}
 
 // Challenge IDs we posted (royalty engine). The gateway 403s any attempt to
 // verify submissions on your own challenge ("conflict of interest") — pre-skip
@@ -734,7 +764,12 @@ async function scoreSubmissionTrace(trace: string, domainTags: string[] = []): P
         knowledgeInsight: "",
         skip: String(p.skip),
       };
-    return {
+    // Off-topic clamp: when correctness detects a topic mismatch, the other
+    // dimensions can't honestly stay high — tables of irrelevant numbers were
+    // earning efficiency 0.72 on admitted "no connection to the challenge"
+    // traces. Deterministic post-clamp; the scorer prompt/calibration for
+    // on-topic traces is untouched.
+    return applyOffTopicClamp({
       correctnessScore: clampScore01(p.correctnessScore),
       reasoningScore: clampScore01(p.reasoningScore),
       efficiencyScore: clampScore01(p.efficiencyScore),
@@ -746,7 +781,7 @@ async function scoreSubmissionTrace(trace: string, domainTags: string[] = []): P
       justification: String(p.justification ?? "").slice(0, 500),
       knowledgeInsight: String(p.knowledgeInsight ?? "").slice(0, 500),
       knowledgeDomainTags: Array.isArray(p.knowledgeDomainTags) ? p.knowledgeDomainTags.slice(0, 5).map(String) : undefined,
-    };
+    });
   } catch {
     return null;
   }
@@ -813,6 +848,15 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
     console.log(`💎 verifying submission ${sub.id.slice(0, 8)} (challenge=${sub.challenge_id?.slice(0, 8)}, kind=${sub.verifier_kind ?? "standard"})`);
     const fetchedTrace = await fetchSubmissionTrace(runtime, sub);
     console.log(`   📄 trace source=${fetchedTrace.source} len=${fetchedTrace.trace.length}`);
+    // Anti-farm abstention: withhold the quorum increment entirely — a low
+    // score would still advance the spam toward payment.
+    const abstain = verifyAbstainReason(fetchedTrace.trace);
+    recordTraceSeen(sub.id, fetchedTrace.trace, abstain);
+    if (abstain) {
+      verifiedSubmissions.add(sub.id);
+      console.log(`   ⛔ abstain — ${abstain}; no quorum credit, no verify slot spent`);
+      return;
+    }
     // Probe comprehension FIRST — it decides whether a missing full trace is
     // actually fatal. Comprehension answers are graded by cosine similarity
     // (≥0.30) against the FULL IPFS trace, so a gated submission with no full
@@ -984,6 +1028,15 @@ async function verifyArtifactSubmission(runtime: ReturnType<typeof getRuntime>, 
   try {
     console.log(`💎🔁 verifying ARTIFACT submission ${sub.id.slice(0, 8)} (kind=${sub.verifier_kind})`);
     const fetchedTrace = await fetchSubmissionTrace(runtime, sub);
+    // Anti-farm abstention — same gate as the standard path (the farm posts
+    // artifact kinds too, and a rerun of templated junk still grants quorum).
+    const abstain = verifyAbstainReason(fetchedTrace.trace);
+    recordTraceSeen(sub.id, fetchedTrace.trace, abstain);
+    if (abstain) {
+      verifiedSubmissions.add(sub.id);
+      console.log(`   ⛔ abstain — ${abstain}; no quorum credit, no verify slot spent`);
+      return;
+    }
 
     // 1. Comprehension — prove we read the trace (same endpoints as standard).
     let questions: ComprehensionQuestion[] = [];
