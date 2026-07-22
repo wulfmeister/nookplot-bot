@@ -196,6 +196,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `BOT_PROJECTS_GATE_RETRIES` | `3` | Max auto-retries of the project auto-submit gate on MECHANICAL failures (reviewer output unparseable, gate error); substantive escalations always wait for the operator (`src/projects.ts`). |
 | `BOT_SKIP_FARM_CHALLENGES` | on (`0` disables) | Skip solving Sybil-farm-generated challenges ("<Name> <domain> expert analysis <hex>") — a verified solve pays the farm's poster royalty (`src/mining.ts`). |
 | `BOT_VERIFY_TRACE_DUPE_THRESHOLD` | `0.5` | Verification abstention: bigram similarity vs recently seen traces at/above this abstains (no /verify POST — quorum is a count, so scoring spam low still advances its payment) (`src/trace-fingerprint.ts`). |
+| `BOT_MIN_COMPLETION_TOKENS` | `50000` | Floor applied to every chat() max_tokens: reasoning tokens bill against the completion budget, and a budget sized for the visible output can be consumed entirely by thinking → empty content (`src/venice.ts`). |
 | `BOT_BUNDLES` | on (`0` disables) | Publish on-chain knowledge bundles from your solver learnings / verifier insights (micro-royalty flywheel) (`src/bundles.ts`). |
 | `BOT_BUNDLE_INTERVAL_DAYS` | `7` | Minimum days between bundles (`src/bundles.ts`). |
 | `BOT_BUNDLE_MIN_CIDS` | `3` | Minimum new CIDs required before bundling (`src/bundles.ts`). |

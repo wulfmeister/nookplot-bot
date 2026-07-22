@@ -64,11 +64,28 @@ export function assertVeniceKey(): void {
   }
 }
 
+/**
+ * Completion-budget floor applied to EVERY chat() call. All models in the
+ * roster run with reasoning enabled, and reasoning tokens are billed against
+ * max_tokens — a "small" budget sized for the visible output can be consumed
+ * entirely by thinking, returning EMPTY content (observed: the project
+ * reviewer at 1500 tokens produced 0 chars deterministically and burned all
+ * its gate retries; challenge drafting at 4000 had the same failure on
+ * gpt-55). Callers' max_tokens now act as a floor-clamped hint: instructions
+ * control output LENGTH, this controls the hard stop. Operator accepted the
+ * cost tail (a runaway 50k-token opus output ≈ $1.50) over silent empties.
+ */
+const MIN_COMPLETION_TOKENS = Number(process.env.BOT_MIN_COMPLETION_TOKENS ?? 50_000);
+
 export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
   assertVeniceKey();
   const maxAttempts = 3;
   let lastErr: Error | null = null;
   const model = opts.model ?? DEFAULT_MODEL;
+  // Floored, but retryable downward: some providers 400 when max_tokens
+  // exceeds the model's completion limit — on that specific error we halve
+  // and retry rather than failing the call.
+  let effectiveMaxTokens = Math.max(opts.max_tokens ?? MIN_COMPLETION_TOKENS, MIN_COMPLETION_TOKENS);
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
       const ctrl = new AbortController();
@@ -84,7 +101,7 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
             model: model,
             messages,
             temperature: opts.temperature,
-            max_tokens: opts.max_tokens,
+            max_tokens: effectiveMaxTokens,
             venice_parameters: opts.venice_parameters,
             // Auto-apply xhigh thinking when the chosen model supports it
             // (claude-opus-4-7, grok-4-3, openai-gpt-55). Explicit opts wins.
@@ -141,6 +158,16 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
         try {
           recordVeniceCall({ model, outcome: "rate-limited" });
         } catch { /* telemetry must never break the call */ }
+      }
+      // A 400 rejecting our (floored) max_tokens means this model's completion
+      // limit is below the floor — halve and retry instead of failing.
+      const tokenLimit400 =
+        lastErr.message.includes("Venice API 400") &&
+        /max_?(output_)?tokens|maximum.{0,30}tokens/i.test(lastErr.message);
+      if (tokenLimit400 && effectiveMaxTokens > 8000) {
+        effectiveMaxTokens = Math.max(8000, Math.floor(effectiveMaxTokens / 2));
+        console.warn(`   ↩ ${model} rejected max_tokens — retrying at ${effectiveMaxTokens}`);
+        continue;
       }
       const transient =
         lastErr.message.includes("timeout") ||
