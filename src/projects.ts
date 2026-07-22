@@ -545,13 +545,25 @@ async function reviewDraftCorrectness(name: string, codeAndTests: string): Promi
     "You are a STRICT reviewer deciding whether a small project is safe to PUBLISH ON-CHAIN under our identity WITHOUT any human review. It ALREADY passed its unit tests in a clean sandbox — so 'tests pass' is NOT sufficient evidence and you must NOT rely on it. Hunt for: logic bugs the tests miss, stubs that ignore their inputs, off-by-one / boundary errors, insecure patterns, and MISLEADING claims in code/comments (e.g. 'implements standard X' when it doesn't). Escalation to a human is cheap; a wrong on-chain publish is permanent — so set safe=false or confidence below 'high' on ANY genuine doubt. " +
     "Output STRICT JSON only: {\"safe\": boolean, \"confidence\": \"high\"|\"medium\"|\"low\", \"issues\": [\"blocking issue\", ...], \"notes\": \"one line\"}.";
   try {
-    const res = await chat(
-      [{ role: "system", content: sys }, { role: "user", content: `Project: ${name}\n\n${codeAndTests.slice(0, 24000)}` }],
-      { model: REVIEW_MODEL, max_tokens: 1500, temperature: 0.1, timeoutMs: 180_000 },
-    );
+    const messages = [
+      { role: "system" as const, content: sys },
+      { role: "user" as const, content: `Project: ${name}\n\n${codeAndTests.slice(0, 24000)}` },
+    ];
+    // 6000 not 1500: chat() applies the model's default reasoning effort
+    // (opus-4-8 = "high"), and on a large brace-heavy draft the THINKING alone
+    // exceeded 1500 tokens — content came back empty on every attempt
+    // (deterministic at temp 0.1, which is how the Cache Entry Store draft
+    // burned all 3 mechanical-gate retries on identical empty outputs).
+    let res = await chat(messages, { model: REVIEW_MODEL, max_tokens: 6000, temperature: 0.1, timeoutMs: 180_000 });
+    if (!res.content.trim()) {
+      // Reasoning still ate the budget — the verdict JSON itself is tiny, so
+      // retry once at low effort: shallow thinking, guaranteed output room.
+      console.log("📁🤖 review returned empty content (reasoning consumed the budget) — retrying at low effort");
+      res = await chat(messages, { model: REVIEW_MODEL, max_tokens: 6000, temperature: 0.1, timeoutMs: 180_000, reasoning_effort: "low" });
+    }
     const p = extractJsonObj<{ safe?: boolean; confidence?: string; issues?: string[]; notes?: string }>(res.content);
     if (!p) {
-      console.log(`📁🤖 review output did not parse — raw (first 400 chars): ${res.content.slice(0, 400)}`);
+      console.log(`📁🤖 review output did not parse — raw (first 400 chars): ${res.content.trim() ? res.content.slice(0, 400) : "(empty)"}`);
       return { safe: false, confidence: "low", issues: ["review output did not parse"], notes: "" };
     }
     return { safe: p.safe === true, confidence: (p.confidence ?? "low").toLowerCase(), issues: p.issues ?? [], notes: p.notes ?? "" };
