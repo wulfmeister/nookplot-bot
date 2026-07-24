@@ -5,7 +5,8 @@ import { chat, VENICE_WEB_SEARCH } from "./venice.js";
 import { pickModel, pickModelAB, pickAlternateModel, effortFor, abPool, PARSE_FAIL_RATE_THRESHOLD, PARSE_FAIL_MIN_ATTEMPTS } from "./models.js";
 import { isFarmChallengeTitle } from "./trace-fingerprint.js";
 import { writeNote } from "./vault.js";
-import { NOOK_DIR, readJsonl, appendJsonl, extractJsonObj, sleep } from "./util.js";
+import { NOOK_DIR, readJsonl, readJsonlTail, appendJsonl, extractJsonObj, sleep } from "./util.js";
+import { analyzeQuorumHealth } from "./quorum-watch.js";
 import { gatherMiningContext, type MiningContext } from "./mining-context.js";
 import {
   fetchSubmissionGuide,
@@ -985,12 +986,121 @@ export function challengeValueTier(c: Challenge): number {
   return c.verifierKind && VERIFIABLE_KINDS.has(c.verifierKind) ? 1 : 0;
 }
 
-export function compareChallengePriority(a: Challenge, b: Challenge, targets: string[]): number {
+/**
+ * Verifiable-kind tilt (2026-07-23). The value-tier sort encodes HEALTHY-
+ * network economics: standard traces pay ~5-6.5x per cap slot, so they outrank
+ * verifiable kinds. But standard payouts require a 3-verifier quorum, and the
+ * verifier pool starves for days at a time — measured over the three weeks to
+ * 07-23: standard resolved 65 verified / 55 EXPIRED (46% of slots forfeited)
+ * while python_tests ran 49/49 verified (sandbox-graded, quorum-immune).
+ * When starvation is visible — chronic (trailing standard expiry share above
+ * BOT_VERIFIABLE_TILT_TRIGGER) or acute (quorum-watch reports a v2=0 stall) —
+ * invert the tier preference until verifiable kinds hold BOT_VERIFIABLE_TILT
+ * of the rolling day's submitted slots. Soft, like the base sort: with no
+ * verifiable challenge open, standards still run — a slot never idles. This
+ * also covers the acute half of "don't solve into starvation": a hard defer
+ * was rejected because even the worst measured week resolved 43% of standards,
+ * so a standard slot keeps positive EV over idling.
+ */
+export interface TiltInputs {
+  ratio: number; // target verifiable share of the rolling day's slots; 0 disables
+  trigger: number; // standard expiry share that arms the chronic trigger
+  minResolved: number; // minimum resolved standards before expiry share is trusted
+  standardResolved: number; // verified+expired standard rows in the window
+  standardExpiredShare: number;
+  quorumStalled: boolean; // acute signal from quorum-watch
+  todaySubmitted: number; // slots consumed in the rolling 24h (rows with submissionId)
+  todayVerifiable: number; // of those, verifiable kinds
+}
+
+export interface TiltState {
+  active: boolean;
+  preferVerifiable: boolean;
+  reason: string;
+}
+
+export function computeVerifiableTilt(i: TiltInputs): TiltState {
+  if (!(i.ratio > 0)) {
+    return { active: false, preferVerifiable: false, reason: "tilt disabled (BOT_VERIFIABLE_TILT=0)" };
+  }
+  const chronic = i.standardResolved >= i.minResolved && i.standardExpiredShare > i.trigger;
+  const active = chronic || i.quorumStalled;
+  if (!active) {
+    return {
+      active: false,
+      preferVerifiable: false,
+      reason: `standard expiry ${(i.standardExpiredShare * 100).toFixed(0)}% of ${i.standardResolved} resolved ≤ ${(i.trigger * 100).toFixed(0)}% trigger, no quorum stall`,
+    };
+  }
+  const todayShare = i.todaySubmitted > 0 ? i.todayVerifiable / i.todaySubmitted : 0;
+  const preferVerifiable = todayShare < i.ratio;
+  const why = [
+    chronic ? `standard expiry ${(i.standardExpiredShare * 100).toFixed(0)}% of ${i.standardResolved} resolved > ${(i.trigger * 100).toFixed(0)}%` : null,
+    i.quorumStalled ? "quorum STALL (v2 pinned at 0)" : null,
+  ].filter(Boolean).join(" + ");
+  return {
+    active,
+    preferVerifiable,
+    reason: `${why}; rolling-day verifiable ${i.todayVerifiable}/${i.todaySubmitted} vs ${(i.ratio * 100).toFixed(0)}% target → ${preferVerifiable ? "verifiable first" : "target met — standard first"}`,
+  };
+}
+
+const MINING_VERIFIED_LOG = join(NOOK_DIR, "mining-verified.jsonl");
+const NETWORK_STATUS_LOG = join(NOOK_DIR, "network-status.jsonl");
+
+/** Gather tilt inputs from local JSONL state (impure shell around computeVerifiableTilt). */
+export function loadTiltInputs(nowMs: number): TiltInputs {
+  const num = (v: string | undefined, dflt: number) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : dflt;
+  };
+  const ratio = Math.min(1, Math.max(0, num(process.env.BOT_VERIFIABLE_TILT, 0.6)));
+  const trigger = num(process.env.BOT_VERIFIABLE_TILT_TRIGGER, 0.2);
+  const windowMs = num(process.env.BOT_VERIFIABLE_TILT_WINDOW_DAYS, 10) * 86_400_000;
+  let standardResolved = 0;
+  let standardExpired = 0;
+  for (const r of readJsonlTail<{ ts?: string; verifierKind?: string; status?: string }>(MINING_VERIFIED_LOG, 600)) {
+    if (r.verifierKind !== "standard") continue;
+    if (!r.ts || nowMs - Date.parse(r.ts) > windowMs) continue;
+    if (r.status === "verified") standardResolved++;
+    else if (r.status === "expired") { standardResolved++; standardExpired++; }
+  }
+  const quorumStalled =
+    analyzeQuorumHealth(readJsonlTail(NETWORK_STATUS_LOG, 400), {
+      stallHours: num(process.env.BOT_QUORUM_STALL_HOURS, 6),
+    }).status === "stalled";
+  let todaySubmitted = 0;
+  let todayVerifiable = 0;
+  for (const r of readJsonlTail<{ ts?: string; verifierKind?: string; submissionId?: string }>(MINING_LOG, 300)) {
+    if (!r.submissionId) continue; // only rows that consumed a cap slot
+    if (!r.ts || nowMs - Date.parse(r.ts) > ROLLING_WINDOW_MS) continue;
+    todaySubmitted++;
+    if (r.verifierKind && VERIFIABLE_KINDS.has(r.verifierKind)) todayVerifiable++;
+  }
+  return {
+    ratio,
+    trigger,
+    minResolved: 10,
+    standardResolved,
+    standardExpiredShare: standardResolved ? standardExpired / standardResolved : 0,
+    quorumStalled,
+    todaySubmitted,
+    todayVerifiable,
+  };
+}
+
+export function compareChallengePriority(
+  a: Challenge,
+  b: Challenge,
+  targets: string[],
+  opts: { preferVerifiable?: boolean } = {},
+): number {
   // Value tier first: never spend an epoch slot on a ~10-NOOK verifiable
-  // challenge while a higher-EV standard reasoning challenge is open.
+  // challenge while a higher-EV standard reasoning challenge is open —
+  // unless the verifiable tilt says the quorum pipeline can't pay standards.
   const tierA = challengeValueTier(a);
   const tierB = challengeValueTier(b);
-  if (tierA !== tierB) return tierA - tierB;
+  if (tierA !== tierB) return opts.preferVerifiable ? tierB - tierA : tierA - tierB;
   const subsA = a.submissionCount ?? 0;
   const subsB = b.submissionCount ?? 0;
   const lowA = subsA <= LOW_COMPETITION_MAX ? 0 : 1;
@@ -1175,7 +1285,16 @@ export async function discoverAndSolveMiningChallenges(
   }
 
   const targets = specializeDomains();
-  eligible.sort((a, b) => compareChallengePriority(a, b, targets));
+  let tilt: TiltState = { active: false, preferVerifiable: false, reason: "" };
+  try {
+    tilt = computeVerifiableTilt(loadTiltInputs(Date.now()));
+  } catch (err) {
+    // Tilt is best-effort — on any state-read failure fall back to the
+    // healthy-network ordering rather than blocking the poll.
+    console.warn(`   ⚠ tilt state unavailable (${(err as Error).message}) — using default ordering`);
+  }
+  eligible.sort((a, b) => compareChallengePriority(a, b, targets, tilt));
+  if (tilt.active) console.log(`   ⚖ verifiable tilt: ${tilt.reason}`);
 
   const matched = targets.length > 0 ? eligible.filter((c) => passesSpecializationFilter(c)).length : 0;
   console.log(

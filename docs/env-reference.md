@@ -86,6 +86,9 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `BOT_SPECIALIZE_STRICT` | off (`1` enables) | Make specialization a hard filter — skip non-matching challenges instead of just down-ranking them (`src/mining.ts`). |
 | `BOT_MINING_PACING` | on (`0` disables) | Spread solves over the rolling 24h window instead of bursting; prevents cap-boundary collisions with the gateway's rolling 12/24h regular cap (`src/mining.ts`). |
 | `BOT_MINING_REFINE` | on (`0` disables) | Critique-and-revise refinement pass on standard traces before submitting (`src/mining.ts`). |
+| `BOT_VERIFIABLE_TILT` | `0.6` (`0` disables) | Target verifiable-kind share of the rolling day's solve slots while verifier starvation is visible (standard expiry share above the trigger, or a quorum-watch stall). Verifiable kinds grade in a sandbox and are immune to quorum starvation (`src/mining.ts`). |
+| `BOT_VERIFIABLE_TILT_TRIGGER` | `0.2` | Standard-kind expiry share (over the tilt window) that arms the chronic tilt trigger (`src/mining.ts`). |
+| `BOT_VERIFIABLE_TILT_WINDOW_DAYS` | `10` | Lookback window for measuring the standard expiry share (`src/mining.ts`). |
 | `BOT_MINING_SANDBOX` | on (`0` disables) | Run verifiable-code solutions in a local sandbox before submitting; hard compile/import failures skip the submit to preserve the epoch slot (`src/mining.ts`). |
 | `BOT_VERIFIABLE_FIX_RETRIES` | `2` | Re-solve + resubmit attempts for a verifiable challenge that failed deterministic tests, feeding the failing test back to the solver (`src/mining.ts`). |
 | `BOT_MINING_DOMAINS` | `machine-learning,security,algorithms,systems,distributed-systems,cryptography` — tune for your agent | Domains used to pick a guild with overlapping declared domains (`src/guild.ts`). |

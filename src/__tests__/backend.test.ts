@@ -111,7 +111,7 @@ import {
   enrichSummarySpecificity,
   passesSpecificityGate,
 } from "../specificity-gate.js";
-import { compareChallengePriority, challengeValueTier, isTransientGenerationError } from "../mining.js";
+import { compareChallengePriority, challengeValueTier, computeVerifiableTilt, isTransientGenerationError, type TiltInputs } from "../mining.js";
 import { pickAlternateModel } from "../models.js";
 import { selectBundleCids, bundleDue, sanitizeBundleTags, registeredPublishedCids } from "../bundles.js";
 import { countWithinDays, cohortAddresses } from "../cohort-benchmark.js";
@@ -1592,6 +1592,95 @@ describe("mining.compareChallengePriority", () => {
     const a = { ...base, id: "a", submissionCount: 1, verifierKind: "python_tests", estimatedRewardNook: 20 };
     const b = { ...base, id: "b", submissionCount: 8, verifierKind: "python_tests", estimatedRewardNook: 20 };
     assert.ok(compareChallengePriority(a, b, []) < 0); // fewer subs first, same tier
+  });
+
+  it("preferVerifiable inverts ONLY the tier ordering", () => {
+    const standard = { ...base, id: "std", submissionCount: 0, estimatedRewardNook: 5000 };
+    const verifiable = { ...base, id: "ver", submissionCount: 9, estimatedRewardNook: 10, verifierKind: "python_tests" };
+    // Default: standard first. Tilted: verifiable first, even at worse competition/reward.
+    assert.ok(compareChallengePriority(standard, verifiable, []) < 0);
+    assert.ok(compareChallengePriority(standard, verifiable, [], { preferVerifiable: true }) > 0);
+    assert.ok(compareChallengePriority(verifiable, standard, [], { preferVerifiable: true }) < 0);
+    // Within a tier, tilt changes nothing.
+    const a = { ...base, id: "a", submissionCount: 1, verifierKind: "python_tests" };
+    const b = { ...base, id: "b", submissionCount: 8, verifierKind: "python_tests" };
+    assert.ok(compareChallengePriority(a, b, [], { preferVerifiable: true }) < 0);
+    const s1 = { ...base, id: "s1", submissionCount: 1 };
+    const s2 = { ...base, id: "s2", submissionCount: 8 };
+    assert.ok(compareChallengePriority(s1, s2, [], { preferVerifiable: true }) < 0);
+  });
+});
+
+// ── mining.ts verifiable-kind tilt (quorum-starvation response) ─────────
+
+describe("mining.computeVerifiableTilt", () => {
+  // Baseline inputs: healthy network, nothing submitted yet today.
+  const healthy: TiltInputs = {
+    ratio: 0.6,
+    trigger: 0.2,
+    minResolved: 10,
+    standardResolved: 40,
+    standardExpiredShare: 0.1,
+    quorumStalled: false,
+    todaySubmitted: 0,
+    todayVerifiable: 0,
+  };
+
+  it("inactive on a healthy network (expiry under trigger, no stall)", () => {
+    const t = computeVerifiableTilt(healthy);
+    assert.equal(t.active, false);
+    assert.equal(t.preferVerifiable, false);
+  });
+
+  it("ratio 0 disables the tilt entirely, even during a stall", () => {
+    const t = computeVerifiableTilt({ ...healthy, ratio: 0, quorumStalled: true, standardExpiredShare: 1 });
+    assert.equal(t.active, false);
+    assert.match(t.reason, /disabled/);
+  });
+
+  it("chronic trigger: expiry share above trigger with sufficient sample activates", () => {
+    // The real 07-23 numbers: 55 of 120 resolved standards expired (46%).
+    const t = computeVerifiableTilt({ ...healthy, standardResolved: 120, standardExpiredShare: 0.46 });
+    assert.equal(t.active, true);
+    assert.equal(t.preferVerifiable, true); // 0/0 today < 60% target
+    assert.match(t.reason, /46%/);
+  });
+
+  it("small sample does NOT arm the chronic trigger (2 expiries of 4 resolved is noise)", () => {
+    const t = computeVerifiableTilt({ ...healthy, standardResolved: 4, standardExpiredShare: 0.5 });
+    assert.equal(t.active, false);
+  });
+
+  it("acute quorum stall activates regardless of sample size", () => {
+    const t = computeVerifiableTilt({ ...healthy, standardResolved: 0, standardExpiredShare: 0, quorumStalled: true });
+    assert.equal(t.active, true);
+    assert.equal(t.preferVerifiable, true);
+    assert.match(t.reason, /STALL/);
+  });
+
+  it("stops preferring verifiable once the rolling day hits the target share", () => {
+    // 6 verifiable of 10 submitted = 60% ≥ 60% target → back to standard-first,
+    // but the tilt stays ACTIVE (re-arms if more standards land).
+    const t = computeVerifiableTilt({
+      ...healthy, standardResolved: 120, standardExpiredShare: 0.46,
+      todaySubmitted: 10, todayVerifiable: 6,
+    });
+    assert.equal(t.active, true);
+    assert.equal(t.preferVerifiable, false);
+    assert.match(t.reason, /target met/);
+  });
+
+  it("still prefers verifiable just under the target share", () => {
+    const t = computeVerifiableTilt({
+      ...healthy, standardResolved: 120, standardExpiredShare: 0.46,
+      todaySubmitted: 10, todayVerifiable: 5,
+    });
+    assert.equal(t.preferVerifiable, true);
+  });
+
+  it("expiry exactly AT the trigger does not activate (strict >)", () => {
+    const t = computeVerifiableTilt({ ...healthy, standardExpiredShare: 0.2 });
+    assert.equal(t.active, false);
   });
 });
 

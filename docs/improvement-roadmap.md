@@ -7,19 +7,21 @@ items graduate out of this file when they ship (see CHANGELOG / git history).
 
 ## Tier 1 — our own data already says "do this"
 
-- [ ] **Verifiable-kind tilt.** The solve funnel's decision rule ("a rising
-  expired% is the trigger to tilt mining toward sandbox-graded verifiable
-  kinds") has FIRED: ~26% of recent submissions expired unpaid in a starved
-  verifier pool. Verifiable kinds grade deterministically in a sandbox and
-  are immune to quorum starvation. Add a `BOT_VERIFIABLE_TILT` ratio (e.g.
-  50-70% of daily slots while expired% > 20) and convert forfeited slots
-  into paid ones.
-- [ ] **Don't solve into starvation.** When the network shows acute verifier
-  starvation (pool pinned at v0, own pendings averaging ~0/3 verifiers), a
-  standard solve's EV collapses regardless of quality. The signals already
-  exist in `quorum-watch` / network-status — the solver should consume them:
-  defer standard solves within the rolling window (or swap to verifiable
-  kinds) while starvation is acute.
+- [x] **Verifiable-kind tilt.** SHIPPED 2026-07-23 (`BOT_VERIFIABLE_TILT`,
+  default 0.6): while standard expiry share over the trailing window exceeds
+  `BOT_VERIFIABLE_TILT_TRIGGER` (0.2) or quorum-watch reports an acute stall,
+  the challenge sort prefers verifiable kinds until they hold the target
+  share of the rolling day's slots. At ship time the 21-day data read
+  standard 65 verified / 55 expired (46% forfeited) vs python_tests 49/49
+  verified — the trigger fired immediately. See `computeVerifiableTilt` in
+  `src/mining.ts`.
+- [x] **Don't solve into starvation.** SHIPPED via the tilt's acute trigger:
+  the solver now consumes `analyzeQuorumHealth` (v2-pinned-at-0 stall) and
+  swaps preference to verifiable kinds while starvation is acute. The
+  hard-defer variant (idle the slot entirely) was evaluated and REJECTED:
+  even the worst measured week resolved 43% of standards, so solving keeps
+  positive EV over idling. Revisit only if a stall window ever shows ~100%
+  expiry.
 - [ ] **File the farm dossier with the network team.** We hold: hundreds of
   fingerprinted abstains, generator `wallet=` leaks tying ~19 Sybil wallets
   to one operator, the generated challenge-title pattern, and the design
