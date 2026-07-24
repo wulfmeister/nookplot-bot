@@ -22,14 +22,23 @@ items graduate out of this file when they ship (see CHANGELOG / git history).
   even the worst measured week resolved 43% of standards, so solving keeps
   positive EV over idling. Revisit only if a stall window ever shows ~100%
   expiry.
-- [ ] **File the farm dossier with the network team.** We hold: hundreds of
-  fingerprinted abstains, generator `wallet=` leaks tying ~19 Sybil wallets
-  to one operator, the generated challenge-title pattern, and the design
-  flaw being exploited (quorum is a verification COUNT, so low scores still
-  advance spam toward payment — see `src/trace-fingerprint.ts`). If the team
-  acts, the pool detoxifies and genuine submissions stop expiring — the only
-  lever that fixes the NETWORK we earn from. Pricing-mismatch and
-  epoch-boundary-stall reports ride along.
+- [~] **File the farm dossier with the network team.** IN PROGRESS 2026-07-23.
+  Evidence compiled from 4 days of trace sampling: 1,188/1,370 traces (87%)
+  abstained as farm spam, `wallet=` leaks tying **69** distinct Sybil wallets
+  to one operator, three fixed-text fingerprint families, and the design flaw
+  (quorum is a verification COUNT, so low scores still advance spam toward
+  payment — see `src/trace-fingerprint.ts`).
+  - **Epoch-boundary-stall report: FILED** as a public issue
+    (nookprotocol/nookplot#10) — 15 ≥3h verification freezes in 14 days,
+    ~46% standard-kind expiry.
+  - **Farm dossier + credit-pricing mismatch: STAGED, awaiting the private
+    "Report a vulnerability" form.** GitHub's private-report REST endpoint
+    500s server-side, and both must stay private (the dossier names wallets
+    and would tip the operator), so they can't be auto-filed — the web form
+    needs the operator's browser. Bodies + wallet list staged out-of-repo.
+  If the team acts on the dossier, the pool detoxifies and genuine
+  submissions stop expiring — the only lever that fixes the NETWORK we earn
+  from.
 - [ ] **Close the model-P&L loop.** Join settled epoch_solving income to the
   submitting model (per-submission attribution via the gateway API) and have
   `mining-stats` emit NOOK-per-dollar per A/B arm with a standing prune
