@@ -15,7 +15,7 @@
  *   - mining-context:  pickDomainHint, formatSearchResults, formatVaultHits
  *   - dashboard-web:   blocker scoring (via importing computeBlockers — exported below)
  */
-import { describe, it } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
 import { pickModel, pickModelAB, effortFor } from "../models.js";
@@ -3071,7 +3071,8 @@ import {
 } from "../quotas.js";
 import { acquireGeneration, semaphoreSnapshot } from "../generation-semaphore.js";
 import { readJsonlTail } from "../util.js";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { acquireInstanceLock, releaseInstanceLock, holderStatus, readPidfile, readGitRev, type LockDeps } from "../instance-lock.js";
+import { writeFileSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { join as joinPath } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -3454,5 +3455,151 @@ describe("verify-kinds.decideFromRerun (correctness from independent rerun)", ()
     const d = decideFromRerun({ success: true });
     assert.equal(d.action, "verify");
     assert.match(d.note, /inconclusive|submit-time/);
+  });
+});
+
+// ── instance-lock.ts single-instance daemon lock ────────────────────────
+
+describe("instance-lock (single-instance daemon lock)", () => {
+  let dir: string;
+  const pidfile = () => joinPath(dir, "bot.pid");
+  // A pid that is definitely not a live process AND not ours.
+  const DEAD_PID = 3_999_999;
+
+  beforeEach(() => {
+    dir = mkdtempSync(joinPath(tmpdir(), "nookplot-lock-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const deps = (over: Partial<LockDeps> = {}): Partial<LockDeps> => ({
+    pidfilePath: pidfile(),
+    isAlive: () => false,
+    commandOf: () => null,
+    cwdOf: () => null,
+    pid: 4242,
+    repo: "/repo/bot",
+    ...over,
+  });
+
+  it("acquires when no pidfile exists and records our identity", () => {
+    const info = acquireInstanceLock(deps());
+    assert.ok("pid" in info && info.pid === 4242);
+    const onDisk = readPidfile(pidfile());
+    assert.equal(onDisk?.pid, 4242);
+    assert.equal(onDisk?.repo, "/repo/bot");
+  });
+
+  it("acquires over a stale pidfile (recorded pid is dead)", () => {
+    writeFileSync(pidfile(), JSON.stringify({ pid: DEAD_PID, startedAt: "2026-07-20T00:00:00Z", gitRev: "abc1234", repo: "/repo/bot" }));
+    const info = acquireInstanceLock(deps({ isAlive: () => false }));
+    assert.ok("pid" in info);
+    assert.equal(readPidfile(pidfile())?.pid, 4242);
+  });
+
+  it("REFUSES when the holder is alive, runs src/index.ts, and cwd matches", () => {
+    writeFileSync(pidfile(), JSON.stringify({ pid: DEAD_PID, startedAt: "2026-07-23T00:00:00Z", gitRev: "abc1234", repo: "/repo/bot" }));
+    assert.throws(
+      () => acquireInstanceLock(deps({
+        isAlive: () => true,
+        commandOf: () => "node --require tsx/preflight.cjs --import tsx/loader.mjs src/index.ts",
+        cwdOf: () => "/repo/bot",
+      })),
+      new RegExp(`pid ${DEAD_PID}`),
+    );
+    // And the holder's pidfile was NOT touched.
+    assert.equal(readPidfile(pidfile())?.pid, DEAD_PID);
+  });
+
+  it("REFUSES when the holder is alive and cwd is unknowable (conservative)", () => {
+    writeFileSync(pidfile(), JSON.stringify({ pid: DEAD_PID, startedAt: "x", gitRev: null, repo: "/repo/bot" }));
+    assert.throws(() =>
+      acquireInstanceLock(deps({
+        isAlive: () => true,
+        commandOf: () => "node ... src/index.ts",
+        cwdOf: () => null,
+      })),
+    );
+  });
+
+  it("REFUSES conservatively when the pid is alive but command AND cwd are unknowable", () => {
+    writeFileSync(pidfile(), JSON.stringify({ pid: DEAD_PID, startedAt: "x", gitRev: null, repo: "/repo/bot" }));
+    assert.throws(
+      () => acquireInstanceLock(deps({ isAlive: () => true })),
+      /conservatively/,
+    );
+  });
+
+  it("acquires when the pid was REUSED by an unrelated process", () => {
+    writeFileSync(pidfile(), JSON.stringify({ pid: DEAD_PID, startedAt: "x", gitRev: null, repo: "/repo/bot" }));
+    const info = acquireInstanceLock(deps({
+      isAlive: () => true,
+      commandOf: () => "/Applications/Spotify.app/Contents/MacOS/Spotify",
+    }));
+    assert.ok("pid" in info);
+  });
+
+  it("acquires when a DIFFERENT tsx project holds the pid (src/index.ts is a generic name)", () => {
+    // The operator's other project also runs `tsx src/index.ts` — cwd disambiguates.
+    writeFileSync(pidfile(), JSON.stringify({ pid: DEAD_PID, startedAt: "x", gitRev: null, repo: "/repo/bot" }));
+    const info = acquireInstanceLock(deps({
+      isAlive: () => true,
+      commandOf: () => "node --import tsx/loader.mjs src/index.ts",
+      cwdOf: () => "/repo/morning-brief",
+    }));
+    assert.ok("pid" in info);
+  });
+
+  it("acquires over a corrupt pidfile", () => {
+    writeFileSync(pidfile(), "not json{{{");
+    const info = acquireInstanceLock(deps());
+    assert.ok("pid" in info);
+    assert.equal(readPidfile(pidfile())?.pid, 4242);
+  });
+
+  it("release removes only OUR pidfile, never another holder's", () => {
+    writeFileSync(pidfile(), JSON.stringify({ pid: DEAD_PID, startedAt: "x", gitRev: null, repo: "/repo/bot" }));
+    releaseInstanceLock(deps()); // we are 4242, holder is DEAD_PID
+    assert.equal(readPidfile(pidfile())?.pid, DEAD_PID); // untouched
+    acquireInstanceLock(deps());
+    releaseInstanceLock(deps());
+    assert.equal(readPidfile(pidfile()), null); // ours → removed
+  });
+
+  it("BOT_INSTANCE_LOCK=0 skips the lock entirely", () => {
+    const saved = process.env.BOT_INSTANCE_LOCK;
+    process.env.BOT_INSTANCE_LOCK = "0";
+    try {
+      const r = acquireInstanceLock(deps({ isAlive: () => true, commandOf: () => "src/index.ts", cwdOf: () => "/repo/bot" }));
+      assert.deepEqual(r, { skipped: true });
+      assert.equal(readPidfile(pidfile()), null); // nothing written
+    } finally {
+      if (saved === undefined) delete process.env.BOT_INSTANCE_LOCK;
+      else process.env.BOT_INSTANCE_LOCK = saved;
+    }
+  });
+
+  it("holderStatus reports alive holder identity for /api/health", () => {
+    writeFileSync(pidfile(), JSON.stringify({ pid: DEAD_PID, startedAt: "2026-07-23T12:00:00Z", gitRev: "f192051", repo: "/repo/bot" }));
+    const h = holderStatus(deps({
+      isAlive: () => true,
+      commandOf: () => "node ... src/index.ts",
+      cwdOf: () => "/repo/bot",
+    }));
+    assert.equal(h.state, "alive");
+    assert.equal(h.info?.gitRev, "f192051");
+    const stale = holderStatus(deps({ isAlive: () => false }));
+    assert.equal(stale.state, "stale");
+  });
+
+  it("readGitRev resolves HEAD → ref file in a synthetic .git", () => {
+    const repo = joinPath(dir, "fakerepo");
+    const refsDir = joinPath(repo, ".git", "refs", "heads");
+    mkdirSync(refsDir, { recursive: true });
+    writeFileSync(joinPath(repo, ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(joinPath(refsDir, "main"), "f192051deadbeef0000000000000000000000000\n");
+    assert.equal(readGitRev(repo), "f192051");
+    assert.equal(readGitRev(joinPath(dir, "no-such-repo")), null);
   });
 });

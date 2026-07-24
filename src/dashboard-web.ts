@@ -43,6 +43,7 @@ import { getRuntime } from "./runtime.js";
 import { isLean, runsInLean } from "./lean.js";
 import { readCapacity, capacityUnderuse, MINING_DAILY_CAP } from "./capacity.js";
 import { readDailySpend } from "./pnl.js";
+import { holderStatus } from "./instance-lock.js";
 
 const PORT = Number(process.env.WEB_PORT ?? 7878);
 const BIND = process.env.WEB_BIND_HOST ?? "127.0.0.1";
@@ -961,18 +962,45 @@ function json(res: ServerResponse, code: number, obj: unknown) {
  * the daemon's log (it writes constantly), used as a fallback if `pgrep` is
  * unavailable. Cached 4s so rapid polling can't spawn pgrep in a tight loop.
  */
-let daemonCache: { running: boolean; lastActivityAgoSec: number | null; at: number } | null = null;
-function daemonStatus(): { running: boolean; lastActivityAgoSec: number | null } {
+interface DaemonStatus {
+  running: boolean;
+  lastActivityAgoSec: number | null;
+  /** Identity from the instance-lock pidfile — null when no live holder. */
+  identity: { pid: number; startedAt: string; gitRev: string | null } | null;
+}
+let daemonCache: (DaemonStatus & { at: number }) | null = null;
+function daemonStatus(): DaemonStatus {
   const now = Date.now();
   if (daemonCache && now - daemonCache.at < 4000) {
-    return { running: daemonCache.running, lastActivityAgoSec: daemonCache.lastActivityAgoSec };
+    const { at: _at, ...rest } = daemonCache;
+    return rest;
   }
+  // Primary signal: the instance-lock pidfile — exact pid, no pattern match.
+  // (pgrep -f "src/index.ts" also matches UNRELATED tsx projects, which made
+  // the old check read "running" when only some other daemon was up.)
   let running = false;
+  let identity: DaemonStatus["identity"] = null;
+  let holderState: "none" | "stale" | "alive" | "ambiguous" = "none";
   try {
-    const r = spawnSync("pgrep", ["-f", "src/index.ts"], { encoding: "utf8", timeout: 2000 });
-    running = r.status === 0 && r.stdout.trim().length > 0;
+    const holder = holderStatus();
+    holderState = holder.state;
+    if (holder.state === "alive" || holder.state === "ambiguous") {
+      running = true;
+      identity = { pid: holder.info!.pid, startedAt: holder.info!.startedAt, gitRev: holder.info!.gitRev };
+    }
   } catch {
-    running = false;
+    /* fall through to the legacy signals */
+  }
+  // pgrep fallback ONLY when there is no pidfile at all (pre-lock daemon
+  // build). A stale pidfile is a definitive "dead" — pgrep would just
+  // false-positive on unrelated tsx projects running a src/index.ts.
+  if (!running && holderState === "none") {
+    try {
+      const r = spawnSync("pgrep", ["-f", "src/index.ts"], { encoding: "utf8", timeout: 2000 });
+      running = r.status === 0 && r.stdout.trim().length > 0;
+    } catch {
+      running = false;
+    }
   }
   // Freshness from the newest artifact the daemon actually touches. The bot logs
   // to stdout (redirected wherever the launcher points), so bot.log alone is
@@ -999,10 +1027,12 @@ function daemonStatus(): { running: boolean; lastActivityAgoSec: number | null }
     /* ignore */
   }
   const lastActivityAgoSec = newestMs > 0 ? Math.max(0, Math.round((now - newestMs) / 1000)) : null;
-  // Fallback: if pgrep couldn't confirm but the log is very fresh, treat as up.
-  if (!running && lastActivityAgoSec !== null && lastActivityAgoSec < 180) running = true;
-  daemonCache = { running, lastActivityAgoSec, at: now };
-  return { running, lastActivityAgoSec };
+  // Fallback: if neither pidfile nor pgrep could confirm but the log is very
+  // fresh, treat as up. A STALE pidfile skips this — the daemon is known-dead
+  // even if its files were touched seconds before the crash.
+  if (!running && holderState === "none" && lastActivityAgoSec !== null && lastActivityAgoSec < 180) running = true;
+  daemonCache = { running, lastActivityAgoSec, identity, at: now };
+  return { running, lastActivityAgoSec, identity };
 }
 
 /**

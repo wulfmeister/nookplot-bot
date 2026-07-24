@@ -81,6 +81,7 @@ import { runDiagnosticsTick } from "./diagnostics.js";
 import { gatherEcosystemSummary } from "./ecosystem.js";
 import { bootstrapSubscriptions, autoSpawnTunnel, shutdownTunnel } from "./subscriptions.js";
 import { runSpecializationDriftTick } from "./specialization-drift.js";
+import { acquireInstanceLock, releaseInstanceLock } from "./instance-lock.js";
 
 const EVENTS_FILE = join(NOOK_DIR, "events.jsonl");
 const AB_LOG = join(NOOK_DIR, "ab-applications.jsonl");
@@ -2447,6 +2448,19 @@ async function startEcosystemLoop(runtime: ReturnType<typeof getRuntime>) {
 }
 
 async function main() {
+  // Single-instance lock FIRST — before any side effect. A second daemon must
+  // exit here, not after it has posted/spent/subscribed (the 5-daemon pileup
+  // of 07-11→16 doubled spend and raced the 02:00Z post with pre-gate code).
+  try {
+    const lock = acquireInstanceLock();
+    if ("pid" in lock) console.log(`🔒 instance lock acquired (pid ${lock.pid}, rev ${lock.gitRev ?? "?"})`);
+  } catch (err) {
+    console.error(`✗ ${(err as Error).message}`);
+    process.exit(1);
+  }
+  // Releases only if the pidfile is OURS — a refused boot can't delete the
+  // legitimate holder's lock.
+  process.on("exit", () => releaseInstanceLock());
   // Keep bot.log live no matter how we're launched. Without this the log only
   // updates when the operator pipes stdout through `tee`; a bare launch freezes
   // it and the self-observer reads a stale tail (see src/bot-log.ts).
@@ -2608,6 +2622,7 @@ async function main() {
     if (diagnosticsInterval) clearInterval(diagnosticsInterval);
     if (ecosystemInterval) clearInterval(ecosystemInterval);
     shutdownTunnel();
+    releaseInstanceLock();
     await runtime.disconnect?.();
     process.exit(0);
   };

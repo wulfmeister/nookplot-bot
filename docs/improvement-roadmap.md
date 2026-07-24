@@ -37,11 +37,14 @@ items graduate out of this file when they ship (see CHANGELOG / git history).
 
 ## Tier 2 — structural robustness (cheap, permanent)
 
-- [ ] **Single-instance lock in the daemon.** The 5-daemon pileup (07-11→16:
-  tsx re-exec survived pattern-based kills; doubled spend, bypassed gates)
-  is currently prevented by *procedure*. Make it code: pidfile/flock at
-  boot, exit if another instance holds it; expose pid / boot time / git rev
-  in `/api/health` for a dashboard identity chip.
+- [x] **Single-instance lock in the daemon.** SHIPPED 2026-07-23
+  (`src/instance-lock.ts`): pidfile at `~/.nookplot/bot.pid` taken FIRST in
+  main() — a second boot refuses before any side effect. Handles stale files
+  (dead pid), OS pid reuse (command-line check), and same-named tsx projects
+  (cwd check); refuses conservatively when identity is unknowable;
+  `BOT_INSTANCE_LOCK=0` escape hatch. `/api/health` now reports the daemon's
+  pid / boot time / git rev from the pidfile instead of a `pgrep` pattern
+  that matched unrelated projects.
 - [ ] **launchd supervision + alerting.** The daemon dies with a reboot and
   nothing notices until a royalty day is lost. KeepAlive launchd job, plus
   alerts for: quorum stall, no challenge posted by ~20:00Z (the 250k/day

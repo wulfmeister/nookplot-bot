@@ -85,6 +85,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `BOT_SPECIALIZE_MATCH_MODE` | `any` | `any` = challenge matches one of your domains; `all` = must match every domain (`src/mining.ts`). |
 | `BOT_SPECIALIZE_STRICT` | off (`1` enables) | Make specialization a hard filter — skip non-matching challenges instead of just down-ranking them (`src/mining.ts`). |
 | `BOT_MINING_PACING` | on (`0` disables) | Spread solves over the rolling 24h window instead of bursting; prevents cap-boundary collisions with the gateway's rolling 12/24h regular cap (`src/mining.ts`). |
+| `BOT_INSTANCE_LOCK` | on (`0` disables) | Single-instance pidfile lock at `~/.nookplot/bot.pid` — a second daemon refuses to boot instead of silently doubling spend and racing gated code paths (`src/instance-lock.ts`). |
 | `BOT_MINING_REFINE` | on (`0` disables) | Critique-and-revise refinement pass on standard traces before submitting (`src/mining.ts`). |
 | `BOT_VERIFIABLE_TILT` | `0.6` (`0` disables) | Target verifiable-kind share of the rolling day's solve slots while verifier starvation is visible (standard expiry share above the trigger, or a quorum-watch stall). Verifiable kinds grade in a sandbox and are immune to quorum starvation (`src/mining.ts`). |
 | `BOT_VERIFIABLE_TILT_TRIGGER` | `0.2` | Standard-kind expiry share (over the tilt window) that arms the chronic tilt trigger (`src/mining.ts`). |
