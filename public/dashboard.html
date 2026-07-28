@@ -651,11 +651,20 @@ async function refreshBotStatus() {
   try {
     const h = await apiFetch("/api/health");
     const d = h && h.daemon ? h.daemon : { running: false, lastActivityAgoSec: null };
+    const gw = h && h.gateway ? h.gateway : null;
     const ago = fmtAgo(d.lastActivityAgoSec);
-    if (d.running) {
+    const rev = d.identity && d.identity.gitRev ? ` · rev ${d.identity.gitRev}` : "";
+    // Three states, because "running" alone lies: through the 53h blackout of
+    // 2026-07-25 the process was up and this badge stayed green while the bot
+    // earned nothing. Green now requires a REACHABLE GATEWAY too.
+    if (d.running && gw && !gw.reachable && gw.consecutiveNoEpoch >= 2) {
+      el.className = "bot-status stopped";
+      el.textContent = `● bot up — GATEWAY DOWN ${gw.hours >= 1 ? Math.round(gw.hours) + "h" : "<1h"}`;
+      el.title = `daemon is running but ${gw.consecutiveNoEpoch} consecutive polls returned no epoch (since ${gw.since || "?"}) — it is earning nothing. Check host connectivity.${rev}`;
+    } else if (d.running) {
       el.className = "bot-status running";
       el.textContent = "● bot running";
-      el.title = `daemon (src/index.ts) is up${ago ? ` · last activity ${ago}` : ""}`;
+      el.title = `daemon (src/index.ts) is up${ago ? ` · last activity ${ago}` : ""}${rev}${gw && gw.lastEpochSeenAt ? ` · gateway ok` : ""}`;
     } else {
       el.className = "bot-status stopped";
       el.textContent = "● bot stopped";

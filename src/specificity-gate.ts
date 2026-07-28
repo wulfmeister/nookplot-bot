@@ -47,7 +47,19 @@ export function specificityCategories(s: string): {
     // definition this file's own extractCategoryFragment / buildSpecificityTail use.
     numbers: /\b\d+(?:[.,]\d+)?\s?(?:%|x|×|ms|ns|μs|MB|GB|KB|tokens?|chars?|bits?|bytes?|iter(?:ations)?|epochs?|steps?|elements?|cases?)\b/.test(s)
       || /O\([^)]+\)/.test(s),
-    techniques: /\b[a-z]+[A-Z][A-Za-z]+\b/.test(s) || /"[^"]{3,}"/.test(s),
+    // A METHOD name, not any quoted string. The loose /"[^"]{3,}"/ arm used to
+    // credit bare string literals lifted out of source (`technique "http"` from
+    // a scheme check), so the local gate passed summaries the gateway scored
+    // techniques +0 on — the false pass behind 39 specificity-400s in 14 days.
+    // Require an identifier shape: camelCase, snake_case, or dotted/`()` calls.
+    // Accepts: camelCase (parseHeader), snake_case (bisect_right), a call
+    // (urlsplit(), json.loads()), or a dotted member (Map.get). The dotted arm
+    // excludes file extensions so "solution.py" stays a `code` hit only —
+    // double-crediting it would rebuild the false pass this replaced.
+    techniques: /\b[a-z]+[A-Z][A-Za-z]+\b/.test(s)
+      || /\b[a-z][a-z0-9]*_[a-z0-9_]+\b/.test(s)
+      || /\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\(/.test(s)
+      || /\b[A-Za-z_][A-Za-z0-9_]*\.(?!(?:py|ts|tsx|js|rs|go|java|cpp|c|h|md|json|yaml|toml|sh)\b)[A-Za-z_][A-Za-z0-9_]+\b/.test(s),
     comparisons: /\b(vs\.?|versus|better than|instead of|compared to|outperforms?|worse than)\b/i.test(s),
     code: /`[^`]+`/.test(s) || /\.(py|ts|tsx|js|rs|go|java|cpp|c|h|md|json|yaml|toml|sh)\b/.test(s),
     failures: /\b(fails?|broke|breaks?|error|pitfall|edge case|regress(?:ion|es)?|degrade)/i.test(s),

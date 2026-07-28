@@ -44,6 +44,7 @@ import { isLean, runsInLean } from "./lean.js";
 import { readCapacity, capacityUnderuse, MINING_DAILY_CAP } from "./capacity.js";
 import { readDailySpend } from "./pnl.js";
 import { holderStatus } from "./instance-lock.js";
+import { gatewayReachability } from "./network-status.js";
 
 const PORT = Number(process.env.WEB_PORT ?? 7878);
 const BIND = process.env.WEB_BIND_HOST ?? "127.0.0.1";
@@ -612,6 +613,25 @@ function computeBlockers(args: {
   const blockers: Array<{ severity: "high" | "med" | "low"; scope: "network" | "us"; message: string; action?: string }> = [];
   const p = args.poolDist;
   const blockedPct = p.total > 0 ? p.v0 / p.total : 0;
+
+  // FIRST, before any data-dependent rule: is the gateway even reachable?
+  // Every other rule here needs POSITIVE data to fire (e.g. the v0 guard
+  // divides by p.total), so a TOTAL outage produced an empty blocker list and
+  // a green "No blockers detected 🟢" — which is exactly what the dashboard
+  // showed through all 53 hours of the 2026-07-25 blackout while we earned
+  // nothing. A reachable gateway always returns an epoch, so a run of samples
+  // without one is unambiguous.
+  const gw = gatewayReachability(args.networkHistory);
+  if (!gw.reachable && gw.consecutiveNoEpoch >= 2) {
+    blockers.push({
+      severity: "high",
+      scope: "us",
+      message:
+        `Gateway unreachable: ${gw.consecutiveNoEpoch} consecutive polls (~${gw.hours.toFixed(1)}h, since ` +
+        `${gw.since ?? "?"}) returned no epoch — the daemon is up but earning nothing`,
+      action: "Check host connectivity first (this is usually the local network, not the gateway); the watchdog exits after 3 polls so a supervisor can restart into a fresh connection",
+    });
+  }
 
   if (args.emergencyReserve) {
     blockers.push({
@@ -1427,7 +1447,13 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     }
   }
   if (path === "/api/health") {
-    return json(res, 200, { ok: true, ts: new Date().toISOString(), daemon: daemonStatus() });
+    // `daemon.running` is process liveness ONLY — it was true for all 53h of
+    // the 2026-07-25 blackout. `gateway` is the half that says whether the
+    // daemon can actually earn; the header badge must require both.
+    const gateway = gatewayReachability(
+      readJsonlTail<NetworkStatusEntry>(join(NOOK_DIR, "network-status.jsonl"), 12),
+    );
+    return json(res, 200, { ok: true, ts: new Date().toISOString(), daemon: daemonStatus(), gateway });
   }
   if (path === "/api/solve-funnel") {
     try {

@@ -141,6 +141,9 @@ export async function pollNetworkStatus(
     safeGet<{ submissions?: VerifiableSub[] }>(runtime, "/v1/mining/submissions/verifiable?limit=200"),
     safeGet<RlmResp>(runtime, "/v1/mining/spot-checks/pending?limit=1"),
   ]);
+  // Watchdog FIRST: a reachable gateway always returns an epoch, and putting
+  // this before the rest of the poll means a later failure can't skip it.
+  noteGatewayReachability(epochRes !== null);
 
   // Pool distribution
   const subs = poolRes?.submissions ?? [];
@@ -231,6 +234,67 @@ export async function pollNetworkStatus(
   return snapshot;
 }
 
+/**
+ * Connectivity watchdog.
+ *
+ * On 2026-07-25 the host's network stack wedged at 22:57Z and stayed dead
+ * until a reboot 53 HOURS later. The daemon never noticed: the SDK's REST
+ * client is a stateless fetch with no reconnect primitive, `connect()` throws
+ * "Already connected" on a live runtime, the boot connect-ladder never re-runs,
+ * and every loop swallows its own fetch errors — so all 20+ loops kept ticking
+ * against a dead network while safeGet() quietly wrote a structurally valid
+ * all-zero snapshot every 30 minutes. Freshness checks passed (the file WAS
+ * being written); nothing inspected the CONTENT. Cost: ~1.1M NOOK of forfeited
+ * posting royalties and un-mined slots.
+ *
+ * A reachable gateway always returns an epoch. So: count consecutive polls
+ * where the epoch fetch returned null, and exit once it is clearly not a blip —
+ * re-entering the boot connect-ladder is the only recovery path the SDK
+ * affords, and a supervisor (launchd KeepAlive, see docs/operations.md) turns
+ * that exit into a restart. Threshold 3 = ~90 min at the 30-min cadence; across
+ * 3,152 historical samples every consecutive-null run was either length 1
+ * (transient blip) or a genuine multi-hour outage, so 3 has no false positives.
+ */
+const NULL_EPOCH_EXIT_THRESHOLD = Number(process.env.BOT_GATEWAY_WATCHDOG_POLLS ?? 3);
+let consecutiveNullEpochPolls = 0;
+
+/** Exported for tests: consecutive polls with an unreachable gateway. */
+export function gatewayWatchdogState(): { consecutiveNullEpochPolls: number; threshold: number } {
+  return { consecutiveNullEpochPolls, threshold: NULL_EPOCH_EXIT_THRESHOLD };
+}
+
+/** Pure decision half of the watchdog — given a run length, should we bail out? */
+export function shouldExitForDeadGateway(consecutive: number, threshold = NULL_EPOCH_EXIT_THRESHOLD): boolean {
+  return threshold > 0 && consecutive >= threshold;
+}
+
+function noteGatewayReachability(reachable: boolean): void {
+  if (reachable) {
+    if (consecutiveNullEpochPolls > 0) {
+      console.log(`   ✓ gateway reachable again after ${consecutiveNullEpochPolls} failed poll(s)`);
+    }
+    consecutiveNullEpochPolls = 0;
+    return;
+  }
+  consecutiveNullEpochPolls++;
+  console.warn(
+    `   ⚠ gateway unreachable (no epoch) — ${consecutiveNullEpochPolls}/${NULL_EPOCH_EXIT_THRESHOLD} consecutive polls`,
+  );
+  if (!shouldExitForDeadGateway(consecutiveNullEpochPolls)) return;
+  console.error(
+    `✗ gateway unreachable for ${consecutiveNullEpochPolls} consecutive polls — the daemon is up but earning ` +
+      `nothing. Exiting so a supervisor restarts us into a fresh connection (set BOT_GATEWAY_WATCHDOG_POLLS=0 to disable).`,
+  );
+  try {
+    appendJsonl(LOG_PATH, {
+      ts: new Date().toISOString(),
+      watchdog: "gateway-unreachable-exit",
+      consecutivePolls: consecutiveNullEpochPolls,
+    });
+  } catch { /* never block the exit on logging */ }
+  process.exit(70); // EX_UNAVAILABLE — distinguishes this from a crash in supervisor logs
+}
+
 export async function startNetworkStatusLoop(
   runtime: RuntimeLike,
   myAddress: string | null,
@@ -239,4 +303,43 @@ export async function startNetworkStatusLoop(
   // First snapshot 45s after boot (lets the bot settle), then every 30 min.
   setTimeout(() => pollNetworkStatus(runtime, myAddress).catch(() => undefined), 45_000);
   setInterval(() => pollNetworkStatus(runtime, myAddress).catch(() => undefined), 30 * 60 * 1000);
+}
+
+/**
+ * Was the gateway reachable at the daemon's most recent polls? Derived from the
+ * trailing tail of network-status.jsonl, which records what the DAEMON
+ * experienced (not this web process's own connectivity). A reachable gateway
+ * always returns an epoch number; `epoch == null` means the fetch failed and
+ * safeGet() nulled it.
+ *
+ * Consumed by the dashboard (/api/health + a blocker rule) and by tests, which feeds the header badge — the
+ * one thing an operator actually glances at.
+ */
+export function gatewayReachability(history: Array<{ ts?: string; epoch?: number | null }>): {
+  reachable: boolean;
+  consecutiveNoEpoch: number;
+  hours: number;
+  since: string | null;
+  lastEpochSeenAt: string | null;
+} {
+  const rows = history.filter((h) => h?.ts);
+  if (rows.length === 0) {
+    return { reachable: true, consecutiveNoEpoch: 0, hours: 0, since: null, lastEpochSeenAt: null };
+  }
+  let consecutive = 0;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i].epoch === undefined || rows[i].epoch === null) consecutive++;
+    else break;
+  }
+  const lastGood = rows[rows.length - 1 - consecutive];
+  const firstBad = consecutive > 0 ? rows[rows.length - consecutive] : null;
+  const latestTs = Date.parse(rows[rows.length - 1].ts!);
+  const hours = firstBad?.ts ? Math.max(0, (latestTs - Date.parse(firstBad.ts)) / 3_600_000) : 0;
+  return {
+    reachable: consecutive === 0,
+    consecutiveNoEpoch: consecutive,
+    hours,
+    since: firstBad?.ts ?? null,
+    lastEpochSeenAt: lastGood?.ts ?? null,
+  };
 }

@@ -54,7 +54,7 @@ interface CostEntry {
   estCost: number;
   /** When the caller knows whether this call was useful (e.g. a mining solve
    * that failed to parse), they record that here for later forensics. */
-  outcome?: "parse-ok" | "parse-fail" | "timeout" | "other-error" | "ok" | "rate-limited";
+  outcome?: "parse-ok" | "parse-fail" | "timeout" | "other-error" | "ok" | "rate-limited" | "submit-reject";
   callSite?: string;
 }
 
@@ -168,7 +168,13 @@ export function parseFailureRateByModel(lookback = 10): Record<
   }
   const result: Record<string, { attempts: number; failures: number; rate: number }> = {};
   for (const [model, recent] of Object.entries(byModel)) {
-    const failures = recent.filter((e) => e.outcome === "parse-fail").length;
+    // "submit-reject" counts as a failure alongside "parse-fail": a model whose
+    // output the GATEWAY refuses is just as worthless as one we can't parse,
+    // and costs the same paid solve. Without this the breaker is blind to
+    // wire-level rejection — GLM generated cleanly 146/148 times while 100% of
+    // its submissions 400'd, so the breaker rated it our healthiest arm for 13
+    // days (52 solves, $12.31, zero accepted).
+    const failures = recent.filter((e) => e.outcome === "parse-fail" || e.outcome === "submit-reject").length;
     result[model] = {
       attempts: recent.length,
       failures,
@@ -204,6 +210,28 @@ export function tagLatestCallOutcome(
       return;
     }
   }
+}
+
+/**
+ * Record that the GATEWAY refused a submission produced by `model` (a permanent
+ * 4xx that no retry fixes — e.g. an unrecognized modelUsed id). Appended as a
+ * zero-cost mining_solve entry so `parseFailureRateByModel` — and therefore the
+ * cost circuit breaker — sees wire-level rejection, not just parse failures.
+ * The paid solve is already spent by the time we learn this, so the only
+ * defense is sidelining the arm before it burns the next one.
+ */
+export function recordSubmitRejection(model: string, reason?: string): void {
+  appendJsonl(LOG, {
+    ts: new Date().toISOString(),
+    model,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    estCost: 0,
+    outcome: "submit-reject",
+    callSite: "mining_solve",
+    note: reason?.slice(0, 160),
+  } as CostEntry & { note?: string });
 }
 
 /** Track whether we've already fired the daily alert. Latched to avoid spam. */

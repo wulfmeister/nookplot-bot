@@ -7,21 +7,27 @@ items graduate out of this file when they ship (see CHANGELOG / git history).
 
 ## Tier 1 — our own data already says "do this"
 
-- [x] **Verifiable-kind tilt.** SHIPPED 2026-07-23 (`BOT_VERIFIABLE_TILT`,
-  default 0.6): while standard expiry share over the trailing window exceeds
-  `BOT_VERIFIABLE_TILT_TRIGGER` (0.2) or quorum-watch reports an acute stall,
-  the challenge sort prefers verifiable kinds until they hold the target
-  share of the rolling day's slots. At ship time the 21-day data read
-  standard 65 verified / 55 expired (46% forfeited) vs python_tests 49/49
-  verified — the trigger fired immediately. See `computeVerifiableTilt` in
-  `src/mining.ts`.
-- [x] **Don't solve into starvation.** SHIPPED via the tilt's acute trigger:
-  the solver now consumes `analyzeQuorumHealth` (v2-pinned-at-0 stall) and
-  swaps preference to verifiable kinds while starvation is acute. The
-  hard-defer variant (idle the slot entirely) was evaluated and REJECTED:
-  even the worst measured week resolved 43% of standards, so solving keeps
-  positive EV over idling. Revisit only if a stall window ever shows ~100%
-  expiry.
+- [x] **Verifiable-kind tilt.** SHIPPED 2026-07-23, **CORRECTED 2026-07-28.**
+  The original trigger (expiry share > 20%) was WRONG: it ranked kinds by
+  survival rate while ignoring what each kind pays. Gateway per-submission
+  attribution showed standard returns 54,308 NOOK per paid solve at 55%
+  survival (27,516/slot) vs verifiable 10,181 at 88% (8,960/slot) — standard
+  wins 3.1x DESPITE the expiry, and break-even needs ~84% standard expiry.
+  The 20% trigger fired constantly and steered slots toward work paying ~5x
+  less, into a path that only submits 38% of the time. The trigger is now the
+  EV comparison itself (`BOT_STANDARD_REWARD_MULTIPLE`, measured 5.3x), which
+  correctly reports "standard first" on current data. Lesson: rank by NOOK
+  per slot, never by a survival rate alone.
+- [x] **Don't solve into starvation.** RESOLVED — as "no action needed",
+  which the numbers above make explicit. Both proposed responses lose money
+  at any starvation level yet observed: idling a slot earns 0, and switching
+  to verifiable earns ~5x less per slot, while a standard solve survives
+  ~55% of the time. The quorum-stall trigger added on 07-23 was REMOVED on
+  07-28 for the same reason — a stall depresses standard survival, which the
+  EV test already sees through the expiry share, and even the worst stall
+  week resolved 43% of standards (far above the ~16% break-even). Revisit
+  only if a window ever shows ~85%+ expiry, which the tilt now handles
+  automatically.
 - [x] **File the farm dossier with the network team.** DONE 2026-07-25 — all
   three reports filed.
   - **Epoch-boundary-stall:** public issue nookprotocol/nookplot#10 — 15 ≥3h
@@ -53,11 +59,25 @@ items graduate out of this file when they ship (see CHANGELOG / git history).
   `BOT_INSTANCE_LOCK=0` escape hatch. `/api/health` now reports the daemon's
   pid / boot time / git rev from the pidfile instead of a `pgrep` pattern
   that matched unrelated projects.
-- [ ] **launchd supervision + alerting.** The daemon dies with a reboot and
-  nothing notices until a royalty day is lost. KeepAlive launchd job, plus
-  alerts for: quorum stall, no challenge posted by ~20:00Z (the 250k/day
-  poster royalty needs a verified solve before 02:00Z settlement), claim=0
-  day, spend spike, stale heartbeat.
+- [x] **launchd supervision.** SHIPPED 2026-07-28 after the blackout below:
+  `scripts/com.nookplot.bot.plist` (RunAtLoad + KeepAlive + 60s throttle) and
+  `scripts/run-daemon.sh`. Paired with the connectivity watchdog
+  (`BOT_GATEWAY_WATCHDOG_POLLS`) — the watchdog's exit is only a repair if
+  something restarts us. Safe alongside a manual `npm start` because of the
+  single-instance lock.
+- [ ] **Alerting (still open).** Supervision restarts a dead daemon but
+  nothing yet tells the operator when we are *up and not earning*: no
+  challenge posted by ~20:00Z (the 250k/day poster royalty needs a verified
+  solve before 02:00Z settlement), claim=0 day, spend spike. The dashboard
+  now goes red on a dead gateway, but only if someone is looking at it.
+- [x] **Connectivity watchdog.** SHIPPED 2026-07-28. On 07-25 the host
+  network wedged for 53h; the daemon stayed alive, kept writing all-zero
+  snapshots, and earned nothing — ~1.1M NOOK forfeited (2 days of posting
+  royalty, which does NOT accumulate, plus ~19 un-mined slots). The SDK has
+  no reconnect primitive and `connect()` throws on a live runtime, so the
+  watchdog exits 70 after 3 consecutive epoch-less polls and lets the
+  supervisor rebuild the connection. Dashboard shows a high blocker and a red
+  "GATEWAY DOWN" badge from 2 samples (~1h).
 - [ ] **Back up operational state.** `~/.nookplot/*.jsonl` (gate caches,
   rolling-cap state, claim history) is unbacked-up operational gold — extend
   the existing knowledge-backup script. Also rotate

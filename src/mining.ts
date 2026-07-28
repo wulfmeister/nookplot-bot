@@ -6,7 +6,6 @@ import { pickModel, pickModelAB, pickAlternateModel, effortFor, abPool, PARSE_FA
 import { isFarmChallengeTitle } from "./trace-fingerprint.js";
 import { writeNote } from "./vault.js";
 import { NOOK_DIR, readJsonl, readJsonlTail, appendJsonl, extractJsonObj, sleep } from "./util.js";
-import { analyzeQuorumHealth } from "./quorum-watch.js";
 import { gatherMiningContext, type MiningContext } from "./mining-context.js";
 import {
   fetchSubmissionGuide,
@@ -71,6 +70,25 @@ const VERIFIABLE_DEFAULT_MODEL = "claude-opus-4-8";
 // deterministic tests, feeding the exact failing test back to the solver. The
 // gateway grants up to 20 slots/challenge; we use a few. Tune via env.
 const VERIFIABLE_FIX_RETRIES = Number(process.env.BOT_VERIFIABLE_FIX_RETRIES ?? 2);
+
+/**
+ * Summary rules for VERIFIABLE (code) solves.
+ *
+ * The gateway scores traceSummary for specificity and 400s below 35/100. The
+ * verifiable path has no reasoning trace to enrich from — only snake_case
+ * Python/JS source, which contains no camelCase identifiers, no unit-bearing
+ * numbers and no comparative phrasing, so the enricher had nothing to extract
+ * and 39 submissions in 14 days died at the wire (60% of all python attempts,
+ * each one a paid solve). Ask the SOLVER for the scoring tokens instead of
+ * trying to synthesize them afterwards. The three bullets mirror the gateway's
+ * own "Concrete fix" guidance verbatim.
+ */
+const SUMMARY_SPECIFICITY_RULE = `
+- The "summary" is scored for specificity by an automated grader and REJECTED below threshold. It must contain ALL THREE of:
+  • a measurable claim with units or counts — "O(n log n) for n=10000 elements", "2 passes over 64 bytes", "reduces 3 scans to 1"; a bare year or step number does NOT count;
+  • a named method in backticks — \`bisect_right\`, \`urlsplit\`, \`Map.get\` — used in a clause that says what it does, not just listed;
+  • an explicit comparison — "X instead of Y", "vs", "better than" — e.g. "iterative accumulation instead of recursion (avoids stack depth limits at n>1000)".
+  Describe the ALGORITHM and its measurable properties. Do NOT pad with metadata (reward amounts, challenge ids, the function's own name) — the grader scores those zero.`;
 
 // Hidden test harnesses on these challenges frequently include SECURITY assertions
 // (a single security failure rejects the whole solve even when the functional
@@ -389,6 +407,7 @@ async function solvePythonTests(
 Constraints:
 - Output JSON ONLY, no prose, no code fences outside the JSON value.
 - Schema (emit "solution" FIRST): {"solution":"complete Python source code as a single string","reasoning":"50-200 char explanation","summary":"100+ char description of approach + key steps"}
+${SUMMARY_SPECIFICITY_RULE}
 - Your solution.py must export the function(s) named in the challenge description.
 - Handle edge cases (empty inputs, negatives, zero, large numbers, off-by-one boundaries).
 - Use stdlib only; no third-party imports unless requirements.txt explicitly lists them.
@@ -438,6 +457,7 @@ async function solveJsTests(
 
 Constraints:
 - Output JSON ONLY (emit "solution" FIRST): {"solution":"complete JS source as a string","reasoning":"50-200 chars","summary":"100+ chars approach + edges handled"}
+${SUMMARY_SPECIFICITY_RULE}
 - Use ESM exports (export function foo() {}). The runner uses "type": "module".
 - No top-level await. No console.log. No imports of node:fs etc unless explicitly required.
 - Handle edge cases.${SECURITY_HARDENING_JS}${starterHint}`;
@@ -819,6 +839,55 @@ export function gatewayModelName(model: string): string {
   return model.replace(/^zai-org-/, "").replace(/^e2ee-/, "");
 }
 
+/**
+ * Does this submit error blame the MODEL ID itself (as opposed to the trace
+ * content, the epoch cap, or a duplicate)? Only these justify sidelining the
+ * arm — the gateway is saying it will never accept anything this model
+ * produces, so every further pick burns a paid solve for nothing.
+ */
+export function isModelRejection(error: string): boolean {
+  return /modelUsed|doesn't look like a real model name|unknown model/i.test(error);
+}
+
+/**
+ * Last-resort summary rewrite for a verifiable solve whose summary can't clear
+ * the specificity gate by extraction alone. One cheap call, given the code and
+ * the exact categories the gateway scores — cheaper than the paid solve it
+ * saves. Returns null on any failure; the caller then skips the submit rather
+ * than sending something we predict will 400.
+ */
+export async function regenerateVerifiableSummary(
+  current: string,
+  code: string | undefined,
+  ch: Challenge,
+  model: string,
+): Promise<string | null> {
+  try {
+    const res = await chat(
+      [
+        {
+          role: "system",
+          content:
+            `Rewrite a solution summary so it passes an automated specificity grader. Output the rewritten summary as PLAIN TEXT only — no JSON, no quotes around the whole thing, no preamble.\n${SUMMARY_SPECIFICITY_RULE}\n- 2-4 sentences, 150-500 characters. Describe only what the code actually does; invent no measurements.`,
+        },
+        {
+          role: "user",
+          content:
+            `Challenge: ${ch.title ?? "(untitled)"}\n\nCurrent summary (too vague):\n${current}\n\n` +
+            (code ? `Solution code:\n\`\`\`\n${code.slice(0, 4000)}\n\`\`\`\n\n` : "") +
+            `Rewrite it now.`,
+        },
+      ],
+      { model, max_tokens: 4000, temperature: 0.3, timeoutMs: 90_000 },
+    );
+    const out = (res.content ?? "").trim().replace(/^["'`]+|["'`]+$/g, "").trim();
+    return out.length >= 100 ? out : null;
+  } catch (err) {
+    console.warn(`   ⚠ summary regeneration failed: ${(err as Error).message.slice(0, 120)}`);
+    return null;
+  }
+}
+
 export function maybeOverrideModelForVerifiable(
   ch: Challenge,
   abPick: { model: string; reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" },
@@ -987,28 +1056,44 @@ export function challengeValueTier(c: Challenge): number {
 }
 
 /**
- * Verifiable-kind tilt (2026-07-23). The value-tier sort encodes HEALTHY-
- * network economics: standard traces pay ~5-6.5x per cap slot, so they outrank
- * verifiable kinds. But standard payouts require a 3-verifier quorum, and the
- * verifier pool starves for days at a time — measured over the three weeks to
- * 07-23: standard resolved 65 verified / 55 EXPIRED (46% of slots forfeited)
- * while python_tests ran 49/49 verified (sandbox-graded, quorum-immune).
- * When starvation is visible — chronic (trailing standard expiry share above
- * BOT_VERIFIABLE_TILT_TRIGGER) or acute (quorum-watch reports a v2=0 stall) —
- * invert the tier preference until verifiable kinds hold BOT_VERIFIABLE_TILT
- * of the rolling day's submitted slots. Soft, like the base sort: with no
- * verifiable challenge open, standards still run — a slot never idles. This
- * also covers the acute half of "don't solve into starvation": a hard defer
- * was rejected because even the worst measured week resolved 43% of standards,
- * so a standard slot keeps positive EV over idling.
+ * Verifiable-kind tilt — CORRECTED 2026-07-28.
+ *
+ * The original trigger (ship 07-23) fired whenever the trailing standard-kind
+ * EXPIRY SHARE exceeded 20%, on the theory that converting forfeited slots
+ * into sandbox-graded (quorum-immune) ones is free money. That was wrong: it
+ * ranked kinds by survival rate while ignoring how much each kind PAYS.
+ * Per-submission attribution from the gateway (2026-07-28, last 100 subs):
+ *
+ *   standard    54,308 NOOK per paid solve × 55% survival = 27,516 / slot
+ *   verifiable  10,181 NOOK per paid solve × 88% survival =  8,960 / slot
+ *
+ * Standard wins 3.1x DESPITE losing 45% of its slots to expiry. Break-even
+ * needs standard survival to fall to ~16% (i.e. ~84% expiry) — four times
+ * worse than anything yet observed. The 20% trigger therefore fired
+ * constantly and steered slots from 27.5k-per-slot work into 9k-per-slot
+ * work, compounded by verifiable's 38% submit rate (the gateway specificity
+ * gate rejects most of them).
+ *
+ * The trigger is now the comparison that actually decides it: tilt only when
+ * standard's expected value per slot drops BELOW verifiable's, using the
+ * measured reward multiple (BOT_STANDARD_REWARD_MULTIPLE, re-measurable with
+ * `npm run mining:stats`). Same soft mechanism as before — it is a sort, not
+ * a filter, so a slot never idles.
+ *
+ * The standalone quorum-stall trigger was also dropped: a stall depresses
+ * standard survival, which this EV test already sees through the expiry
+ * share, and even the worst measured stall week still resolved 43% of
+ * standards — far above the ~16% break-even.
  */
 export interface TiltInputs {
   ratio: number; // target verifiable share of the rolling day's slots; 0 disables
-  trigger: number; // standard expiry share that arms the chronic trigger
-  minResolved: number; // minimum resolved standards before expiry share is trusted
+  /** How many times more a PAID standard solve pays than a paid verifiable one. */
+  standardRewardMultiple: number;
+  minResolved: number; // minimum resolved standards before survival is trusted
   standardResolved: number; // verified+expired standard rows in the window
   standardExpiredShare: number;
-  quorumStalled: boolean; // acute signal from quorum-watch
+  /** Verifiable survival (verified / resolved). Defaults to 1 — they grade in a sandbox. */
+  verifiableSurvival: number;
   todaySubmitted: number; // slots consumed in the rolling 24h (rows with submissionId)
   todayVerifiable: number; // of those, verifiable kinds
 }
@@ -1023,30 +1108,32 @@ export function computeVerifiableTilt(i: TiltInputs): TiltState {
   if (!(i.ratio > 0)) {
     return { active: false, preferVerifiable: false, reason: "tilt disabled (BOT_VERIFIABLE_TILT=0)" };
   }
-  const chronic = i.standardResolved >= i.minResolved && i.standardExpiredShare > i.trigger;
-  const active = chronic || i.quorumStalled;
-  if (!active) {
+  // Not enough resolved standards to trust the survival estimate → keep the
+  // healthy-network default (standard first). Never tilt on noise.
+  if (i.standardResolved < i.minResolved) {
     return {
       active: false,
       preferVerifiable: false,
-      reason: `standard expiry ${(i.standardExpiredShare * 100).toFixed(0)}% of ${i.standardResolved} resolved ≤ ${(i.trigger * 100).toFixed(0)}% trigger, no quorum stall`,
+      reason: `only ${i.standardResolved} resolved standards (<${i.minResolved}) — too few to judge; standard first`,
     };
+  }
+  // EV per slot, in units of "one paid verifiable solve".
+  const standardEv = (1 - i.standardExpiredShare) * i.standardRewardMultiple;
+  const verifiableEv = i.verifiableSurvival;
+  const ev = `standard EV ${standardEv.toFixed(2)} (${((1 - i.standardExpiredShare) * 100).toFixed(0)}% survival × ${i.standardRewardMultiple.toFixed(1)}x reward) vs verifiable ${verifiableEv.toFixed(2)}`;
+  if (standardEv >= verifiableEv) {
+    return { active: false, preferVerifiable: false, reason: `${ev} → standard first` };
   }
   const todayShare = i.todaySubmitted > 0 ? i.todayVerifiable / i.todaySubmitted : 0;
   const preferVerifiable = todayShare < i.ratio;
-  const why = [
-    chronic ? `standard expiry ${(i.standardExpiredShare * 100).toFixed(0)}% of ${i.standardResolved} resolved > ${(i.trigger * 100).toFixed(0)}%` : null,
-    i.quorumStalled ? "quorum STALL (v2 pinned at 0)" : null,
-  ].filter(Boolean).join(" + ");
   return {
-    active,
+    active: true,
     preferVerifiable,
-    reason: `${why}; rolling-day verifiable ${i.todayVerifiable}/${i.todaySubmitted} vs ${(i.ratio * 100).toFixed(0)}% target → ${preferVerifiable ? "verifiable first" : "target met — standard first"}`,
+    reason: `${ev} → verifiable is worth more per slot; rolling-day verifiable ${i.todayVerifiable}/${i.todaySubmitted} vs ${(i.ratio * 100).toFixed(0)}% target → ${preferVerifiable ? "verifiable first" : "target met — standard first"}`,
   };
 }
 
 const MINING_VERIFIED_LOG = join(NOOK_DIR, "mining-verified.jsonl");
-const NETWORK_STATUS_LOG = join(NOOK_DIR, "network-status.jsonl");
 
 /** Gather tilt inputs from local JSONL state (impure shell around computeVerifiableTilt). */
 export function loadTiltInputs(nowMs: number): TiltInputs {
@@ -1055,20 +1142,26 @@ export function loadTiltInputs(nowMs: number): TiltInputs {
     return Number.isFinite(n) ? n : dflt;
   };
   const ratio = Math.min(1, Math.max(0, num(process.env.BOT_VERIFIABLE_TILT, 0.6)));
-  const trigger = num(process.env.BOT_VERIFIABLE_TILT_TRIGGER, 0.2);
+  // Measured 2026-07-28 from gateway per-submission attribution: a paid
+  // standard solve returned 54,308 NOOK vs 10,181 for a paid verifiable one.
+  // Re-measure with `npm run mining:stats` and update if the network reprices.
+  const standardRewardMultiple = num(process.env.BOT_STANDARD_REWARD_MULTIPLE, 5.3);
   const windowMs = num(process.env.BOT_VERIFIABLE_TILT_WINDOW_DAYS, 10) * 86_400_000;
   let standardResolved = 0;
   let standardExpired = 0;
+  let verifiableResolved = 0;
+  let verifiableVerified = 0;
   for (const r of readJsonlTail<{ ts?: string; verifierKind?: string; status?: string }>(MINING_VERIFIED_LOG, 600)) {
-    if (r.verifierKind !== "standard") continue;
     if (!r.ts || nowMs - Date.parse(r.ts) > windowMs) continue;
-    if (r.status === "verified") standardResolved++;
-    else if (r.status === "expired") { standardResolved++; standardExpired++; }
+    const verifiable = r.verifierKind ? VERIFIABLE_KINDS.has(r.verifierKind) : false;
+    if (r.verifierKind === "standard") {
+      if (r.status === "verified") standardResolved++;
+      else if (r.status === "expired") { standardResolved++; standardExpired++; }
+    } else if (verifiable) {
+      if (r.status === "verified") { verifiableResolved++; verifiableVerified++; }
+      else if (r.status === "expired" || r.status === "rejected") verifiableResolved++;
+    }
   }
-  const quorumStalled =
-    analyzeQuorumHealth(readJsonlTail(NETWORK_STATUS_LOG, 400), {
-      stallHours: num(process.env.BOT_QUORUM_STALL_HOURS, 6),
-    }).status === "stalled";
   let todaySubmitted = 0;
   let todayVerifiable = 0;
   for (const r of readJsonlTail<{ ts?: string; verifierKind?: string; submissionId?: string }>(MINING_LOG, 300)) {
@@ -1079,11 +1172,13 @@ export function loadTiltInputs(nowMs: number): TiltInputs {
   }
   return {
     ratio,
-    trigger,
+    standardRewardMultiple,
     minResolved: 10,
     standardResolved,
     standardExpiredShare: standardResolved ? standardExpired / standardResolved : 0,
-    quorumStalled,
+    // Sandbox-graded kinds essentially always resolve; fall back to 1.0 until
+    // we have enough resolved rows to say otherwise.
+    verifiableSurvival: verifiableResolved >= 5 ? verifiableVerified / verifiableResolved : 1,
     todaySubmitted,
     todayVerifiable,
   };
@@ -1497,6 +1592,31 @@ export async function discoverAndSolveMiningChallenges(
         s.traceSummary = enrichSummarySpecificity(s.traceSummary, [s.traceContent, codeText, s.reasoning, ch.description]);
         console.log(`   🔬 summary enriched pre-submit (${before}→${countSpecificity(s.traceSummary)} specificity categories)`);
       }
+      // Enrichment is extractive — on the verifiable path there is often
+      // nothing in the source material to extract (snake_case code has no
+      // camelCase names, no unit-bearing numbers, no comparisons), so it can
+      // return a summary that still fails. Submitting anyway is how 39 paid
+      // solves died at the gateway. Regenerate instead: one cheap targeted
+      // call, told exactly which categories are missing.
+      if (s.traceSummary && !s.traceContent && !passesSpecificityGate(s.traceSummary)) {
+        const rewritten = await regenerateVerifiableSummary(s.traceSummary, codeText, ch, modelUsed);
+        if (rewritten && passesSpecificityGate(rewritten)) {
+          console.log(`   ✍ summary regenerated to clear the specificity gate`);
+          s.traceSummary = rewritten;
+        } else {
+          console.warn(`   ⛔ summary still below the specificity gate after regeneration — skipping submit to save the solve`);
+          appendJsonl(MINING_LOG, {
+            ts: new Date().toISOString(),
+            challengeId: ch.id,
+            verifierKind: kind,
+            outcome: "error" as const,
+            notes: "specificity gate: summary unfixable locally (submit skipped)",
+            model: modelUsed,
+          });
+          specificityRejectedChallenges.markFor(ch.id, ALREADY_SUBMITTED_TTL_MS);
+          continue;
+        }
+      }
 
       let sub: {
         id?: string;
@@ -1593,6 +1713,16 @@ export async function discoverAndSolveMiningChallenges(
 
       if (sub.error) {
         console.warn(`   ✗ submit error: ${sub.error}`);
+        // Model-attributable rejection (the gateway refused the modelUsed id
+        // itself) → feed the circuit breaker so this arm gets sidelined before
+        // it burns another paid solve. Other 400s (specificity, cap, dupes)
+        // are challenge-attributable, not model-attributable, so they must NOT
+        // sideline a healthy model.
+        if (isModelRejection(sub.error)) {
+          void import("./venice-cost.js")
+            .then((m) => m.recordSubmitRejection(modelUsed, sub.error))
+            .catch(() => undefined); // telemetry must never break the loop
+        }
         appendJsonl(MINING_LOG, {
           ts: new Date().toISOString(),
           challengeId: ch.id,

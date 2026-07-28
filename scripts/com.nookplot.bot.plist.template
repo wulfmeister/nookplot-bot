@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Supervisor template for the nookplot-bot daemon (macOS launchd).
+  __REPO__ and __HOME__ are substituted by scripts/install-launchd.sh — run
+  that rather than copying this file by hand.
+
+  Why this exists: on 2026-07-25 the host network wedged and the daemon limped
+  for 53h earning nothing (~1.1M NOOK forfeited — the 250k/day posting royalty
+  does not accumulate). The connectivity watchdog in src/network-status.ts now
+  exits 70 when the gateway is unreachable for BOT_GATEWAY_WATCHDOG_POLLS
+  consecutive polls, but that exit is only a REPAIR if something restarts us —
+  this job. RunAtLoad additionally covers reboots (the same incident lost a
+  further 30 min waiting for a manual start).
+
+  KeepAlive is unconditional rather than SuccessfulExit-only: the daemon is
+  meant to run forever, so ANY exit is a fault worth restarting. ThrottleInterval
+  keeps a crash-loop from hammering the gateway, and the single-instance lock
+  (src/instance-lock.ts) prevents doubling up with a manual `npm start`.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.nookplot.bot</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO__/scripts/run-daemon.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>WorkingDirectory</key><string>__REPO__</string>
+  <key>StandardOutPath</key><string>__HOME__/.nookplot/bot.out.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.nookplot/bot.out.log</string>
+</dict>
+</plist>

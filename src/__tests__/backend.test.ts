@@ -111,7 +111,7 @@ import {
   enrichSummarySpecificity,
   passesSpecificityGate,
 } from "../specificity-gate.js";
-import { compareChallengePriority, challengeValueTier, computeVerifiableTilt, isTransientGenerationError, type TiltInputs } from "../mining.js";
+import { compareChallengePriority, challengeValueTier, computeVerifiableTilt, isModelRejection, isTransientGenerationError, type TiltInputs } from "../mining.js";
 import { pickAlternateModel } from "../models.js";
 import { selectBundleCids, bundleDue, sanitizeBundleTags, registeredPublishedCids } from "../bundles.js";
 import { countWithinDays, cohortAddresses } from "../cohort-benchmark.js";
@@ -1611,76 +1611,96 @@ describe("mining.compareChallengePriority", () => {
   });
 });
 
-// ── mining.ts verifiable-kind tilt (quorum-starvation response) ─────────
+// ── mining.ts verifiable-kind tilt (EV comparison, corrected 2026-07-28) ──
 
 describe("mining.computeVerifiableTilt", () => {
-  // Baseline inputs: healthy network, nothing submitted yet today.
-  const healthy: TiltInputs = {
+  // Baseline = the real measured network: standard pays 5.3x per PAID solve and
+  // loses 45% of slots to expiry; verifiable grades in a sandbox (survival ~1).
+  const measured: TiltInputs = {
     ratio: 0.6,
-    trigger: 0.2,
+    standardRewardMultiple: 5.3,
     minResolved: 10,
-    standardResolved: 40,
-    standardExpiredShare: 0.1,
-    quorumStalled: false,
+    standardResolved: 75,
+    standardExpiredShare: 0.45,
+    verifiableSurvival: 0.88,
     todaySubmitted: 0,
     todayVerifiable: 0,
   };
 
-  it("inactive on a healthy network (expiry under trigger, no stall)", () => {
-    const t = computeVerifiableTilt(healthy);
+  it("does NOT tilt at the real measured numbers — standard wins despite 45% expiry", () => {
+    // This is the regression the original expiry-share trigger caused: it fired
+    // at 20% expiry and steered slots from 27.5k-per-slot to 9k-per-slot work.
+    const t = computeVerifiableTilt(measured);
     assert.equal(t.active, false);
     assert.equal(t.preferVerifiable, false);
+    assert.match(t.reason, /standard first/);
   });
 
-  it("ratio 0 disables the tilt entirely, even during a stall", () => {
-    const t = computeVerifiableTilt({ ...healthy, ratio: 0, quorumStalled: true, standardExpiredShare: 1 });
+  it("does not tilt at 46% expiry either (the number that triggered the bad version)", () => {
+    assert.equal(computeVerifiableTilt({ ...measured, standardResolved: 120, standardExpiredShare: 0.46 }).active, false);
+  });
+
+  it("tilts only when standard EV actually falls below verifiable EV", () => {
+    // Break-even: (1-e) * 5.3 < 0.88  →  e > ~83.4%.
+    const justUnder = computeVerifiableTilt({ ...measured, standardExpiredShare: 0.82 });
+    assert.equal(justUnder.active, false, "82% expiry still favors standard");
+    const justOver = computeVerifiableTilt({ ...measured, standardExpiredShare: 0.85 });
+    assert.equal(justOver.active, true, "85% expiry finally favors verifiable");
+    assert.equal(justOver.preferVerifiable, true);
+  });
+
+  it("a catastrophic stall (95% expiry) tilts", () => {
+    const t = computeVerifiableTilt({ ...measured, standardExpiredShare: 0.95 });
+    assert.equal(t.active, true);
+    assert.equal(t.preferVerifiable, true);
+  });
+
+  it("ratio 0 disables the tilt entirely, even at total standard collapse", () => {
+    const t = computeVerifiableTilt({ ...measured, ratio: 0, standardExpiredShare: 1 });
     assert.equal(t.active, false);
     assert.match(t.reason, /disabled/);
   });
 
-  it("chronic trigger: expiry share above trigger with sufficient sample activates", () => {
-    // The real 07-23 numbers: 55 of 120 resolved standards expired (46%).
-    const t = computeVerifiableTilt({ ...healthy, standardResolved: 120, standardExpiredShare: 0.46 });
-    assert.equal(t.active, true);
-    assert.equal(t.preferVerifiable, true); // 0/0 today < 60% target
-    assert.match(t.reason, /46%/);
-  });
-
-  it("small sample does NOT arm the chronic trigger (2 expiries of 4 resolved is noise)", () => {
-    const t = computeVerifiableTilt({ ...healthy, standardResolved: 4, standardExpiredShare: 0.5 });
+  it("small sample never tilts (3 expiries of 4 resolved is noise, not a signal)", () => {
+    const t = computeVerifiableTilt({ ...measured, standardResolved: 4, standardExpiredShare: 0.75 });
     assert.equal(t.active, false);
+    assert.match(t.reason, /too few/);
   });
 
-  it("acute quorum stall activates regardless of sample size", () => {
-    const t = computeVerifiableTilt({ ...healthy, standardResolved: 0, standardExpiredShare: 0, quorumStalled: true });
+  it("a lower reward multiple lowers the bar for tilting", () => {
+    // If standard ever pays only 1.2x, 30% expiry is already enough.
+    const t = computeVerifiableTilt({ ...measured, standardRewardMultiple: 1.2, standardExpiredShare: 0.3 });
     assert.equal(t.active, true);
-    assert.equal(t.preferVerifiable, true);
-    assert.match(t.reason, /STALL/);
+  });
+
+  it("weak verifiable survival raises the bar for tilting", () => {
+    // Verifiable that only survives 30% of the time is a worse destination.
+    const base = { ...measured, standardExpiredShare: 0.9 };
+    assert.equal(computeVerifiableTilt(base).active, true);
+    assert.equal(computeVerifiableTilt({ ...base, verifiableSurvival: 0.3 }).active, false);
   });
 
   it("stops preferring verifiable once the rolling day hits the target share", () => {
-    // 6 verifiable of 10 submitted = 60% ≥ 60% target → back to standard-first,
-    // but the tilt stays ACTIVE (re-arms if more standards land).
-    const t = computeVerifiableTilt({
-      ...healthy, standardResolved: 120, standardExpiredShare: 0.46,
-      todaySubmitted: 10, todayVerifiable: 6,
-    });
+    const tilted = { ...measured, standardExpiredShare: 0.9 };
+    const t = computeVerifiableTilt({ ...tilted, todaySubmitted: 10, todayVerifiable: 6 });
     assert.equal(t.active, true);
     assert.equal(t.preferVerifiable, false);
     assert.match(t.reason, /target met/);
+    const under = computeVerifiableTilt({ ...tilted, todaySubmitted: 10, todayVerifiable: 5 });
+    assert.equal(under.preferVerifiable, true);
   });
+});
 
-  it("still prefers verifiable just under the target share", () => {
-    const t = computeVerifiableTilt({
-      ...healthy, standardResolved: 120, standardExpiredShare: 0.46,
-      todaySubmitted: 10, todayVerifiable: 5,
-    });
-    assert.equal(t.preferVerifiable, true);
+describe("mining.isModelRejection (circuit-breaker attribution)", () => {
+  it("blames the MODEL for modelUsed rejections", () => {
+    assert.equal(isModelRejection('Gateway request failed (400): modelUsed "glm-5-2" doesn\'t look like a real model name'), true);
+    assert.equal(isModelRejection("unknown model: foo-1"), true);
   });
-
-  it("expiry exactly AT the trigger does not activate (strict >)", () => {
-    const t = computeVerifiableTilt({ ...healthy, standardExpiredShare: 0.2 });
-    assert.equal(t.active, false);
+  it("does NOT blame the model for content/cap/dupe rejections", () => {
+    // These would sideline a perfectly healthy arm if misattributed.
+    assert.equal(isModelRejection("Gateway request failed (400): traceSummary specificity score 33/100 (threshold 35)"), false);
+    assert.equal(isModelRejection("Maximum 12 regular challenges per 24-hour epoch"), false);
+    assert.equal(isModelRejection("You have already submitted to this challenge"), false);
   });
 });
 
@@ -3071,6 +3091,7 @@ import {
 } from "../quotas.js";
 import { acquireGeneration, semaphoreSnapshot } from "../generation-semaphore.js";
 import { readJsonlTail } from "../util.js";
+import { shouldExitForDeadGateway, gatewayWatchdogState, gatewayReachability } from "../network-status.js";
 import { acquireInstanceLock, releaseInstanceLock, holderStatus, readPidfile, readGitRev, type LockDeps } from "../instance-lock.js";
 import { writeFileSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { join as joinPath } from "node:path";
@@ -3601,5 +3622,93 @@ describe("instance-lock (single-instance daemon lock)", () => {
     writeFileSync(joinPath(refsDir, "main"), "f192051deadbeef0000000000000000000000000\n");
     assert.equal(readGitRev(repo), "f192051");
     assert.equal(readGitRev(joinPath(dir, "no-such-repo")), null);
+  });
+});
+
+describe("network-status gateway watchdog", () => {
+  it("does not exit on a single missed poll (transient blip)", () => {
+    assert.equal(shouldExitForDeadGateway(1, 3), false);
+    assert.equal(shouldExitForDeadGateway(2, 3), false);
+  });
+  it("exits once the run reaches the threshold", () => {
+    assert.equal(shouldExitForDeadGateway(3, 3), true);
+    assert.equal(shouldExitForDeadGateway(105, 3), true); // the 2026-07-25 outage
+  });
+  it("threshold 0 disables the watchdog entirely", () => {
+    assert.equal(shouldExitForDeadGateway(999, 0), false);
+  });
+  it("starts from a clean state", () => {
+    const st = gatewayWatchdogState();
+    assert.equal(st.consecutiveNullEpochPolls, 0);
+    assert.ok(st.threshold >= 0);
+  });
+});
+
+describe("dashboard-web.gatewayReachability (blackout visibility)", () => {
+  const ok = (ts: string, epoch?: number | null) => ({ ts, epoch: epoch ?? undefined });
+  it("reports reachable when the latest sample has an epoch", () => {
+    const r = gatewayReachability([ok("2026-07-28T02:00:00Z", 130), ok("2026-07-28T02:30:00Z", 131)]);
+    assert.equal(r.reachable, true);
+    assert.equal(r.consecutiveNoEpoch, 0);
+  });
+  it("detects the trailing no-epoch run and measures its span", () => {
+    // The real 2026-07-25 shape: a good sample, then nothing but nulls.
+    const r = gatewayReachability([
+      ok("2026-07-25T22:27:00Z", 128),
+      ok("2026-07-25T22:57:00Z", undefined),
+      ok("2026-07-25T23:27:00Z", undefined),
+      ok("2026-07-26T00:57:00Z", undefined),
+    ]);
+    assert.equal(r.reachable, false);
+    assert.equal(r.consecutiveNoEpoch, 3);
+    assert.equal(r.since, "2026-07-25T22:57:00Z");
+    assert.equal(r.lastEpochSeenAt, "2026-07-25T22:27:00Z");
+    assert.ok(r.hours > 1.9 && r.hours < 2.1, `expected ~2h, got ${r.hours}`);
+  });
+  it("treats null epoch the same as undefined", () => {
+    assert.equal(gatewayReachability([ok("2026-07-25T22:57:00Z", null)]).consecutiveNoEpoch, 1);
+  });
+  it("recovery clears the run even with nulls earlier in history", () => {
+    const r = gatewayReachability([
+      ok("2026-07-28T02:00:00Z", undefined),
+      ok("2026-07-28T02:30:00Z", undefined),
+      ok("2026-07-28T03:39:00Z", 131),
+    ]);
+    assert.equal(r.reachable, true);
+    assert.equal(r.consecutiveNoEpoch, 0);
+  });
+  it("empty history is not an outage (fresh install)", () => {
+    assert.equal(gatewayReachability([]).reachable, true);
+  });
+});
+
+describe("specificity-gate techniques matcher (post-2026-07-28 tightening)", () => {
+  it("no longer credits a bare string literal lifted from code", () => {
+    // The exact false pass behind 39 gateway specificity-400s: the enricher
+    // appended `technique "http"` from a scheme check and the local gate said
+    // pass, while the gateway scored techniques +0.
+    assert.equal(specificityCategories('Validates the scheme technique "http" before fetching.').techniques, false);
+    assert.equal(specificityCategories('Uses the "fast" path when possible.').techniques, false);
+  });
+  it("still credits real method names", () => {
+    assert.equal(specificityCategories("Uses bisect_right to find the insertion point.").techniques, true);
+    assert.equal(specificityCategories("Calls urlsplit() on the raw input first.").techniques, true);
+    assert.equal(specificityCategories("Delegates to Map.get for O(1) lookup.").techniques, true);
+    assert.equal(specificityCategories('Wraps "json.loads" instead of pickle.').techniques, true);
+    assert.equal(specificityCategories("The parseHeader helper normalizes casing.").techniques, true);
+  });
+  it("a gateway-shaped good summary passes the whole gate", () => {
+    const good =
+      "Uses `bisect_right` over the sorted offsets instead of a linear scan, cutting lookup from O(n) to O(log n) " +
+      "for n=10000 entries. Rejects malformed rows early rather than failing at parse time.";
+    assert.equal(passesSpecificityGate(good), true);
+  });
+  it("the vague summaries that actually 400'd still fail locally", () => {
+    // Real shape of a rejected python_tests summary: prose + a literal, no
+    // measurable claim, no comparison. Must NOT reach the gateway.
+    assert.equal(
+      passesSpecificityGate('Implements the requested function by iterating over the input and returning the result for "get_url_body".'),
+      false,
+    );
   });
 });

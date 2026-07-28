@@ -80,9 +80,18 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   // that fails ≥30% over ≥5 attempts, and DEFAULTS.mining_solve (opus-4-8) is the
   // safe fallback if all four get filtered. At 12/day that's ~3 attempts/arm/day;
   // mining-stats recommends pruning at gap ≥20pp once n ≥ 5 per arm.
+  // GLM removed 2026-07-28 after 52 attempts / 0 accepted submissions / $12.31
+  // burned across 13 days: the gateway's modelUsed validator rejects every
+  // dash-mangled form of its id (both "zai-org-glm-5-2" and the stripped
+  // "glm-5-2" 400 with "doesn't look like a real model name" AFTER we pay for
+  // the solve). The parse-fail circuit breaker could not see it — GLM was
+  // 146/148 "ok" at GENERATION time, so the breaker rated it our healthiest
+  // arm while 100% of its submissions died at the wire. Do not re-add without
+  // a single canary submission using a dotted id ("glm-5.2", fallback
+  // "zai-org/GLM-5.2"); both are unverified guesses and each test costs a
+  // paid solve.
   mining_solve: [
     "grok-4-5",
-    "zai-org-glm-5-2",
     "claude-fable-5",
     "openai-gpt-56-sol",
   ],
