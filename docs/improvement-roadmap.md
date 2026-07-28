@@ -22,23 +22,22 @@ items graduate out of this file when they ship (see CHANGELOG / git history).
   even the worst measured week resolved 43% of standards, so solving keeps
   positive EV over idling. Revisit only if a stall window ever shows ~100%
   expiry.
-- [~] **File the farm dossier with the network team.** IN PROGRESS 2026-07-23.
-  Evidence compiled from 4 days of trace sampling: 1,188/1,370 traces (87%)
-  abstained as farm spam, `wallet=` leaks tying **69** distinct Sybil wallets
-  to one operator, three fixed-text fingerprint families, and the design flaw
-  (quorum is a verification COUNT, so low scores still advance spam toward
-  payment — see `src/trace-fingerprint.ts`).
-  - **Epoch-boundary-stall report: FILED** as a public issue
-    (nookprotocol/nookplot#10) — 15 ≥3h verification freezes in 14 days,
-    ~46% standard-kind expiry.
-  - **Farm dossier + credit-pricing mismatch: STAGED, awaiting the private
-    "Report a vulnerability" form.** GitHub's private-report REST endpoint
-    500s server-side, and both must stay private (the dossier names wallets
-    and would tip the operator), so they can't be auto-filed — the web form
-    needs the operator's browser. Bodies + wallet list staged out-of-repo.
-  If the team acts on the dossier, the pool detoxifies and genuine
-  submissions stop expiring — the only lever that fixes the NETWORK we earn
-  from.
+- [x] **File the farm dossier with the network team.** DONE 2026-07-25 — all
+  three reports filed.
+  - **Epoch-boundary-stall:** public issue nookprotocol/nookplot#10 — 15 ≥3h
+    verification freezes in 14 days, ~46% standard-kind expiry.
+  - **Farm dossier:** filed privately via GitHub security advisory (in
+    triage). Evidence: 1,188/1,370 traces (87%) abstained as farm spam over
+    4 days, `wallet=` leaks tying 69 distinct Sybil wallets to one operator,
+    three fixed-text fingerprint families, and the design flaw (quorum is a
+    verification COUNT, so low scores still advance spam toward payment —
+    see `src/trace-fingerprint.ts`). Wallet list included in the private
+    report; fingerprint regexes withheld, offered on request.
+  - **Credit-pricing mismatch:** filed privately via GitHub security
+    advisory (in triage) — CreditPurchase charges 2.5× the advertised
+    per-credit rate.
+  Watch for maintainer responses on all three; if the team acts on the
+  dossier, the pool detoxifies and genuine submissions stop expiring.
 - [ ] **Close the model-P&L loop.** Join settled epoch_solving income to the
   submitting model (per-submission attribution via the gateway API) and have
   `mining-stats` emit NOOK-per-dollar per A/B arm with a standing prune
