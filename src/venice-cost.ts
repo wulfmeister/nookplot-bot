@@ -29,18 +29,46 @@ const LOG = join(NOOK_DIR, "venice-costs.jsonl");
  * Numbers track the published Venice catalog prices as of 2026-05; revise
  * if Venice updates pricing.
  */
-const COST_PER_M_TOKENS_BLENDED: Record<string, number> = {
-  // Venice list 2026-06-11: $12/M in, $60/M out — exactly 2× opus-4-7
-  // ($6/$30), so 2× the table's opus blended rate keeps ordering consistent.
-  "claude-opus-4-8": 25.0, // $5/$25 per M — same Opus-tier blended rate as 4-7
-  "claude-fable-5": 50.0,
-  "claude-opus-4-7": 25.0,
-  "openai-gpt-55": 18.0,
-  "grok-4-3": 12.0,
-  "gemini-3-1-pro-preview": 8.0,
-  "deepseek-v4-pro": 5.0,
+/**
+ * Real Venice list prices, USD per 1M tokens, pulled from the live catalog
+ * (`GET /v1/models` → model_spec.pricing) on 2026-07-28.
+ *
+ * Replaces a single hand-maintained "blended" rate per model, which had gone
+ * both STALE and INCOMPLETE: grok-4-3 was listed at 12.0 against a real
+ * $1.42/$2.83, and three of the four live mining arms (grok-4-5,
+ * openai-gpt-56-sol, and both new ones) had no entry at all, so they silently
+ * fell back to the default. Since these numbers feed NOOK-per-dollar per A/B
+ * arm — the comparison that decides which model to prune — a wrong rate
+ * quietly corrupts the decision.
+ *
+ * Input vs output is tracked separately because our calls are extremely
+ * output-heavy: reasoning tokens bill as output and every call carries a 50k
+ * completion budget, so a blended rate mis-prices arms whose in/out spread
+ * differs (grok-4-5 is 3.0x out/in; gpt-56-sol is 6.0x).
+ */
+const MODEL_PRICING: Record<string, { in: number; out: number }> = {
+  // Current mining A/B arms
+  "grok-4-5": { in: 2.27, out: 6.8 },
+  "claude-opus-5": { in: 6, out: 30 },
+  "openai-gpt-56-sol": { in: 6.25, out: 37.5 },
+  "kimi-k3": { in: 4.6875, out: 23.4375 },
+  // Fallback / other-task models
+  "claude-opus-4-8": { in: 6, out: 30 },
+  "claude-opus-4-7": { in: 6, out: 30 },
+  "claude-fable-5": { in: 12, out: 60 },
+  "grok-4-3": { in: 1.42, out: 2.83 },
+  "openai-gpt-55": { in: 6.25, out: 37.5 },
+  "zai-org-glm-5-2": { in: 1.4, out: 4.4 },
+  "gemini-3-1-pro-preview": { in: 2.5, out: 15 },
+  "deepseek-v4-pro": { in: 1.65, out: 3.301 },
 };
-const DEFAULT_COST_PER_M = 15.0;
+// NOTE: grok-4-3, grok-4-5 and gemini-3-1-pro-preview also have EXTENDED-context
+// tiers that roughly double these rates above a 200k-token threshold. The flat
+// table cannot express that, so long-context calls on those models are
+// under-costed. Immaterial today (mining prompts run ~4-12k tokens); revisit if
+// we start feeding whole repos.
+/** Unknown model: assume mid-tier rather than free, so cost never reads as 0. */
+const DEFAULT_PRICING = { in: 5.0, out: 20.0 };
 
 const DAILY_COST_ALERT = Number(process.env.BOT_VENICE_DAILY_COST_ALERT ?? 50);
 
@@ -59,9 +87,15 @@ interface CostEntry {
 }
 
 /** Estimate a single call's cost in credits given usage data. */
-export function estimateCallCost(model: string, totalTokens: number): number {
-  const rate = COST_PER_M_TOKENS_BLENDED[model] ?? DEFAULT_COST_PER_M;
-  return (totalTokens / 1_000_000) * rate;
+export function estimateCallCost(model: string, totalTokens: number, completionTokens?: number): number {
+  const p = MODEL_PRICING[model] ?? DEFAULT_PRICING;
+  // With a known split, price input and output separately (reasoning tokens
+  // are billed as output and dominate our spend). Without it, assume the
+  // output-heavy shape our calls actually have (~70% completion) rather than
+  // an even split, which would understate cost by ~2x.
+  const out = completionTokens ?? totalTokens * 0.7;
+  const inp = Math.max(0, totalTokens - out);
+  return (inp / 1_000_000) * p.in + (out / 1_000_000) * p.out;
 }
 
 /** Record a successful Venice call. */
@@ -84,7 +118,15 @@ export function recordVeniceCall(args: {
   const totalTokens = Number(
     (u as { total_tokens?: number }).total_tokens ?? promptTokens + completionTokens + reasoningTokens,
   );
-  const estCost = estimateCallCost(args.model, totalTokens);
+  // completionTokens ALREADY INCLUDES reasoningTokens — Venice follows the
+  // OpenAI convention where reasoning is a subset, verified against 6,108
+  // reasoning-bearing rows in this very log (total == prompt + completion in
+  // 6108/6108, additive in 0/6108). Adding them would double-count, and only
+  // on the arms that report reasoning at all (grok-4-5 and gpt-56-sol always
+  // do; claude-opus-* and kimi-k3 never do) — inflating two A/B arms' cost by
+  // 18-61% while leaving the others exact, which is precisely the per-arm
+  // corruption this pricing work exists to prevent.
+  const estCost = estimateCallCost(args.model, totalTokens, completionTokens);
   const entry: CostEntry = {
     ts: new Date().toISOString(),
     model: args.model,

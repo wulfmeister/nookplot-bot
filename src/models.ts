@@ -4,11 +4,12 @@
  * Each task gets the model best suited for its value/volume tradeoff.
  * Override at runtime by setting MODEL_<TASK> env vars (uppercased).
  *
- * Venice catalog confirmed live (re-probed 2026-07-09, 100 models):
- *   grok-4-3, grok-4-5, grok-4-20, claude-opus-4-8, claude-fable-5,
- *   claude-sonnet-5, zai-org-glm-5-2, openai-gpt-55, openai-gpt-56-sol,
- *   gemini-3-1-pro-preview, deepseek-v4-pro. All four mining arms below
- *   probed 200 + non-empty on 2026-07-09.
+ * Venice catalog confirmed live (re-probed 2026-07-28, 106 models):
+ *   grok-4-3, grok-4-5, grok-4-20, claude-opus-4-8, claude-opus-5,
+ *   claude-fable-5, claude-sonnet-5, kimi-k2-5/k2-6/k2-7-code/k3,
+ *   openai-gpt-55, openai-gpt-56-sol, gemini-3-1-pro-preview,
+ *   deepseek-v4-pro. All four mining arms below probed 200 + non-empty with a
+ *   solve-shaped JSON request on 2026-07-28.
  */
 
 import { isLean } from "./lean.js";
@@ -70,10 +71,10 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   // rotation swaps in four newer models, all re-probed 200 + non-empty:
   //   grok-4-5          — xAI's newer grok; 500k ctx (down from 4-3's 1M), pricier
   //     on output ($2.27/$6.80). reasoning_effort=xhigh.
-  //   zai-org-glm-5-2   — GLM-5.2, 1M ctx, $1.40/$4.40 — replaces the sidelined
-  //     deepseek-v4-pro (40% submit rate, worst in pool). effort=high.
-  //   claude-fable-5    — Claude 5 flagship; back on Venice (no longer 500s) but
-  //     2× opus cost ($12/$60). On trial per operator; effort=xhigh.
+  //   claude-opus-5     — Claude 5 Opus, 1M ctx, code-optimized. Replaced
+  //     claude-fable-5 on 2026-07-28 (operator); effort=high.
+  //   kimi-k3           — Moonshot Kimi K3, 1M ctx, code-optimized. Added as the
+  //     4th arm 2026-07-28 (operator); effort=high.
   //   openai-gpt-56-sol — GPT-5.6 "Sol", 1M ctx, $6.25/$37.5. effort=high (OpenAI
   //     reasoning models empty-trace at xhigh — see MODEL_EFFORT note).
   // The parse-fail circuit-breaker (filterPoolByParseFailure) sidelines any arm
@@ -90,10 +91,26 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   // a single canary submission using a dotted id ("glm-5.2", fallback
   // "zai-org/GLM-5.2"); both are unverified guesses and each test costs a
   // paid solve.
+  // Roster set 2026-07-28 (operator): claude-opus-5 replaces claude-fable-5,
+  // kimi-k3 joins as the 4th arm. All four ids verified against the LIVE Venice
+  // catalog (GET /v1/models, 106 models) and probed with a solve-shaped request
+  // at both high and xhigh — every one returned parseable JSON with a working
+  // solution and a summary that clears our specificity gate. None carries an
+  // org prefix, which is the shape the gateway's modelUsed validator rejects
+  // (see the GLM note above); every plain-id model we have ever submitted has
+  // been accepted (grok-4-5 59/59, claude-opus-4-8 39/39, gpt-56-sol 32/32,
+  // claude-fable-5 8/8). If a new arm is nonetheless rejected at the wire, the
+  // submit-reject breaker now sidelines it automatically.
+  // BETA WATCH: kimi-k3 and openai-gpt-56-sol are flagged betaModel=true in the
+  // catalog — Venice may withdraw a beta model without the standard deprecation
+  // notice. A withdrawn arm 404s at generation, which is NOT matched by
+  // isTransientGenerationError, so the attempt is lost rather than rerouted.
+  // Re-probe these two first whenever the catalog is re-checked.
   mining_solve: [
     "grok-4-5",
-    "claude-fable-5",
+    "claude-opus-5",
     "openai-gpt-56-sol",
+    "kimi-k3",
   ],
   mining_learning: undefined,
   verification_score: undefined,
@@ -122,12 +139,21 @@ const MODEL_EFFORT: Record<string, ReasoningEffort> = {
   "claude-fable-5": "xhigh",
   "claude-opus-4-7": "xhigh",
   "grok-4-3": "xhigh",
-  "grok-4-5": "xhigh",
+  // grok-4-5 accepts ONLY low|medium|high per the live catalog
+  // (reasoningEffortOptions) — it was set to "xhigh" from 2026-07-09 until
+  // 2026-07-28, an unsupported value Venice appears to have silently ignored.
+  "grok-4-5": "high",
   "openai-gpt-55": "high",
   // OpenAI reasoning models empty-trace at xhigh (observed on gpt-55) — keep
   // gpt-56-sol at high. GLM-5.2 at high pending its own calibration.
   "openai-gpt-56-sol": "high",
-  "zai-org-glm-5-2": "high",
+  // claude-opus-5 and kimi-k3 are deliberately ABSENT: the live catalog reports
+  // supportsReasoningEffort=false / no reasoningEffortOptions for both, so any
+  // value here would be an ignored parameter. Both still reason (
+  // supportsReasoning=true) — they just don't expose a depth dial. Probing them
+  // at high vs xhigh on 2026-07-28 produced different-length output, but since
+  // the requests were served identically that was sampling noise, not a
+  // calibration signal. effortFor() returning undefined omits the field.
   // Probed live 2026-05-24: both accept xhigh and return non-empty.
   "gemini-3-1-pro-preview": "xhigh",
   "deepseek-v4-pro": "xhigh",

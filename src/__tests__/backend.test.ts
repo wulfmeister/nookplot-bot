@@ -149,21 +149,43 @@ describe("models", () => {
     // Non-lean A/B sampling (lean would force the cheap model, pool="lean").
     const savedLean = process.env.BOT_LEAN;
     delete process.env.BOT_LEAN;
-    // Pool as of 2026-07-09 (operator-directed refresh): the prior arms had
-    // collapsed to 2 live models (rest parse-failed), so this rotates in four
-    // newer models — grok-4-5, glm-5.2, fable-5 (back on Venice), gpt-5.6 Sol.
+    // Pool as of 2026-07-28 (operator): opus-5 replaced fable-5, kimi-k3 added,
+    // GLM removed (0/52 accepted — the gateway rejects org-prefixed ids).
+    // All four verified against the live Venice catalog + solve-shaped probes.
     const allowed = new Set([
       "grok-4-5",
-      "zai-org-glm-5-2",
-      "claude-fable-5",
+      "claude-opus-5",
       "openai-gpt-56-sol",
+      "kimi-k3",
     ]);
     try {
-      for (let i = 0; i < 20; i++) {
+      const seen = new Set<string>();
+      for (let i = 0; i < 40; i++) {
         const pick = pickModelAB("mining_solve");
         assert.equal(pick.pool, "ab");
         assert.ok(allowed.has(pick.model), `unexpected model: ${pick.model}`);
+        seen.add(pick.model);
       }
+      // Every arm must actually be reachable — a typo'd id would silently
+      // never be picked, or (worse) be picked and rejected at the wire.
+      assert.equal(seen.size, allowed.size, `only ${[...seen].join(",")} were ever picked`);
+      // No arm may carry an org prefix: that is the exact shape the gateway's
+      // modelUsed validator rejects (GLM burned 52 paid solves on it).
+      for (const m of allowed) {
+        assert.ok(!/^(zai-org-|e2ee-|moonshotai-|meta-)/.test(m), `${m} has an org prefix the gateway rejects`);
+        assert.equal(gatewayModelName(m), m, `${m} should pass through gatewayModelName unchanged`);
+      }
+      // Reasoning effort is configured ONLY for arms that expose the dial.
+      // Per the live catalog (2026-07-28): grok-4-5 supports low|medium|high,
+      // openai-gpt-56-sol supports up to max, and claude-opus-5 / kimi-k3
+      // report supportsReasoningEffort=false — a value for those would be an
+      // ignored parameter dressed up as a calibration decision.
+      assert.equal(effortFor("claude-opus-5"), undefined);
+      assert.equal(effortFor("kimi-k3"), undefined);
+      // And never send an effort a model doesn't accept: grok-4-5 tops out at
+      // "high" (it was set to an unsupported "xhigh" for three weeks).
+      assert.equal(effortFor("grok-4-5"), "high");
+      assert.equal(effortFor("openai-gpt-56-sol"), "high");
     } finally {
       if (savedLean === undefined) delete process.env.BOT_LEAN;
       else process.env.BOT_LEAN = savedLean;
@@ -3091,6 +3113,7 @@ import {
 } from "../quotas.js";
 import { acquireGeneration, semaphoreSnapshot } from "../generation-semaphore.js";
 import { readJsonlTail } from "../util.js";
+import { estimateCallCost } from "../venice-cost.js";
 import { shouldExitForDeadGateway, gatewayWatchdogState, gatewayReachability } from "../network-status.js";
 import { acquireInstanceLock, releaseInstanceLock, holderStatus, readPidfile, readGitRev, type LockDeps } from "../instance-lock.js";
 import { writeFileSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
@@ -3225,14 +3248,17 @@ describe("util.readJsonlTail", () => {
 
 import { before, after } from "node:test";
 
-import { estimateCallCost } from "../venice-cost.js";
 import { filterPoolByParseFailure } from "../models.js";
 import { findRenames } from "../specialization-drift.js";
 
 describe("venice-cost.estimateCallCost", () => {
   it("uses known model rate", () => {
+    // Real Venice list pricing for the Opus tier: $6/M in, $30/M out. With no
+    // split supplied we assume the output-heavy shape our calls actually have
+    // (70% completion): 0.3M×$6 + 0.7M×$30 = $22.80. This replaced a stale
+    // hand-maintained blended rate of 25.0 on 2026-07-28.
     const c = estimateCallCost("claude-opus-4-7", 1_000_000);
-    assert.equal(Math.round(c * 100) / 100, 25.0);
+    assert.equal(Math.round(c * 100) / 100, 22.8);
   });
   it("falls back to default rate for unknown model", () => {
     const c = estimateCallCost("some-future-model", 100_000);
@@ -3710,5 +3736,64 @@ describe("specificity-gate techniques matcher (post-2026-07-28 tightening)", () 
       passesSpecificityGate('Implements the requested function by iterating over the input and returning the result for "get_url_body".'),
       false,
     );
+  });
+});
+
+describe("venice-cost.estimateCallCost (real per-model pricing)", () => {
+  it("prices every live mining arm from the real table, not the default", () => {
+    // A model missing from the table silently falls back to DEFAULT_PRICING,
+    // which corrupts the NOOK-per-dollar comparison that decides A/B pruning.
+    // Distinct prices prove each arm has its own entry.
+    const costs = ["grok-4-5", "claude-opus-5", "openai-gpt-56-sol", "kimi-k3"]
+      .map((m) => estimateCallCost(m, 12000, 8000));
+    assert.equal(new Set(costs.map((c) => c.toFixed(6))).size, 4, "arms share a price — one is falling back to the default");
+    for (const c of costs) assert.ok(c > 0, "cost must never be zero");
+  });
+
+  it("bills output tokens at the output rate (reasoning dominates our spend)", () => {
+    // Same total, different split: output-heavy must cost more, since every
+    // arm prices output 3-6x input.
+    const outputHeavy = estimateCallCost("claude-opus-5", 10000, 9000);
+    const inputHeavy = estimateCallCost("claude-opus-5", 10000, 1000);
+    assert.ok(outputHeavy > inputHeavy * 2, `expected output-heavy to dominate: ${outputHeavy} vs ${inputHeavy}`);
+  });
+
+  it("matches Venice list pricing for a known model", () => {
+    // claude-opus-5 = $6/M in, $30/M out. 4k in + 8k out = 0.024 + 0.24.
+    assert.ok(Math.abs(estimateCallCost("claude-opus-5", 12000, 8000) - 0.264) < 1e-9);
+  });
+
+  it("an unknown model still costs something (never free)", () => {
+    assert.ok(estimateCallCost("some-unreleased-model", 12000, 8000) > 0);
+  });
+
+  it("assumes an output-heavy split when the completion count is unknown", () => {
+    // Legacy 2-arg calls must not understate cost by assuming a cheap split.
+    const assumed = estimateCallCost("claude-opus-5", 10000);
+    const evenSplit = estimateCallCost("claude-opus-5", 10000, 5000);
+    assert.ok(assumed > evenSplit, "unknown split should assume output-heavy");
+  });
+});
+
+describe("venice-cost reasoning-token accounting (no double-count)", () => {
+  it("treats reasoning as a SUBSET of completion, not additive", () => {
+    // Venice follows the OpenAI convention: completion_tokens already includes
+    // reasoning_tokens (verified against 6,108 reasoning-bearing rows in the
+    // live cost log — total == prompt + completion in 6108/6108, additive in
+    // 0/6108). Billing their sum double-counts, and ONLY on arms that report
+    // reasoning (grok-4-5, gpt-56-sol always; claude-*, kimi-k3 never), which
+    // silently biases the per-arm NOOK-per-dollar comparison.
+    const prompt = 2500, completion = 5000, total = 7500;
+    const correct = estimateCallCost("openai-gpt-56-sol", total, completion);
+    const doubleCounted = estimateCallCost("openai-gpt-56-sol", total, completion + 2300);
+    assert.ok(doubleCounted > correct, "sanity: the buggy form would cost more");
+    // The correct figure is exactly input-rate × prompt + output-rate × completion.
+    const expected = (2500 / 1e6) * 6.25 + (5000 / 1e6) * 37.5;
+    assert.ok(Math.abs(correct - expected) < 1e-9, `${correct} != ${expected}`);
+  });
+
+  it("never lets the output count exceed the total (input can't go negative)", () => {
+    const c = estimateCallCost("claude-opus-5", 1000, 5000);
+    assert.ok(c > 0 && Number.isFinite(c));
   });
 });

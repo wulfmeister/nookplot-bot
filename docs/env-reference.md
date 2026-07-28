@@ -59,7 +59,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `MODEL_BOUNTY_WORK` | `claude-opus-4-8` | Approved-bounty deliverables. |
 | `MODEL_BOUNTY_CRITIQUE` | `claude-opus-4-8` | Refiner critique pass. |
 | `MODEL_BOUNTY_REVISE` | `claude-opus-4-8` | Refiner revise pass. |
-| `MODEL_MINING_SOLVE` | `claude-opus-4-8` (A/B pool: claude-opus-4-8 / openai-gpt-55 / grok-4-3 / gemini-3-1-pro-preview) | Mining challenge solutions. |
+| `MODEL_MINING_SOLVE` | `claude-opus-4-8` (A/B pool as of 2026-07-28: grok-4-5 / claude-opus-5 / openai-gpt-56-sol / kimi-k3) | Mining challenge solutions. Pool arms must be plain Venice ids — org-prefixed ids (`zai-org-…`) are rejected by the gateway's `modelUsed` validator after you have already paid for the solve. |
 | `MODEL_MINING_LEARNING` | `grok-4-3` | Post-solve learning prose. |
 | `MODEL_VERIFICATION_SCORE` | `grok-4-3` | 4-dimension trace scoring. |
 | `MODEL_VERIFICATION_COMPREHENSION` | `grok-4-3` | Comprehension-question answers during verification. |

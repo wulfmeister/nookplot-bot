@@ -64,7 +64,13 @@ const VERIFIABLE_KINDS = new Set(["python_tests", "javascript_tests", "exact_ans
 // deserialization) vs claude-opus-4-8 at 8%, so non-code A/B picks (grok-4-3,
 // gemini) are routed to a code-strong model for verifiable kinds. Standard
 // reasoning challenges keep the full A/B pool. Override via BOT_VERIFIABLE_MODEL.
-const VERIFIABLE_CODE_MODELS = new Set(["claude-opus-4-8", "claude-opus-4-7", "openai-gpt-55"]);
+// claude-opus-5 added 2026-07-28: same family, same $6/$30 pricing and same
+// code-optimized flag as opus-4-8, so it is code-strong by the standard that
+// put opus-4-8 here. Without it, NONE of the four current A/B arms survived
+// this filter — every verifiable solve was rerouted to opus-4-8, which is not
+// in the pool, so verifiable kinds (about half our attempts) produced zero A/B
+// signal. kimi-k3 and gpt-56-sol stay out pending their own code data.
+const VERIFIABLE_CODE_MODELS = new Set(["claude-opus-4-8", "claude-opus-5", "claude-opus-4-7", "openai-gpt-55"]);
 const VERIFIABLE_DEFAULT_MODEL = "claude-opus-4-8";
 // How many times to re-solve + resubmit a verifiable challenge that failed its
 // deterministic tests, feeding the exact failing test back to the solver. The
@@ -1713,16 +1719,6 @@ export async function discoverAndSolveMiningChallenges(
 
       if (sub.error) {
         console.warn(`   ✗ submit error: ${sub.error}`);
-        // Model-attributable rejection (the gateway refused the modelUsed id
-        // itself) → feed the circuit breaker so this arm gets sidelined before
-        // it burns another paid solve. Other 400s (specificity, cap, dupes)
-        // are challenge-attributable, not model-attributable, so they must NOT
-        // sideline a healthy model.
-        if (isModelRejection(sub.error)) {
-          void import("./venice-cost.js")
-            .then((m) => m.recordSubmitRejection(modelUsed, sub.error))
-            .catch(() => undefined); // telemetry must never break the loop
-        }
         appendJsonl(MINING_LOG, {
           ts: new Date().toISOString(),
           challengeId: ch.id,
@@ -1852,6 +1848,19 @@ export async function discoverAndSolveMiningChallenges(
       await sleep(30_000);
     } catch (err) {
       const msg = (err as Error).message;
+      // Model-attributable rejection (the gateway refused the modelUsed id
+      // itself) → feed the circuit breaker so this arm is sidelined before it
+      // burns more paid solves. This lives in the CATCH, not next to the
+      // `sub.error` branch: the SDK THROWS on a gateway 4xx, so a modelUsed
+      // rejection never reaches that branch — which is why the first version
+      // of this guard was dead code. Other 400s (specificity, epoch cap,
+      // duplicates) are challenge-attributable and must not sideline a
+      // healthy model.
+      if (isModelRejection(msg)) {
+        void import("./venice-cost.js")
+          .then((m) => m.recordSubmitRejection(modelUsed, msg))
+          .catch(() => undefined); // telemetry must never break the loop
+      }
       // Classify permanent failures and mark the appropriate skip cache so the
       // next poll filters this challenge out before any SDK round-trip.
       if (isAlreadySubmittedError(msg)) {
