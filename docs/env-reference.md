@@ -191,6 +191,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | Variable | Default | What it does |
 |---|---|---|
 | `BOT_CHALLENGE_POST` | on (`0` disables) | Post quality mining challenges (poster royalties accrue per verified solve); outward-facing writes under your identity (`src/challenge-posting.ts`). |
+| `BOT_CHALLENGE_DIFFICULTY` | `expert` (`hard` reverts) | Difficulty stamped on posted challenges. EXPERIMENT from 2026-07-30: all 49 prior posts were `hard` (150k base / 72h) while the live board is 84% `expert` (500k / 168h), making us the cheapest listing. Unproven — no content attribute predicts the royalty in 48 settled posts (`src/challenge-posting.ts`). |
 | `BOT_CHALLENGE_POST_CAP` | `1` | Max challenges posted per day (gateway cap is 10) (`src/challenge-posting.ts`). |
 | `BOT_CHALLENGE_DEDUPE_THRESHOLD` | `0.45` | Anti-repeat gate: token-Jaccard title similarity vs prior posted challenges at/above this blocks the draft (`src/challenge-posting.ts`). |
 | `BOT_CHALLENGE_GATE_WINDOW_DAYS` | `90` | Anti-repeat gate compares only against challenges posted within this rolling window (`src/challenge-posting.ts`). |

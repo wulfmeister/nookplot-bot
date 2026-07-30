@@ -37,6 +37,27 @@ type RuntimeLike = Pick<NookplotRuntime, "connection">;
 
 const LOG = join(NOOK_DIR, "challenges-posted.jsonl");
 const DAILY_CAP = Number(process.env.BOT_CHALLENGE_POST_CAP ?? 1);
+
+/**
+ * Posted difficulty — EXPERIMENT started 2026-07-30, not a proven fix.
+ *
+ * The drafter was asked for "medium|hard|expert" with no guidance and the
+ * parser fell back to "hard" on anything unexpected; all 49 challenges we have
+ * ever posted came out `hard` (baseReward 150,000, 72h). The live board is 84
+ * of 100 `expert` at 500,000 / 168h, so we are the cheapest listing on it, and
+ * reward-per-slot is the strongest surviving correlate of solver attention.
+ *
+ * Honest caveat: n=0 on the treatment. An investigation of all 48 settled posts
+ * found NO content attribute predicts the royalty — submissions arrive in an
+ * exogenous network-wide sweep (right now: 21 challenges at zero submissions,
+ * 53 pinned at exactly 12), and our 18-vs-1 swing on consecutive days came from
+ * landing in the swept vs unswept half with a byte-identical challenge. So this
+ * is a free shot at a plausible edge, not the lever. Set
+ * BOT_CHALLENGE_DIFFICULTY=hard to revert.
+ */
+const CHALLENGE_DIFFICULTY = (["medium", "hard", "expert"].includes(String(process.env.BOT_CHALLENGE_DIFFICULTY))
+  ? process.env.BOT_CHALLENGE_DIFFICULTY
+  : "expert") as ChallengeDraft["difficulty"];
 const MIN_SPECIFICITY = 4;
 
 interface PostedEntry {
@@ -56,6 +77,11 @@ interface PostedEntry {
    * against these (titles are cheap to paraphrase; the problem text is what
    * peers actually solve). Absent on pre-gate entries. */
   description?: string;
+  /** Difficulty actually posted. Recorded from 2026-07-30 so the
+   * hard-vs-expert experiment is measurable locally — the first 49 posts left
+   * this unlogged, which is why the difficulty question needed a gateway
+   * round-trip to answer at all. */
+  difficulty?: "medium" | "hard" | "expert";
 }
 
 interface ChallengeDraft {
@@ -467,7 +493,7 @@ async function draftChallenge(domain: string, grounding: string, avoidTitles: st
   return {
     title: String(p.title).slice(0, 100),
     description: String(p.description).slice(0, 2000),
-    difficulty: (["medium", "hard", "expert"].includes(String(p.difficulty)) ? p.difficulty : "hard") as ChallengeDraft["difficulty"],
+    difficulty: CHALLENGE_DIFFICULTY,
     domainTags: Array.isArray(p.domainTags) && p.domainTags.length > 0 ? p.domainTags.slice(0, 4).map(String) : [domain],
   };
 }
@@ -654,6 +680,7 @@ export async function runChallengePostTick(runtime: RuntimeLike): Promise<void> 
       outcome: "posted" as const,
       groundingNotes: draftGrounding,
       description: draft.description,
+      difficulty: draft.difficulty,
     } satisfies PostedEntry);
     recordAudit("challenge_post", "submitted", draft.title.slice(0, 80), { domain, difficulty: draft.difficulty });
   } catch (err) {
