@@ -4078,3 +4078,44 @@ describe("challenge-posting.rescueAwareCap (one ceiling, both guards)", () => {
     assert.ok(!(3 < rescueAwareCap(true, 1, 2)), "3 posts is the cap with 2 rescues");
   });
 });
+
+describe("capacity.capacityUnderuse (verify floor vs genuine supply)", () => {
+  const day = (date: string, verifyUsed: number, verifyEligible?: number) => ({
+    date, miningUsed: 10, miningCap: 12, miningPct: 83,
+    verifyUsed, verifyCap: 38, verifyPct: (verifyUsed / 38) * 100,
+    ...(verifyEligible === undefined ? {} : { verifyEligible }),
+  });
+  // 5 complete days + 1 partial (capacityUnderuse drops the last row).
+  const week = (used: number, eligible?: number) =>
+    ["2026-07-24","2026-07-25","2026-07-26","2026-07-27","2026-07-28","2026-07-29"]
+      .map((d) => day(d, used, eligible));
+
+  it("does NOT flag under-use when we verified most of the GENUINE supply", () => {
+    // 11 of 12 genuine candidates = 92%, even though 11/38 of the cap is 29%.
+    // The old cap-based metric flagged this and told the operator to verify
+    // more — which could only mean verifying spam.
+    assert.equal(capacityUnderuse(week(11, 12)), null);
+  });
+
+  it("still flags under-use when genuine work went unverified", () => {
+    const flag = capacityUnderuse(week(5, 40));
+    assert.ok(flag && /verify avg/.test(flag), `expected a verify flag, got ${flag}`);
+    assert.match(flag, /genuine/);
+  });
+
+  it("a day with no genuine supply is not under-use", () => {
+    assert.equal(capacityUnderuse(week(0, 0)), null);
+  });
+
+  it("falls back to the cap basis when eligibility is unknown (old days)", () => {
+    const flag = capacityUnderuse(week(5, undefined));
+    assert.ok(flag && /of cap/.test(flag), `expected cap-basis wording, got ${flag}`);
+  });
+
+  it("mining under-use is unaffected by the verify change", () => {
+    const rows = week(11, 12).map((d) => ({ ...d, miningUsed: 3 }));
+    const flag = capacityUnderuse(rows);
+    assert.ok(flag && /mining avg/.test(flag));
+    assert.ok(!/verify avg/.test(flag));
+  });
+});

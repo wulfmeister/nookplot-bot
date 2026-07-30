@@ -33,6 +33,14 @@ export interface DayUtil {
   verifyUsed: number;
   verifyCap: number;
   verifyPct: number;
+  /**
+   * Traces that cleared the anti-farm abstention gate that day — i.e. how much
+   * GENUINE work was actually available to verify. The 38/day cap is not the
+   * right denominator: ~94% of the pool is Sybil-farm spam we correctly abstain
+   * on, so measuring against the cap reports "under-use" for behaving
+   * correctly. Undefined on days predating the trace cache.
+   */
+  verifyEligible?: number;
 }
 
 interface MiningRow { ts?: string; outcome?: string }
@@ -87,12 +95,26 @@ export function aggregateCapacity(
 
 /** Read the raw logs and aggregate the last `days` days of utilization. */
 export function readCapacity(days = 14, nowMs = Date.now()): DayUtil[] {
-  return aggregateCapacity(
+  const rows = aggregateCapacity(
     readJsonl<MiningRow>(join(NOOK_DIR, "mining-submissions.jsonl")),
     readJsonl<QuotaRow>(join(NOOK_DIR, "quotas.jsonl")),
     days,
     nowMs,
   );
+  // Genuine verify supply per day = traces that cleared the anti-farm gate.
+  const eligible = new Map<string, number>();
+  for (const r of readJsonl<{ ts?: string; abstained?: boolean }>(join(NOOK_DIR, "verify-trace-cache.jsonl"))) {
+    if (!r.ts || r.abstained) continue;
+    const d = r.ts.slice(0, 10);
+    eligible.set(d, (eligible.get(d) ?? 0) + 1);
+  }
+  // Only attach where the cache actually covers the day, so older days keep
+  // the cap-based denominator rather than silently reading as zero supply.
+  const covered = new Set<string>();
+  for (const r of readJsonl<{ ts?: string }>(join(NOOK_DIR, "verify-trace-cache.jsonl"))) {
+    if (r.ts) covered.add(r.ts.slice(0, 10));
+  }
+  return rows.map((d) => (covered.has(d.date) ? { ...d, verifyEligible: eligible.get(d.date) ?? 0 } : d));
 }
 
 /**
@@ -113,10 +135,23 @@ export function capacityUnderuse(
   if (recent.length < window) return null;
   const avg = (sel: (d: DayUtil) => number) => recent.reduce((s, d) => s + sel(d), 0) / recent.length;
   const mPct = avg((d) => d.miningUsed / d.miningCap);
-  const vPct = avg((d) => d.verifyUsed / d.verifyCap);
+  // Verify utilization is measured against GENUINE SUPPLY, not the raw cap.
+  // Chasing the cap would mean verifying spam — and because quorum is a COUNT
+  // with no reject field, every spam verification advances that spam toward
+  // payment. This metric previously reported "verify 15% (floor 50%)" while the
+  // correct behavior was to abstain on ~94% of the pool: it was coaching the
+  // operator to subsidize the farm.
+  const denom = (d: DayUtil) => (d.verifyEligible === undefined ? d.verifyCap : Math.min(d.verifyCap, d.verifyEligible));
+  const measurable = recent.filter((d) => denom(d) > 0);
+  const vPct = measurable.length
+    ? measurable.reduce((s, d) => s + d.verifyUsed / denom(d), 0) / measurable.length
+    : 1; // nothing genuine was available — that is not under-use
   const flags: string[] = [];
   if (mPct < miningFloor) flags.push(`mining avg ${(mPct * 100).toFixed(0)}% over ${window}d (floor ${(miningFloor * 100).toFixed(0)}%)`);
-  if (vPct < verifyFloor) flags.push(`verify avg ${(vPct * 100).toFixed(0)}% over ${window}d (floor ${(verifyFloor * 100).toFixed(0)}%)`);
+  if (vPct < verifyFloor) {
+    const basis = recent.some((d) => d.verifyEligible !== undefined) ? "of genuine (non-spam) supply" : "of cap";
+    flags.push(`verify avg ${(vPct * 100).toFixed(0)}% ${basis} over ${window}d (floor ${(verifyFloor * 100).toFixed(0)}%)`);
+  }
   return flags.length ? `capacity under-use: ${flags.join("; ")}` : null;
 }
 

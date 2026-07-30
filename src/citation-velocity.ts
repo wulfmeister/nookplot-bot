@@ -161,6 +161,50 @@ async function browseNetworkLearnings(
   }
 }
 
+/**
+ * Resolve a peer LEARNING into a citable KNOWLEDGE-GRAPH node id.
+ *
+ * The bug this fixes (found 2026-07-30 after 18,338 silent failures): we were
+ * POSTing the learning's own id as `targetId` to
+ * `/v1/agents/me/knowledge/:id/cite`, but that endpoint addresses the KNOWLEDGE
+ * GRAPH — learning ids live in a different namespace, so every call 500'd with
+ * "Failed to add citation". Proven by probe: citing a learning id fails, citing
+ * a knowledge-node id from the SAME author succeeds.
+ *
+ * The learning is still the right discovery signal (it carries quality and
+ * domain); we just have to follow its `author_address` into that agent's
+ * knowledge graph and cite a real node there. Best-effort: peers with no
+ * published knowledge simply yield nothing to cite.
+ */
+async function resolvePeerKnowledgeId(
+  runtime: RuntimeLike,
+  peerAddress: string,
+  domain: string | null,
+): Promise<string | null> {
+  try {
+    const res = (await runtime.connection.request(
+      "GET",
+      `/v1/agents/${encodeURIComponent(peerAddress)}/knowledge/graph?limit=25`,
+    )) as { nodes?: MyKnowledgeItem[]; items?: MyKnowledgeItem[] };
+    const items = res.nodes ?? res.items ?? [];
+    if (items.length === 0) return null;
+    // Prefer a node in the domain we're citing from — a same-domain citation is
+    // the one that actually carries meaning.
+    const inDomain = domain
+      ? items.filter((it) => {
+          const ds = (it.domainTags ?? [it.domain, it.domainTag].filter(Boolean) as string[]).map((d) =>
+            String(d).toLowerCase(),
+          );
+          return ds.includes(domain.toLowerCase());
+        })
+      : [];
+    const pick = (inDomain.length > 0 ? inDomain : items)[0];
+    return pickMyId(pick) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function citePeer(
   runtime: RuntimeLike,
   myItemId: string,
@@ -249,7 +293,9 @@ export async function runCitationVelocityTick(
     candidates.sort((a, b) => peerQuality(b) - peerQuality(a));
 
     for (const peer of candidates.slice(0, MAX_CITATIONS_PER_TICK - citationsThisTick)) {
-      const peerId = pickPeerId(peer);
+      // A learning id is NOT citable — resolve the author's knowledge node.
+      const peerAddr = peerAuthor(peer);
+      const peerId = peerAddr ? await resolvePeerKnowledgeId(runtime, peerAddr, domain) : null;
       if (!peerId) continue;
       // Pick a relevant item of ours — prefer one in the same domain
       const mineCandidates = myByDomain.get(domain) ?? myItems;
