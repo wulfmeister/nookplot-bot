@@ -60,10 +60,19 @@ export function verifySharedCount(): number {
 // Burst pacing: the 2026-06-29 collapse (39 verifies free-fired in a burst →
 // gateway 429 → limit-hit froze verifying for a whole window, ~37 slots ≈
 // 5.8k NOOK lost on 06-30) was a rate problem, not a budget problem. Cap the
-// trailing-hour rate so consumption spreads across the rolling window:
-// 2/h × 24h = 48 ≥ shared cap 38, so pacing never shrinks the daily total —
-// it only prevents cap-boundary collisions with the gateway's own counter.
-const VERIFY_HOURLY_PACE = Number(process.env.BOT_VERIFY_HOURLY_PACE ?? 2);
+// trailing-hour rate so consumption spreads across the rolling window.
+//
+// RAISED 2 → 5 on 2026-07-30. The original note argued "2/h × 24h = 48 ≥ cap
+// 38, so pacing never shrinks the daily total" — true only if verifiable work
+// arrives UNIFORMLY. It does not. Since the anti-farm abstention gate went in,
+// ~94% of the pool is template spam we correctly skip, so genuine candidates
+// are scarce AND bursty: 22-109 traces cleared the gate per day while we
+// submitted only 3-11 verifications. At 2/h a burst is truncated and the
+// surplus is gone by the next window — the pace gate, not spam avoidance, was
+// the binding constraint on helping the network. 5/h still caps a burst at an
+// eighth of the 39-at-once event that motivated this gate, and 5 × 24 = 120
+// keeps the daily cap (38) as the real ceiling.
+const VERIFY_HOURLY_PACE = Number(process.env.BOT_VERIFY_HOURLY_PACE ?? 5);
 
 /** Pure pacing check: true when the trailing-hour action count is under the rate. Testable. */
 export function verifyPaceOk(actionTsMs: number[], nowMs: number, perHour: number = VERIFY_HOURLY_PACE): boolean {

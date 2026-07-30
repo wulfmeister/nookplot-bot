@@ -363,32 +363,77 @@ export function rotateDomain(domains: string[], dayOfYear: number): string {
  * of OUR posted challenge gets VERIFIED before the 02:00Z settlement. A
  * challenge that attracts no solvers earns nothing (epoch 06-22: 0-submission
  * challenge → full 250k missed). If today's challenge still has zero
- * submissions ≤6h before settlement, one extra post in a different domain is
- * the only remaining lever. Max 1 rescue/epoch — with DAILY_CAP=1 that's 2
- * posts, still far under the gateway's 10/day.
+ * verified solve ≤BOT_ROYALTY_RESCUE_LEAD_HOURS before settlement, an extra
+ * post in a different domain is the only remaining lever. Up to MAX_RESCUES
+ * per epoch-day — with DAILY_CAP=1 that's 3 posts, still far under the
+ * gateway's 10/day.
  */
+/** Max extra posts per epoch-day when the royalty is unqualified. */
+const MAX_RESCUES = Number(process.env.BOT_ROYALTY_RESCUES ?? 2);
+
+/**
+ * The posts-per-epoch-day ceiling, which differs on the rescue path. ONE
+ * definition, used by both the pre-draft entry guard and the post-draft
+ * concurrency re-check — they diverged once and it cost a wasted LLM draft on
+ * every tick of the rescue window.
+ */
+export function rescueAwareCap(rescue: boolean, dailyCap = DAILY_CAP, maxRescues = MAX_RESCUES): number {
+  return dailyCap + (rescue ? maxRescues : 0);
+}
+/** Start checking this many hours before the 02:00Z settlement. */
+const RESCUE_LEAD_HOURS = Number(process.env.BOT_ROYALTY_RESCUE_LEAD_HOURS ?? 10);
+
+/**
+ * Count solves of our posted challenges that are actually VERIFIED.
+ *
+ * The royalty gates on verification, not submission — the distinction that
+ * cost us on 2026-07-30, when the day's challenge had a submission from 03:36Z
+ * that was still unverified at 15:36Z. The old check counted submissions, saw
+ * 1, and concluded all was well while the 250k quietly went unqualified.
+ * The challenge detail embeds `submissions[]` carrying `status`/`verifiedAt`.
+ */
+export function countVerifiedSolves(detail: {
+  submissions?: Array<{ status?: string; verifiedAt?: string | null }>;
+}): number {
+  return (detail.submissions ?? []).filter((s) => s.status === "verified" || Boolean(s.verifiedAt)).length;
+}
+
 async function midEpochRescueNeeded(
   runtime: RuntimeLike,
   prior: PostedEntry[],
   nowIso: string,
   postedCount: number,
 ): Promise<boolean> {
-  if (postedCount >= DAILY_CAP + 1) return false; // one rescue max
+  if (postedCount >= rescueAwareCap(true)) return false;
   const nowMs = new Date(nowIso).getTime();
-  if (nextSettlementMs(nowMs) - nowMs > 6 * 3600_000) return false;
+  const hoursLeft = (nextSettlementMs(nowMs) - nowMs) / 3600_000;
+  // Historical median time-to-first-VERIFIED-solve on our challenges is ~7.2h
+  // (12 of 13 qualified within 12.7h). Checking at the old 6h mark left a
+  // rescue less runway than the median it needed, so it was structurally
+  // late — start at 10h.
+  if (hoursLeft > RESCUE_LEAD_HOURS) return false;
   const today = prior.filter((e) => epochDay(e.ts) === epochDay(nowIso) && e.outcome === "posted");
-  const last = today[today.length - 1];
-  if (!last?.challengeId) return false;
-  try {
-    const res = (await runtime.connection.request(
-      "GET",
-      `/v1/mining/challenges/${encodeURIComponent(last.challengeId)}`,
-    )) as { challenge?: { submissionCount?: number }; submissionCount?: number };
-    const count = res.challenge?.submissionCount ?? res.submissionCount;
-    return count === 0;
-  } catch {
-    return false; // can't read the count — don't spend a post on a guess
+  if (today.length === 0) return false;
+  // Check EVERY challenge posted this epoch-day, not just the newest: any one
+  // of them qualifying earns the royalty, and a rescue post only helps if
+  // they have ALL failed to attract a verified solve.
+  let sawAnyDetail = false;
+  for (const entry of today) {
+    if (!entry.challengeId) continue;
+    try {
+      const res = (await runtime.connection.request(
+        "GET",
+        `/v1/mining/challenges/${encodeURIComponent(entry.challengeId)}`,
+      )) as { challenge?: Parameters<typeof countVerifiedSolves>[0] } & Parameters<typeof countVerifiedSolves>[0];
+      sawAnyDetail = true;
+      if (countVerifiedSolves(res.challenge ?? res) > 0) return false; // royalty already earned
+    } catch {
+      /* one unreadable challenge shouldn't veto the rescue — keep checking */
+    }
   }
+  // Never spend a post on a pure guess: if we couldn't read ANY challenge, the
+  // gateway is unhealthy and a new post is unlikely to fare better.
+  return sawAnyDetail;
 }
 
 async function draftChallenge(domain: string, grounding: string, avoidTitles: string[]): Promise<ChallengeDraft | null> {
@@ -436,7 +481,10 @@ export async function runChallengePostTick(runtime: RuntimeLike): Promise<void> 
   if (postedCount >= DAILY_CAP) {
     rescue = await midEpochRescueNeeded(runtime, prior, nowIso, postedCount);
     if (!rescue) return;
-    console.log("📮 mid-epoch rescue: today's challenge has 0 submissions with <6h to settlement — posting one more in a different domain");
+    console.log(
+      `📮 mid-epoch rescue: no VERIFIED solve on any challenge posted this epoch-day with <${RESCUE_LEAD_HOURS}h to settlement ` +
+        `— posting another in a different domain (the 250k royalty needs a verified solve, and does not accumulate)`,
+    );
   }
 
   const domains = specializeDomains();
@@ -570,7 +618,13 @@ export async function runChallengePostTick(runtime: RuntimeLike): Promise<void> 
   // posted while we drafted. Their rows are visible now; ours is excluded by
   // title match. Over-cap → abort our intent instead of double-posting.
   const recheck = readJsonl<PostedEntry>(LOG).filter((e) => !(e.outcome === "posting" && e.title === draft!.title));
-  if (postedToday(recheck, new Date().toISOString()) >= DAILY_CAP + (rescue ? 1 : 0)) {
+  // Must use the SAME ceiling as midEpochRescueNeeded. When these disagreed
+  // (this line said DAILY_CAP+1 while the entry guard allowed DAILY_CAP+
+  // MAX_RESCUES), the 2nd rescue passed the entry guard, paid for a full LLM
+  // draft, then aborted here every hourly tick for the rest of the window —
+  // burning drafts and injecting never-posted "posting" rows into the 90-day
+  // near-dupe corpus, on exactly the days the rescue exists to save.
+  if (postedToday(recheck, new Date().toISOString()) >= rescueAwareCap(rescue)) {
     console.warn("📮 ⚠ concurrent post detected during draft — aborting this one");
     appendJsonl(LOG, {
       ts: new Date().toISOString(),

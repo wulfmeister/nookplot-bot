@@ -34,10 +34,9 @@ export type Task =
 // Venice still lists claude-fable-5 but every inference 500s ("Inference
 // processing failed") as of 2026-06-15 — it is functionally gone. claude-opus-4-8
 // is live on Venice (probed 200 OK), 1M ctx / 128k completion, $5/$25 per M.
-// High-VOLUME tasks (verification, comprehension, prose) stay on grok-4-3
-// ($1.42/$2.83 — far cheaper on output). NOTE: verification_score deliberately
-// stays on grok-4-3 — the calibration prompt was validated on grok on 06-11 and
-// switching the scorer would confound the score-window data.
+// High-VOLUME prose tasks stay on grok-4-3 ($1.42/$2.83 — far cheaper on
+// output). Verification moved OFF grok-4-3 to grok-4-5 on 2026-07-30 at the
+// operator's direction; see the note on those rows below.
 const DEFAULTS: Record<Task, string> = {
   bounty_draft: "claude-opus-4-8",
   bounty_work: "claude-opus-4-8",
@@ -45,8 +44,15 @@ const DEFAULTS: Record<Task, string> = {
   bounty_revise: "claude-opus-4-8",
   mining_solve: "claude-opus-4-8",
   mining_learning: "grok-4-3",
-  verification_score: "grok-4-3",
-  verification_comprehension: "grok-4-3",
+  // Verification moved to grok-4-5 on 2026-07-30 (operator). NOTE: this is
+  // NOT a cost saving — grok-4-5 lists $2.27/$6.80 per M vs grok-4-3's
+  // $1.42/$2.83, so it roughly doubles verification inference; the operator
+  // accepted that explicitly for verification quality. Caveat carried over
+  // from 06-11: the scoring prompt was calibrated on grok-4-3, so score
+  // distributions may shift — same family keeps the drift small, but watch
+  // verification-stats.jsonl for a step change in mean scores.
+  verification_score: "grok-4-5",
+  verification_comprehension: "grok-4-5",
   crowd_jury_score: "grok-4-3",
   knowledge_topic: "grok-4-3",
   knowledge_body: "grok-4-3",

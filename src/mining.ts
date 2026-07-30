@@ -1316,9 +1316,38 @@ export function passesSpecializationFilter(ch: Challenge): boolean {
   return targets.some((t) => challengeTags.includes(t));
 }
 
+/**
+ * Minimum estimated reward worth a rolling-cap slot.
+ *
+ * The cap (12 regular per rolling 24h) is the binding constraint, so a slot
+ * spent on a cheap challenge is a slot NOT spent on an expensive one. Measured
+ * settlement value: standard median 45,777 NOOK/solve vs python_tests 5,559 —
+ * an 8.2x gap. On 2026-07-28 the post-blackout catch-up burst put 9 of 12 slots
+ * into challenges estimated at 6 NOOK; those settled for ~32.8k total where 11
+ * standard solves would have returned ~392k. That single window cost ~288k.
+ *
+ * Calibrated against the live pool (2026-07-30, 100 open challenges): every
+ * verifiable challenge was estimated 3-9, while 91 of 92 standard ones were at
+ * 31 — so a floor of 10 separates them cleanly, discarding 1 standard outlier.
+ * Slots are a RATE limit, not a use-or-lose quota: skipping a poll costs
+ * nothing but a 15-minute wait, whereas spending the slot is irreversible.
+ * BOT_MIN_CHALLENGE_REWARD=0 disables.
+ */
+const MIN_CHALLENGE_REWARD = Number(process.env.BOT_MIN_CHALLENGE_REWARD ?? 10);
+
+export function meetsValueFloor(ch: Challenge, floor = MIN_CHALLENGE_REWARD): boolean {
+  if (!(floor > 0)) return true;
+  const est = ch.estimatedRewardNook;
+  // Unknown estimate → allow. Absence of data is not evidence of low value,
+  // and refusing everything unpriced would idle us on a gateway schema change.
+  if (est === undefined || est === null || !Number.isFinite(est)) return true;
+  return est >= floor;
+}
+
 function challengeFitsBudget(ch: Challenge): boolean {
   if (ch.status && ch.status !== "open") return false;
   if (ch.submissionCount !== undefined && ch.maxSubmissions !== undefined && ch.submissionCount >= ch.maxSubmissions) return false;
+  if (!meetsValueFloor(ch)) return false;
   // Sybil-farm challenges ("<Name> <domain> expert analysis <hex>", inflated
   // to expert difficulty to bait the 500K base reward): a verified solve of
   // one pays the FARM's poster royalty. Skip unless explicitly re-enabled.
@@ -1430,7 +1459,15 @@ export async function discoverAndSolveMiningChallenges(
   });
 
   if (eligible.length === 0) {
-    console.log(`⛏ no eligible new mining challenges this poll (${challenges.length} total open)`);
+    // Distinguish "nothing open" from "everything open is too cheap" — the
+    // latter is the value floor working, but it would look identical to a dead
+    // pool if we didn't say so.
+    const belowFloor = challenges.filter((c) => c.status !== "closed" && !meetsValueFloor(c)).length;
+    console.log(
+      `⛏ no eligible new mining challenges this poll (${challenges.length} total open` +
+        (belowFloor > 0 ? `, ${belowFloor} skipped below the ${MIN_CHALLENGE_REWARD}-NOOK value floor` : "") +
+        `)`,
+    );
     return;
   }
 

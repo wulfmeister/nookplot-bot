@@ -208,21 +208,21 @@ canvas { max-width: 100%; }
 <main>
   <!-- Overview -->
   <section class="section active" data-section="overview">
+    <div class="row-card">
+      <h2>💵 Net P&amp;L</h2>
+      <div id="pnl-panel"></div>
+    </div>
     <div class="row-card" id="project-review-card" style="display:none; border-color: var(--magenta);">
       <h2>📁 Project draft — awaiting your decision</h2>
       <div id="project-review"></div>
     </div>
     <div class="row-card" id="inbox-card" style="display:none;">
       <h2>📬 Inbox <span id="inbox-meta" class="legend" style="text-transform:none; font-weight:normal"></span></h2>
-      <div id="inbox-panel"></div>
+      <div id="inbox-panel" style="max-height: 22rem; overflow-y: auto;"></div>
     </div>
     <div class="row-card" id="capacity-card">
       <h2>📊 Capacity utilization <span id="capacity-meta" class="legend" style="text-transform:none; font-weight:normal"></span></h2>
       <div id="capacity-panel"></div>
-    </div>
-    <div class="row-card">
-      <h2>Are we winning?</h2>
-      <div id="winning-panel"></div>
     </div>
     <div class="row-card" id="my-projects-card" style="display:none;">
       <h2>📦 Our published projects (builder reputation)</h2>
@@ -925,37 +925,67 @@ function renderExperiments() {
 }
 
 // ─── render: overview ───
-function renderWinningPanel() {
-  const w = snapshot.winning;
-  const el = document.getElementById("winning-panel");
+// When inference is paid for with DIEM / free OpenRouter credits, the USD cost
+// is already sunk and subtracting it hides what the bot is actually bringing in.
+// This toggle is PRESENTATION ONLY — the API keeps reporting real cost, the
+// daemon keeps tracking and alerting on spend, and the underlying numbers are
+// unchanged. It just picks which of the two true framings to lead with.
+const PNL_FREE_INFERENCE_KEY = "nookplot.pnl.freeInference";
+function pnlFreeInference() {
+  try { return localStorage.getItem(PNL_FREE_INFERENCE_KEY) === "1"; } catch { return false; }
+}
+function setPnlFreeInference(on) {
+  try { localStorage.setItem(PNL_FREE_INFERENCE_KEY, on ? "1" : "0"); } catch {}
+  renderPnlPanel();
+}
+
+function renderPnlPanel() {
+  const p = snapshot.pnl;
+  const el = document.getElementById("pnl-panel");
   if (!el) return;
-  if (!w) {
-    el.innerHTML = `<div class="empty">No verdict data yet.</div>`;
-    return;
-  }
-  const cls = w.status === "winning" ? "good" : w.status === "mixed" ? "warn" : "bad";
-  const metrics = w.metrics ?? {};
+  if (!p) { el.innerHTML = `<div class="empty">No P&L data yet.</div>`; return; }
+  const usd = (n) => (n < 0 ? "-$" : "$") + Math.abs(n).toFixed(2);
+  const free = pnlFreeInference();
+
+  // Gross mode: revenue IS the result — nothing to subtract, so no coverage
+  // ratio and no breakeven price (both are defined against a cost of zero).
+  const headline = free ? p.usdRevenue : p.usdNet;
+  const headlineCls = headline >= 0 ? "good" : "bad";
+  const headlineLabel = free ? "gross · " + p.windowDays + "d" : "net · " + p.windowDays + "d";
+  const todayVal = free ? (p.todayNook ?? 0) * (p.priceUsd ?? 0) : p.todayUsdNet;
+  const cov = p.costCoverage == null ? null : Math.round(p.costCoverage * 100);
+  const covCls = cov == null ? "" : cov >= 100 ? "good" : cov >= 60 ? "warn" : "bad";
+
   el.innerHTML = `
     <div class="verdict-panel">
       <div>
-        <div class="verdict-status ${cls}">${escapeHtml(w.status).toUpperCase()} ${Math.round(w.score ?? 0)}</div>
-        <div class="legend">${escapeHtml(w.headline ?? "")}</div>
+        <div class="verdict-status ${headlineCls}">${usd(headline)} ${headlineLabel}</div>
         <div class="legend">
-          submit ${Math.round((metrics.submitRate ?? 0) * 100)}% ·
-          error ${Math.round((metrics.errorRate ?? 0) * 100)}% ·
-          v0 ${Math.round((metrics.networkV0Pct ?? 0) * 100)}%
+          revenue ${usd(p.usdRevenue)} (${Math.round(p.nookEarned).toLocaleString()} NOOK)
+          · inference ${usd(p.usdCost)}${free ? " <em>(not counted)</em>" : ""}
+        </div>
+        <div class="legend">
+          today: ${Math.round(p.todayNook).toLocaleString()} NOOK${todayVal == null ? "" : ` · ${free ? "gross" : "net"} ${usd(todayVal)}`}
+          <span style="opacity:0.55">(cash basis — a claim settles work verified earlier, so a single day is lumpy)</span>
         </div>
       </div>
-      <div>
-        <strong>Evidence</strong>
-        <ul class="verdict-list">${(w.reasons ?? []).map((r) => `<li>${escapeHtml(r)}</li>`).join("") || "<li>No positive evidence yet.</li>"}</ul>
-      </div>
-      <div>
-        <strong>Next best moves</strong>
-        <ul class="verdict-list">${(w.nextActions ?? []).map((r) => `<li>${escapeHtml(r)}</li>`).join("") || "<li>Keep current loops running.</li>"}</ul>
+      <div style="text-align:right">
+        ${free
+          ? `<div class="verdict-status good">${Math.round(p.nookEarned).toLocaleString()}</div><div class="legend">NOOK earned · ${p.windowDays}d</div>`
+          : (cov == null ? "" : `<div class="verdict-status ${covCls}">${cov}%</div><div class="legend">of cost covered</div>`)}
+        <div class="legend">NOOK $${(p.priceUsd ?? 0).toFixed(8)}</div>
+        ${!free && p.breakevenPriceUsd ? `<div class="legend">breakeven $${p.breakevenPriceUsd.toFixed(8)}</div>` : ""}
       </div>
     </div>
-  `;
+    <label class="legend" style="display:flex; align-items:center; gap:8px; margin-top:10px; cursor:pointer; text-transform:none;">
+      <input type="checkbox" id="pnl-free-inference" ${free ? "checked" : ""} style="cursor:pointer;">
+      Assume free inference from DIEM or free credits on OpenRouter
+      <span style="opacity:0.6">— show gross NOOK earnings without subtracting inference cost</span>
+    </label>`;
+
+  // innerHTML replaced the input, so re-bind every render.
+  const box = document.getElementById("pnl-free-inference");
+  if (box) box.addEventListener("change", (e) => setPnlFreeInference(e.target.checked));
 }
 
 function renderMoneyCards() {
@@ -1352,7 +1382,7 @@ function renderOverview() {
   renderMyProjects();
   renderInbox();
   renderCapacity();
-  renderWinningPanel();
+  renderPnlPanel();
   renderSolveFunnel();
   renderMoneyCards();
   const claimableTotal = Object.values(s.claimable).reduce((a, b) => a + b, 0);

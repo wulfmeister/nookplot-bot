@@ -385,6 +385,7 @@ async function buildSnapshot() {
     avgVCount,
     myPending: myPending.length,
     networkHistory,
+    claimHistory: claims,
     claimable: agentStats?.claimableBalance ?? {},
     emergencyReserve: Boolean(epochRes?.epoch?.isEmergencyReserve),
     rlmExhausted: (rlmRes?.dailyCount ?? 0) >= (rlmRes?.dailyCap ?? 10),
@@ -456,24 +457,7 @@ async function buildSnapshot() {
       onboarding: process.env.BOT_ONBOARDING !== "0",
       verifyThresholdOverride: process.env.BOT_VERIFY_THRESHOLD,
     },
-    winning: computeWinningStatus({
-      stakeTier: stake?.tier,
-      stakeMultiplier: stake?.multiplier ?? 0,
-      credits: creditsRes?.balance ?? 0,
-      attempts24h: recent24h.length,
-      submitted24h: recent24h.filter((e) => e.outcome === "pass" || e.outcome === "deferred").length,
-      errors24h: recent24h.filter((e) => e.outcome === "error").length,
-      expectedRevenue24h: expected24h,
-      lifetimeEarned: actualEarned,
-      claimable: offChainClaimable,
-      pendingRewards: agentStats?.pendingRewards ?? 0,
-      verifications24h: recentVerify24h.length,
-      pendingSubs: myPending.length,
-      avgVerifierCount: avgVCount,
-      networkV0Pct: poolDist.total > 0 ? poolDist.v0 / poolDist.total : 0,
-      nearQuorumPool: poolDist.v2,
-      blockers,
-    }),
+    pnl: computeNetPnl(claims, readDailySpend(10), price.usd),
     paperReproOpportunities: readJsonlSafe<{
       ts: string;
       challengeId: string;
@@ -601,11 +585,127 @@ async function buildSnapshot() {
   };
 }
 
+export interface ClaimRow {
+  ts?: string;
+  kind?: string;
+  claimed?: number;
+  priceUsdAtClaim?: number;
+}
+
+/**
+ * Net profit and loss — the number the dashboard exists to show.
+ *
+ * This replaced a "winning score" whose eight terms contained no revenue, cost
+ * or net term (stake tier, credit balance, lifetime-earned>0, any-submissions,
+ * any-verifications, submit rate, any-claimable, network v0%). Because
+ * lifetime-earned and stake tier are effectively constants, it sat pinned near
+ * maximum while the bot lost money every day since 2026-07-11 — actively
+ * coaching the operator that things were fine. A metric that cannot go down
+ * when you lose money is worse than no metric.
+ *
+ * Revenue uses the price AT CLAIM TIME where recorded, so history doesn't drift
+ * with the live quote.
+ */
+export function computeNetPnl(
+  claims: ClaimRow[],
+  spendByDay: Array<{ date: string; spendUsd: number }>,
+  priceUsd: number,
+  nowMs = Date.now(),
+): {
+  windowDays: number;
+  nookEarned: number;
+  usdRevenue: number;
+  usdCost: number;
+  usdNet: number;
+  costCoverage: number | null;
+  breakevenPriceUsd: number | null;
+  priceUsd: number;
+  todayNook: number;
+  todayUsdNet: number | null;
+} {
+  const windowDays = 7;
+  // Revenue and cost MUST share one window, compared on the same basis. An
+  // earlier cut filtered claims by timestamp but spend by date-minus-one-day,
+  // silently costing 8 days against 7 days of revenue and overstating the loss
+  // by ~20%. Both now key off the same UTC date boundary.
+  const cutoffDate = new Date(nowMs - (windowDays - 1) * 86_400_000).toISOString().slice(0, 10);
+  const inWindow = claims.filter(
+    (c) => c.kind === "off-chain" && (c.ts ?? "").slice(0, 10) >= cutoffDate,
+  );
+  const nookEarned = inWindow.reduce((s, c) => s + (c.claimed ?? 0), 0);
+  const usdRevenue = inWindow.reduce((s, c) => s + (c.claimed ?? 0) * (c.priceUsdAtClaim ?? priceUsd), 0);
+  const usdCost = spendByDay
+    .filter((d) => d.date >= cutoffDate)
+    .reduce((s, d) => s + (d.spendUsd ?? 0), 0);
+  const today = new Date(nowMs).toISOString().slice(0, 10);
+  const todayNook = claims
+    .filter((c) => c.kind === "off-chain" && (c.ts ?? "").slice(0, 10) === today)
+    .reduce((s, c) => s + (c.claimed ?? 0), 0);
+  const todaySpend = spendByDay.find((d) => d.date === today)?.spendUsd ?? 0;
+  return {
+    windowDays,
+    nookEarned,
+    usdRevenue,
+    usdCost,
+    usdNet: usdRevenue - usdCost,
+    costCoverage: usdCost > 0 ? usdRevenue / usdCost : null,
+    breakevenPriceUsd: nookEarned > 0 ? usdCost / nookEarned : null,
+    priceUsd,
+    todayNook,
+    todayUsdNet: todayNook * priceUsd - todaySpend,
+  };
+}
+
+/**
+ * Has the on-chain claim relay fallen behind the off-chain ledger?
+ *
+ * Each successful sweep writes an "off-chain" row (what the gateway credited)
+ * followed by an "on-chain" row (the settling transaction). When the relay
+ * fails, off-chain rows keep appearing with no on-chain row after them — the
+ * NOOK is credited but unsettled. Pure so it can be tested against the real
+ * ledger.
+ */
+/**
+ * Minimum orphan age before we call it a stall. A HEALTHY claim writes its
+ * off-chain row and its on-chain row about a second apart, so "an orphan
+ * exists" is momentarily TRUE on every successful cycle — gating on that alone
+ * would flash a false stall whenever a poll landed in the gap. Two hours is far
+ * above that noise and far below the 14h real incident this rule was built for.
+ */
+const CLAIM_RELAY_STALL_MIN_HOURS = Number(process.env.BOT_CLAIM_STALL_HOURS ?? 2);
+
+export function claimRelayHealth(
+  rows: ClaimRow[],
+  nowMs = Date.now(),
+  minStallHours = CLAIM_RELAY_STALL_MIN_HOURS,
+): { stalledHours: number | null; unsettledNook: number; lastOnChain: string | null } {
+  const dated = rows.filter((r) => r.ts && Number.isFinite(Date.parse(r.ts)));
+  const lastOnChain = [...dated].reverse().find((r) => r.kind === "on-chain") ?? null;
+  const lastOnChainMs = lastOnChain ? Date.parse(lastOnChain.ts!) : -Infinity;
+  // Off-chain claims with no on-chain row after them.
+  const orphaned = dated.filter((r) => r.kind === "off-chain" && Date.parse(r.ts!) > lastOnChainMs);
+  if (orphaned.length === 0) return { stalledHours: null, unsettledNook: 0, lastOnChain: lastOnChain?.ts ?? null };
+  const oldest = Math.min(...orphaned.map((r) => Date.parse(r.ts!)));
+  const ageHours = Math.max(0, (nowMs - oldest) / 3_600_000);
+  if (ageHours < minStallHours) {
+    // Young orphan — almost certainly a claim mid-flight, not a stall.
+    return { stalledHours: null, unsettledNook: 0, lastOnChain: lastOnChain?.ts ?? null };
+  }
+  return {
+    // Measure from the ORPHANED CLAIM, not from the last success: that is how
+    // long real value has been sitting unsettled.
+    stalledHours: ageHours,
+    unsettledNook: orphaned.reduce((s, r) => s + (r.claimed ?? 0), 0),
+    lastOnChain: lastOnChain?.ts ?? null,
+  };
+}
+
 function computeBlockers(args: {
   poolDist: { total: number; v0: number; v1: number; v2: number; vHigh: number };
   avgVCount: number;
   myPending: number;
   networkHistory: NetworkStatusEntry[];
+  claimHistory?: ClaimRow[];
   claimable: Record<string, number>;
   emergencyReserve: boolean;
   rlmExhausted: boolean;
@@ -621,6 +721,23 @@ function computeBlockers(args: {
   // showed through all 53 hours of the 2026-07-25 blackout while we earned
   // nothing. A reachable gateway always returns an epoch, so a run of samples
   // without one is unambiguous.
+  // On-chain settlement stalled? An off-chain claim only becomes real NOOK once
+  // the on-chain relay mirrors it. On 2026-07-30 that relay 500'd all day
+  // ("Failed to prepare mining reward claim") leaving 361,422 NOOK claimed but
+  // unsettled — and NOTHING surfaced it: the blocker list showed only routine
+  // verifier-supply notes. Same silent-failure shape as the 53h blackout.
+  const relay = claimRelayHealth(args.claimHistory ?? []);
+  if (relay.stalledHours !== null) {
+    blockers.push({
+      severity: relay.stalledHours >= 24 ? "high" : "med",
+      scope: "us",
+      message:
+        `On-chain claim relay stalled ~${relay.stalledHours.toFixed(0)}h: ${Math.round(relay.unsettledNook).toLocaleString()} NOOK ` +
+        `claimed off-chain with no on-chain settlement since ${relay.lastOnChain ?? "?"}`,
+      action: "Usually a gateway-side 500 on /claim-prepare; the claim is idempotent on cumulative proof so it sweeps when the gateway recovers. Escalate if it outlasts a day.",
+    });
+  }
+
   const gw = gatewayReachability(args.networkHistory);
   if (!gw.reachable && gw.consecutiveNoEpoch >= 2) {
     blockers.push({
@@ -696,80 +813,6 @@ function computeBlockers(args: {
     }
   }
   return blockers;
-}
-
-function computeWinningStatus(args: {
-  stakeTier?: string;
-  stakeMultiplier: number;
-  credits: number;
-  attempts24h: number;
-  submitted24h: number;
-  errors24h: number;
-  expectedRevenue24h: number;
-  lifetimeEarned: number;
-  claimable: number;
-  pendingRewards: number;
-  verifications24h: number;
-  pendingSubs: number;
-  avgVerifierCount: number;
-  networkV0Pct: number;
-  nearQuorumPool: number;
-  blockers: Array<{ severity: "high" | "med" | "low"; scope: "network" | "us"; message: string; action?: string }>;
-}) {
-  const errorRate = args.attempts24h > 0 ? args.errors24h / args.attempts24h : 0;
-  const submitRate = args.attempts24h > 0 ? args.submitted24h / args.attempts24h : 0;
-  const points =
-    (args.stakeTier === "tier3" ? 20 : args.stakeMultiplier >= 1.2 ? 10 : 0) +
-    (args.credits > 100 ? 10 : args.credits > 0 ? 5 : -10) +
-    (args.lifetimeEarned > 0 ? 10 : 0) +
-    (args.submitted24h > 0 ? 20 : -10) +
-    (args.verifications24h > 0 ? 15 : -5) +
-    (submitRate >= 0.6 ? 10 : errorRate >= 0.5 ? -15 : 0) +
-    (args.claimable + args.pendingRewards > 0 ? 10 : 0) +
-    (args.networkV0Pct >= 0.7 ? -10 : 5);
-
-  const reasons: string[] = [];
-  const nextActions: string[] = [];
-  if (args.stakeTier === "tier3") reasons.push(`Tier 3 stake active (${args.stakeMultiplier}x individual multiplier).`);
-  else nextActions.push("Confirm stake tier before relying on mining revenue.");
-  if (args.submitted24h > 0) reasons.push(`${args.submitted24h}/${args.attempts24h} mining attempts landed in 24h.`);
-  else nextActions.push("Get mining submitting again this epoch; idle solver slots are the largest missed upside.");
-  if (args.verifications24h > 0) reasons.push(`${args.verifications24h} verifications logged in 24h.`);
-  else nextActions.push("Spend verification budget on near-quorum v2 submissions first.");
-  if (args.pendingSubs > 0) reasons.push(`${args.pendingSubs} solver submissions pending, avg ${args.avgVerifierCount.toFixed(1)}/3 verifiers.`);
-  if (args.networkV0Pct >= 0.7) nextActions.push("Treat slow payouts as network verifier starvation, not necessarily solve quality.");
-  if (args.nearQuorumPool > 0) nextActions.push(`Prioritize ${args.nearQuorumPool} v2 pool submissions to unlock verifier rewards faster.`);
-  if (errorRate >= 0.5) nextActions.push(`Cut 24h mining error rate (${Math.round(errorRate * 100)}%) before pruning models.`);
-  if (args.claimable + args.pendingRewards > 0) reasons.push(`${Math.round(args.claimable + args.pendingRewards)} NOOK claimable/pending.`);
-
-  const highUsBlocker = args.blockers.some((b) => b.scope === "us" && b.severity === "high");
-  const status = points >= 55 && !highUsBlocker
-    ? "winning"
-    : points >= 25
-      ? "mixed"
-      : "blocked";
-  const headline = status === "winning"
-    ? "Winning, with payout timing mostly gated by verifier supply."
-    : status === "mixed"
-      ? "Mixed: good positioning, but conversion is not proven yet."
-      : "Not winning yet: activity is blocked or not converting.";
-
-  return {
-    status,
-    score: Math.max(0, Math.min(100, points)),
-    headline,
-    reasons: reasons.slice(0, 5),
-    nextActions: nextActions.slice(0, 5),
-    metrics: {
-      submitRate,
-      errorRate,
-      attempts24h: args.attempts24h,
-      submitted24h: args.submitted24h,
-      verifications24h: args.verifications24h,
-      expectedRevenue24h: args.expectedRevenue24h,
-      networkV0Pct: args.networkV0Pct,
-    },
-  };
 }
 
 function readJsonlSafe<T>(path: string): T[] {
@@ -1548,8 +1591,14 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   return json(res, 404, { error: "not-found", path });
 }
 
-createServer(handle).listen(PORT, BIND, () => {
-  console.log(`🌐 nookplot-bot web dashboard → http://${BIND}:${PORT}`);
-  console.log(`   serving public/ from ${PUBLIC_DIR}`);
-  console.log(`   stop with Ctrl+C`);
-});
+// Only bind a port when RUN as the entrypoint. Importing this module (the test
+// suite does, for the pure blocker/P&L helpers) must not start a server —
+// otherwise `npm test` fails with EADDRINUSE whenever the real dashboard is up,
+// which is exactly when you most want the tests to run.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  createServer(handle).listen(PORT, BIND, () => {
+    console.log(`🌐 nookplot-bot web dashboard → http://${BIND}:${PORT}`);
+    console.log(`   serving public/ from ${PUBLIC_DIR}`);
+    console.log(`   stop with Ctrl+C`);
+  });
+}

@@ -61,8 +61,8 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `MODEL_BOUNTY_REVISE` | `claude-opus-4-8` | Refiner revise pass. |
 | `MODEL_MINING_SOLVE` | `claude-opus-4-8` (A/B pool as of 2026-07-28: grok-4-5 / claude-opus-5 / openai-gpt-56-sol / kimi-k3) | Mining challenge solutions. Pool arms must be plain Venice ids — org-prefixed ids (`zai-org-…`) are rejected by the gateway's `modelUsed` validator after you have already paid for the solve. |
 | `MODEL_MINING_LEARNING` | `grok-4-3` | Post-solve learning prose. |
-| `MODEL_VERIFICATION_SCORE` | `grok-4-3` | 4-dimension trace scoring. |
-| `MODEL_VERIFICATION_COMPREHENSION` | `grok-4-3` | Comprehension-question answers during verification. |
+| `MODEL_VERIFICATION_SCORE` | `grok-4-5` (was grok-4-3 until 2026-07-30) | 4-dimension trace scoring. |
+| `MODEL_VERIFICATION_COMPREHENSION` | `grok-4-5` (was grok-4-3 until 2026-07-30) | Comprehension-question answers during verification. |
 | `MODEL_CROWD_JURY_SCORE` | `grok-4-3` | 0–100 crowd-jury grading. |
 | `MODEL_KNOWLEDGE_TOPIC` | `grok-4-3` | Knowledge-graph topic selection. |
 | `MODEL_KNOWLEDGE_BODY` | `grok-4-3` | Knowledge essay bodies. |
@@ -84,6 +84,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `BOT_SPECIALIZE_DOMAINS` | unset (no specialization) — tune for your agent | Comma-separated domain tags; used as a soft preference in challenge sort and reused by bounty/teaching/clarification/subscription filters (`src/mining.ts` and others). |
 | `BOT_SPECIALIZE_MATCH_MODE` | `any` | `any` = challenge matches one of your domains; `all` = must match every domain (`src/mining.ts`). |
 | `BOT_SPECIALIZE_STRICT` | off (`1` enables) | Make specialization a hard filter — skip non-matching challenges instead of just down-ranking them (`src/mining.ts`). |
+| `BOT_MIN_CHALLENGE_REWARD` | `10` (`0` disables) | Minimum estimated reward (NOOK) worth a rolling-cap slot. Measured settlement: standard ~45,777/solve vs python_tests ~5,559; a 2026-07-28 burst put 9 of 12 slots into 6-NOOK challenges and cost ~288k (`src/mining.ts`). |
 | `BOT_MINING_PACING` | on (`0` disables) | Spread solves over the rolling 24h window instead of bursting; prevents cap-boundary collisions with the gateway's rolling 12/24h regular cap (`src/mining.ts`). |
 | `BOT_INSTANCE_LOCK` | on (`0` disables) | Single-instance pidfile lock at `~/.nookplot/bot.pid` — a second daemon refuses to boot instead of silently doubling spend and racing gated code paths (`src/instance-lock.ts`). |
 | `BOT_MINING_REFINE` | on (`0` disables) | Critique-and-revise refinement pass on standard traces before submitting (`src/mining.ts`). |
@@ -122,7 +123,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 |---|---|---|
 | `BOT_VERIFY_SHARED_CAP` | `38` | Local mirror of the gateway's shared verify+crowd-jury budget (hard 40, rolling 24h) with a safety buffer (`src/quotas.ts`). |
 | `BOT_VERIFY_DAILY_CAP` | `38` | Local per-day cap on pure verifies; defaults to the full shared budget (`src/index.ts`). |
-| `BOT_VERIFY_HOURLY_PACE` | `2` | Max verify/crowd actions per trailing hour — burst pacing so a free-fire spree can't trip the gateway 429 (`src/quotas.ts`). |
+| `BOT_VERIFY_HOURLY_PACE` | `5` (was `2` until 2026-07-30) | Max verify/crowd actions per trailing hour — burst pacing so a free-fire spree can't trip the gateway 429. Raised because genuine (non-spam) submissions arrive in bursts: 22–109 traces/day clear the anti-farm gate while only 3–11 verifications landed, so the pace gate — not spam avoidance — was capping how much honest work we could verify (`src/quotas.ts`). |
 | `BOT_VERIFY_POOL_FETCH_LIMIT` | `200` | How many verifiable submissions to fetch per poll (`src/index.ts`). |
 | `BOT_VERIFY_FETCH_STRIKE_LIMIT` | `3` | Transient trace-fetch failures allowed per submission before it's retired permanently (dead/unpinned CIDs) (`src/index.ts`). |
 | `BOT_VERIFY_THRESHOLD` | unset (quota-aware auto) | Override the minimum verification_count a submission needs to be worth a slot; `0` = free-fire on anything (`src/index.ts`). |

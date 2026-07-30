@@ -111,7 +111,7 @@ import {
   enrichSummarySpecificity,
   passesSpecificityGate,
 } from "../specificity-gate.js";
-import { compareChallengePriority, challengeValueTier, computeVerifiableTilt, isModelRejection, discountStaleIdRejections, isTransientGenerationError, type TiltInputs } from "../mining.js";
+import { compareChallengePriority, challengeValueTier, computeVerifiableTilt, isModelRejection, discountStaleIdRejections, meetsValueFloor, isTransientGenerationError, type TiltInputs } from "../mining.js";
 import { pickAlternateModel } from "../models.js";
 import { selectBundleCids, bundleDue, sanitizeBundleTags, registeredPublishedCids } from "../bundles.js";
 import { countWithinDays, cohortAddresses } from "../cohort-benchmark.js";
@@ -136,9 +136,12 @@ describe("models", () => {
     delete process.env.BOT_LEAN;
     try {
       // High-value tasks default to opus-4-8 (the safe fallback under the A/B
-      // pool); volume tasks stay on grok-4-3.
+      // pool); prose/volume tasks stay on grok-4-3. Verification moved to
+      // grok-4-5 on 2026-07-30 at the operator's direction.
       assert.equal(pickModel("mining_solve"), process.env.MODEL_MINING_SOLVE ?? "claude-opus-4-8");
-      assert.equal(pickModel("verification_score"), process.env.MODEL_VERIFICATION_SCORE ?? "grok-4-3");
+      assert.equal(pickModel("verification_score"), process.env.MODEL_VERIFICATION_SCORE ?? "grok-4-5");
+      assert.equal(pickModel("verification_comprehension"), process.env.MODEL_VERIFICATION_COMPREHENSION ?? "grok-4-5");
+      assert.equal(pickModel("knowledge_body"), process.env.MODEL_KNOWLEDGE_BODY ?? "grok-4-3");
     } finally {
       if (savedLean === undefined) delete process.env.BOT_LEAN;
       else process.env.BOT_LEAN = savedLean;
@@ -3123,6 +3126,8 @@ import { acquireGeneration, semaphoreSnapshot } from "../generation-semaphore.js
 import { readJsonlTail } from "../util.js";
 import { estimateCallCost } from "../venice-cost.js";
 import { shouldExitForDeadGateway, gatewayWatchdogState, gatewayReachability } from "../network-status.js";
+import { claimRelayHealth, computeNetPnl } from "../dashboard-web.js";
+import { countVerifiedSolves, rescueAwareCap } from "../challenge-posting.js";
 import { acquireInstanceLock, releaseInstanceLock, holderStatus, readPidfile, readGitRev, type LockDeps } from "../instance-lock.js";
 import { writeFileSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { join as joinPath } from "node:path";
@@ -3845,5 +3850,231 @@ describe("mining circuit breaker — model-id rejection (deterministic evidence)
   it("a healthy arm is untouched", () => {
     const rates = { "grok-4-5": { attempts: 10, failures: 1, rate: 0.1, idRejected: 0, idRejectedWireNames: [] } };
     assert.deepEqual(filterPoolByParseFailure(POOL, rates).sidelined, []);
+  });
+});
+
+describe("mining.meetsValueFloor (protects the rolling-cap slot)", () => {
+  it("rejects the ~6-NOOK challenges that cost ~288k in one window", () => {
+    // 2026-07-28: 9 of 12 slots went to challenges estimated at 6 NOOK,
+    // settling ~5.5k each where standard solves return ~45.8k.
+    assert.equal(meetsValueFloor({ id: "a", estimatedRewardNook: 6 }, 10), false);
+    assert.equal(meetsValueFloor({ id: "a", estimatedRewardNook: 3 }, 10), false);
+    assert.equal(meetsValueFloor({ id: "a", estimatedRewardNook: 9 }, 10), false);
+  });
+  it("accepts standard-tier challenges", () => {
+    // Live pool 2026-07-30: 91 of 92 standard challenges were estimated at 31.
+    assert.equal(meetsValueFloor({ id: "a", estimatedRewardNook: 31 }, 10), true);
+    assert.equal(meetsValueFloor({ id: "a", estimatedRewardNook: 10 }, 10), true);
+  });
+  it("allows a challenge with NO estimate (missing data is not low value)", () => {
+    assert.equal(meetsValueFloor({ id: "a" }, 10), true);
+    assert.equal(meetsValueFloor({ id: "a", estimatedRewardNook: undefined }, 10), true);
+  });
+  it("floor 0 disables the check entirely", () => {
+    assert.equal(meetsValueFloor({ id: "a", estimatedRewardNook: 1 }, 0), true);
+  });
+});
+
+describe("dashboard-web.claimRelayHealth (on-chain settlement stall)", () => {
+  const T = (h: number) => new Date(Date.UTC(2026, 6, 30, h, 0, 0)).toISOString();
+  const now = Date.UTC(2026, 6, 30, 15, 0, 0);
+
+  it("reports healthy when every off-chain claim has an on-chain row after it", () => {
+    const r = claimRelayHealth([
+      { ts: T(2), kind: "off-chain", claimed: 500 },
+      { ts: T(3), kind: "on-chain" },
+    ], now);
+    assert.equal(r.stalledHours, null);
+    assert.equal(r.unsettledNook, 0);
+  });
+
+  it("does NOT fire on a healthy claim mid-flight (off-chain written seconds before on-chain)", () => {
+    // Every successful cycle briefly has an orphan. Gating on existence alone
+    // flashed a false "stalled 0.0h" whenever a poll landed in that gap.
+    const r = claimRelayHealth([
+      { ts: "2026-07-30T02:00:00Z", kind: "on-chain" },
+      { ts: new Date(now - 30_000).toISOString(), kind: "off-chain", claimed: 1000 },
+    ], now);
+    assert.equal(r.stalledHours, null);
+    assert.equal(r.unsettledNook, 0);
+  });
+
+  it("respects the minimum stall age boundary", () => {
+    const rows = [
+      { ts: "2026-07-30T02:00:00Z", kind: "on-chain" },
+      { ts: new Date(now - 90 * 60_000).toISOString(), kind: "off-chain", claimed: 1000 },
+    ];
+    assert.equal(claimRelayHealth(rows, now, 2).stalledHours, null, "1.5h < 2h floor");
+    assert.ok((claimRelayHealth(rows, now, 1).stalledHours ?? 0) > 1, "1.5h > 1h floor");
+  });
+
+  it("detects the 2026-07-30 stall and totals the unsettled NOOK", () => {
+    const r = claimRelayHealth([
+      { ts: "2026-07-29T04:07:00Z", kind: "off-chain", claimed: 373417 },
+      { ts: "2026-07-29T04:07:30Z", kind: "on-chain" },
+      { ts: T(2), kind: "off-chain", claimed: 361422 },
+    ], now);
+    assert.ok(r.stalledHours !== null && r.stalledHours > 12 && r.stalledHours < 14, `got ${r.stalledHours}`);
+    assert.equal(r.unsettledNook, 361422);
+    assert.equal(r.lastOnChain, "2026-07-29T04:07:30Z");
+  });
+
+  it("measures from the ORPHANED claim, not the last success", () => {
+    // Two orphans: the age must reflect the oldest unsettled value.
+    const r = claimRelayHealth([
+      { ts: T(1), kind: "on-chain" },
+      { ts: T(2), kind: "off-chain", claimed: 100 },
+      { ts: T(14), kind: "off-chain", claimed: 50 },
+    ], now);
+    assert.ok(r.stalledHours !== null && r.stalledHours > 12);
+    assert.equal(r.unsettledNook, 150);
+  });
+
+  it("empty ledger is not a stall", () => {
+    assert.equal(claimRelayHealth([], now).stalledHours, null);
+  });
+});
+
+describe("dashboard-web.computeNetPnl (replaces the vanity winning score)", () => {
+  const now = Date.UTC(2026, 6, 30, 15, 0, 0);
+  const day = (d: number) => new Date(Date.UTC(2026, 6, d, 2, 0, 0)).toISOString();
+
+  it("computes a real net, and reports a LOSS as a loss", () => {
+    // The old score had no revenue/cost/net term and sat pinned at max while
+    // the bot lost money daily. This must be able to go negative.
+    const p = computeNetPnl(
+      [{ ts: day(29), kind: "off-chain", claimed: 1_000_000 }],
+      [{ date: "2026-07-29", spendUsd: 6 }],
+      0.00000396,
+      now,
+    );
+    assert.ok(p.usdRevenue > 3.9 && p.usdRevenue < 4.0, `revenue ${p.usdRevenue}`);
+    assert.equal(p.usdCost, 6);
+    assert.ok(p.usdNet < 0, "a losing week must report negative net");
+    assert.ok(p.costCoverage !== null && p.costCoverage < 1);
+  });
+
+  it("uses the price recorded AT CLAIM TIME so history doesn't drift", () => {
+    const p = computeNetPnl(
+      [{ ts: day(29), kind: "off-chain", claimed: 1_000_000, priceUsdAtClaim: 0.00001 }],
+      [],
+      0.00000396, // live price differs — must NOT be used for this row
+      now,
+    );
+    assert.ok(Math.abs(p.usdRevenue - 10) < 1e-9, `expected $10, got ${p.usdRevenue}`);
+  });
+
+  it("derives the breakeven price the operator actually needs", () => {
+    const p = computeNetPnl(
+      [{ ts: day(29), kind: "off-chain", claimed: 2_000_000 }],
+      [{ date: "2026-07-29", spendUsd: 20 }],
+      0.00000396,
+      now,
+    );
+    assert.ok(Math.abs((p.breakevenPriceUsd ?? 0) - 0.00001) < 1e-12);
+  });
+
+  it("prices revenue and cost over the SAME window", () => {
+    // Regression: cost was summed over 8 days against 7 days of revenue,
+    // overstating the loss ~20%. A day outside the window must be excluded
+    // from BOTH sides.
+    const stale = new Date(Date.UTC(2026, 6, 20, 2, 0, 0)).toISOString().slice(0, 10);
+    const p = computeNetPnl(
+      [
+        { ts: day(29), kind: "off-chain", claimed: 1_000_000 },
+        { ts: new Date(Date.UTC(2026, 6, 20, 2, 0, 0)).toISOString(), kind: "off-chain", claimed: 9_000_000 },
+      ],
+      [{ date: "2026-07-29", spendUsd: 6 }, { date: stale, spendUsd: 100 }],
+      0.00001,
+      now,
+    );
+    assert.equal(p.nookEarned, 1_000_000, "stale claim must be outside the window");
+    assert.equal(p.usdCost, 6, "stale spend day must be outside the SAME window");
+  });
+
+  it("ignores on-chain rows so settlement never double-counts revenue", () => {
+    const p = computeNetPnl(
+      [
+        { ts: day(29), kind: "off-chain", claimed: 100_000 },
+        { ts: day(29), kind: "on-chain", claimed: 100_000 },
+      ],
+      [],
+      0.00001,
+      now,
+    );
+    assert.equal(p.nookEarned, 100_000);
+  });
+});
+
+describe("challenge-posting.countVerifiedSolves (royalty gate)", () => {
+  it("counts only VERIFIED solves — a submission is not qualification", () => {
+    // The exact 2026-07-30 shape: one submission, unverified, royalty at risk
+    // while the old submission-count check reported everything fine.
+    assert.equal(countVerifiedSolves({ submissions: [{ status: "submitted", verifiedAt: null }] }), 0);
+    assert.equal(countVerifiedSolves({ submissions: [{ status: "verified", verifiedAt: "2026-07-30T09:00:00Z" }] }), 1);
+  });
+  it("treats a verifiedAt timestamp as qualification even if status lags", () => {
+    assert.equal(countVerifiedSolves({ submissions: [{ status: "submitted", verifiedAt: "2026-07-30T09:00:00Z" }] }), 1);
+  });
+  it("handles an empty or absent submissions array", () => {
+    assert.equal(countVerifiedSolves({ submissions: [] }), 0);
+    assert.equal(countVerifiedSolves({}), 0);
+  });
+});
+
+describe("quotas.verifyPaceOk (burst absorption for genuine work)", () => {
+  const now = Date.UTC(2026, 6, 30, 12, 0, 0);
+  const minsAgo = (m: number) => now - m * 60_000;
+
+  it("absorbs a burst of genuine candidates up to the hourly rate", () => {
+    // Since the anti-farm gate went in, ~94% of the pool is spam we abstain
+    // on, so genuine candidates are scarce AND bursty. At the old rate of 2/h
+    // a burst was truncated and the surplus was gone by the next window —
+    // 22-109 traces/day cleared the gate while only 3-11 verifications landed.
+    const burst = [minsAgo(5), minsAgo(6), minsAgo(7), minsAgo(8)];
+    assert.equal(verifyPaceOk(burst, now, 2), false, "old rate truncates the burst");
+    assert.equal(verifyPaceOk(burst, now, 5), true, "raised rate absorbs it");
+  });
+
+  it("still refuses a free-fire spree — the 2026-06-29 collapse shape", () => {
+    // 39 verifies at once tripped a gateway 429 and froze verifying for a
+    // whole window. The gate must still stop that.
+    const spree = Array.from({ length: 39 }, (_, i) => minsAgo(i));
+    assert.equal(verifyPaceOk(spree, now, 5), false);
+  });
+
+  it("only counts the trailing hour, so the rate recovers", () => {
+    const old = [minsAgo(61), minsAgo(75), minsAgo(90), minsAgo(120), minsAgo(200)];
+    assert.equal(verifyPaceOk(old, now, 5), true);
+  });
+
+  it("the hourly rate never becomes the daily ceiling", () => {
+    // 5/h x 24h = 120, comfortably above the 38/day shared cap, so pacing
+    // shapes the RATE and the cap remains the real limit.
+    assert.ok(5 * 24 > VERIFY_SHARED_CAP);
+  });
+});
+
+describe("challenge-posting.rescueAwareCap (one ceiling, both guards)", () => {
+  it("gives the rescue path room for MAX_RESCUES extra posts", () => {
+    assert.equal(rescueAwareCap(false, 1, 2), 1);
+    assert.equal(rescueAwareCap(true, 1, 2), 3);
+  });
+
+  it("the SECOND rescue is actually reachable", () => {
+    // Regression: the entry guard allowed DAILY_CAP+MAX_RESCUES while the
+    // post-draft concurrency re-check still used DAILY_CAP+1. The 2nd rescue
+    // therefore passed the entry guard, paid for a full LLM draft, and aborted
+    // — every hourly tick for the rest of the 10h window.
+    const dailyCap = 1, maxRescues = 2;
+    const postedSoFar = 2; // one normal post + one rescue
+    assert.ok(postedSoFar < rescueAwareCap(true, dailyCap, maxRescues), "entry guard must allow it");
+    assert.ok(postedSoFar < rescueAwareCap(true, dailyCap, maxRescues), "re-check must allow it too");
+    // And the old mismatched ceiling is what blocked it:
+    assert.ok(!(postedSoFar < dailyCap + 1), "the old DAILY_CAP+1 re-check would have aborted");
+  });
+
+  it("still stops at the ceiling", () => {
+    assert.ok(!(3 < rescueAwareCap(true, 1, 2)), "3 posts is the cap with 2 rescues");
   });
 });
