@@ -98,7 +98,11 @@ items graduate out of this file when they ship (see CHANGELOG / git history).
 - [ ] **Citation-aware topic steering.** We publish ~4 knowledge posts/day
   and never look at which earn citations/access royalties.
   `citation-velocity.jsonl` has the data; feed "what actually gets cited"
-  back into knowledge topic selection.
+  back into knowledge topic selection. NOTE (2026-07-30): this was unmeasurable
+  until now — the citation loop had never succeeded once (18,338 failures from
+  passing a learning id to a knowledge-graph endpoint), so citation counts were
+  all structurally zero. Fixed; let real data accumulate for a week before
+  building steering on top of it.
 
 ## Tier 4 — investigate, unclear payoff
 

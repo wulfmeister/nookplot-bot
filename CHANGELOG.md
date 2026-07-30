@@ -4,6 +4,84 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-07-28–30 — a 53h blackout, three self-inflicted bugs, and one loop that never worked
+
+A week of finding things that were quietly broken rather than adding features.
+The recurring lesson: **a metric that cannot go down is worse than no metric**,
+and **liveness is not earning**.
+
+- **53-hour earning blackout (07-25 22:57Z → 07-28 reboot).** The host's network
+  stack wedged. The daemon stayed alive, kept every loop ticking, and wrote a
+  structurally valid all-zero snapshot every 30 minutes — so freshness checks
+  passed and the dashboard badge stayed green while we earned nothing. Cost
+  ~1.1M NOOK, ~43% of it the posting royalty (which does NOT accumulate; a
+  missed day is gone). Proven host-level, not ours, by an unrelated cron's git
+  pushes failing in the same minute and recovering 3.5 min after reboot. Fixed
+  with a connectivity watchdog (3 consecutive epoch-less polls → exit 70; zero
+  false positives across 3,152 historical samples) plus a launchd KeepAlive job,
+  since the exit is only a repair if something restarts us. Replaying history
+  found this had happened twice before, including a 4.6-day outage in May.
+- **The verifiable-kind tilt was value-destroying** (shipped 07-23, corrected
+  07-28). It preferred sandbox-graded kinds whenever standard-kind expiry passed
+  20%, on the theory that converting forfeited slots into paid ones is free
+  money. Gateway attribution says otherwise: standard returns 54,308 NOOK per
+  paid solve at 55% survival (27,516/slot) vs verifiable 10,181 at 88%
+  (8,960/slot). Standard wins 3.1x *despite* the expiry; break-even needs ~84%
+  expiry. Ranked kinds by survival rate while ignoring what they pay. The
+  trigger is now the EV comparison itself.
+- **Cost accounting was wrong in three ways at once**, which mattered because
+  it is the denominator in every model-pruning decision: the price table was
+  stale and incomplete (grok-4-3 listed at 12.0 against a real $1.42/$2.83;
+  three of four live arms had no entry and silently billed at a $15 default);
+  reasoning tokens were double-counted (Venice follows the OpenAI convention
+  where reasoning is a *subset* of completion — 6,108/6,108 rows confirm), and
+  only on the two arms that report them; and revenue was compared over 7 days
+  against 8 days of cost. Re-costing the last week: $13.46 actual vs $30.06 as
+  logged.
+- **GLM burned 52 paid solves for zero accepted submissions** over 13 days. The
+  gateway rejects every dash-mangled form of its id, and the circuit breaker
+  could not see it because *generation* was clean 146/148 times — so the breaker
+  rated it our healthiest arm. Removed. Submit-time rejections now feed the
+  breaker, and an id rejection sidelines an arm after ONE occurrence (it is
+  deterministic evidence, not a rate). kimi-k3 hit the same wall and is retrying
+  under an org/Model wire name, bounded to a single solve if wrong.
+- **The circuit breaker's denominator counted only failures.** Successes were
+  never tagged, so every model read as 100% failing and any arm was sidelined
+  *permanently* once it accumulated 5 lifetime parse-fails. grok-4-3 was at 4.
+- **The citation loop had never once succeeded — 18,338 failures.** It passed a
+  network-learning id as the target to a knowledge-GRAPH citation endpoint: a
+  different namespace. Every call 500'd, invisibly, since inception. Proven by
+  probe (learning id fails, a knowledge node from the same author succeeds)
+  rather than inferred. Now resolves the author's graph and cites a real node;
+  first successful citations recorded 07-30.
+- **Two dashboard metrics were coaching harm.** The "Are we winning · 100/100"
+  score had no revenue, cost or net term among its eight, so it sat pinned at
+  maximum while the bot lost money every day since 07-11 — deleted, replaced by
+  real P&L as the first panel, with an operator toggle to view gross when
+  inference is paid from DIEM/OpenRouter credits. The capacity warning measured
+  verifications against the raw 38/day cap, but ~94% of the pool is Sybil-farm
+  spam we correctly abstain on, and quorum is a COUNT with no reject field — so
+  hitting that floor would have meant *paying the farm*. Now measured against
+  genuine supply.
+- **Verification throughput was capped by our own pacing, not by spam.** 22-109
+  traces cleared the anti-farm gate per day while only 3-11 verifications
+  landed; the 2/hour gate assumed uniform arrival and genuine work is bursty.
+  Raised to 5/hour.
+- **The royalty rescue checked the wrong thing.** It fired only on zero
+  *submissions*, but the 250k needs a *verified* solve — so on 07-30 a single
+  unverified submission suppressed it while the royalty went unqualified. Now
+  counts verified solves across every challenge posted that epoch-day, starts
+  10h out (median time-to-verified is 7.2h), and allows two rescues. It fired
+  the same evening and drew a submission within 8 minutes.
+- **Challenge attractiveness is not the royalty lever** (investigated, mostly a
+  negative result). All 48 settled posts are byte-identical on every
+  solver-visible field yet drew 0-20 submissions; submissions arrive in an
+  exogenous network-wide sweep. Rejected on the evidence: raising the daily post
+  cap, re-timing the post, shortening descriptions. Kept one free experiment —
+  difficulty was never actually being chosen (the parser fell back to `hard` on
+  all 49 posts, making us the cheapest listing on a board that is 84% `expert`),
+  now pinned and, for the first time, *logged* so the experiment is measurable.
+
 ## 2026-06-23–25 — builder-dimension experiments (exec/collab) + Path C bounties
 
 Pushed on the three zeroed-but-earnable surfaces, instrumented everything, and
