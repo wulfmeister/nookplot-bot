@@ -83,6 +83,9 @@ interface CostEntry {
   /** When the caller knows whether this call was useful (e.g. a mining solve
    * that failed to parse), they record that here for later forensics. */
   outcome?: "parse-ok" | "parse-fail" | "timeout" | "other-error" | "ok" | "rate-limited" | "submit-reject";
+  /** For submit-reject rows: the modelUsed string actually sent on the wire.
+   *  Recorded so a rejection of an OLD wire name does not condemn a corrected one. */
+  wireName?: string;
   callSite?: string;
 }
 
@@ -197,7 +200,7 @@ export function veniceRateLimited429Today(): Record<string, number> {
  */
 export function parseFailureRateByModel(lookback = 10): Record<
   string,
-  { attempts: number; failures: number; rate: number }
+  { attempts: number; failures: number; rate: number; idRejected: number; idRejectedWireNames: string[] }
 > {
   const allCalls = readJsonl<CostEntry>(LOG).filter((e) => e.callSite === "mining_solve");
   // Most-recent first
@@ -208,7 +211,7 @@ export function parseFailureRateByModel(lookback = 10): Record<
     if (!byModel[e.model]) byModel[e.model] = [];
     if (byModel[e.model].length < lookback) byModel[e.model].push(e);
   }
-  const result: Record<string, { attempts: number; failures: number; rate: number }> = {};
+  const result: Record<string, { attempts: number; failures: number; rate: number; idRejected: number; idRejectedWireNames: string[] }> = {};
   for (const [model, recent] of Object.entries(byModel)) {
     // "submit-reject" counts as a failure alongside "parse-fail": a model whose
     // output the GATEWAY refuses is just as worthless as one we can't parse,
@@ -221,6 +224,21 @@ export function parseFailureRateByModel(lookback = 10): Record<
       attempts: recent.length,
       failures,
       rate: recent.length > 0 ? failures / recent.length : 0,
+      // Rejections of the model ID ITSELF are reported separately because they
+      // are DETERMINISTIC — the gateway will refuse this id every time, so one
+      // occurrence is proof, where a parse-fail is only evidence. The breaker
+      // sidelines on a single one instead of waiting for a rate to build.
+      idRejected: recent.filter((e) => e.outcome === "submit-reject").length,
+      // Which exact wire strings were refused. A caller that has since CHANGED
+      // the wire name for this model can disregard rejections of the old one.
+      idRejectedWireNames: [
+        ...new Set(
+          recent
+            .filter((e) => e.outcome === "submit-reject")
+            .map((e) => e.wireName)
+            .filter((w): w is string => Boolean(w)),
+        ),
+      ],
     };
   }
   return result;
@@ -262,7 +280,7 @@ export function tagLatestCallOutcome(
  * The paid solve is already spent by the time we learn this, so the only
  * defense is sidelining the arm before it burns the next one.
  */
-export function recordSubmitRejection(model: string, reason?: string): void {
+export function recordSubmitRejection(model: string, reason?: string, wireName?: string): void {
   appendJsonl(LOG, {
     ts: new Date().toISOString(),
     model,
@@ -272,6 +290,7 @@ export function recordSubmitRejection(model: string, reason?: string): void {
     estCost: 0,
     outcome: "submit-reject",
     callSite: "mining_solve",
+    wireName,
     note: reason?.slice(0, 160),
   } as CostEntry & { note?: string });
 }

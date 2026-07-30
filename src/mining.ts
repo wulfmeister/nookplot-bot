@@ -841,7 +841,30 @@ async function trySolve(
  * solve (15 burned solves in 3 days). Strip the vendor prefix for the wire;
  * local logs keep the full Venice id for A/B attribution.
  */
+/**
+ * Explicit wire-name overrides for models whose Venice catalog id the gateway's
+ * validator refuses. The validator wants a "real published model identifier"
+ * and its own error cites `meta/llama-3.1-70b-instruct` — i.e. the HF-style
+ * `org/Model` form is accepted. Venice flattens those ids (slash → dash,
+ * lowercased), which is what breaks them.
+ *
+ * Every entry here is a HYPOTHESIS until a submission using it is accepted;
+ * each test costs one paid solve, so add at most one at a time and check the
+ * outcome. The breaker now sidelines an arm after a SINGLE id rejection, so a
+ * wrong guess costs one solve rather than dozens.
+ */
+const GATEWAY_MODEL_NAME_OVERRIDES: Record<string, string> = {
+  // kimi-k3 was rejected 3x as a bare id (2026-07-29/30). Moonshot publishes
+  // Kimi on HuggingFace under the `moonshotai` org, so this is the org/Model
+  // form the validator's own example endorses. UNVERIFIED — if the next
+  // submission is rejected again, drop kimi from the pool rather than guess a
+  // third time.
+  "kimi-k3": "moonshotai/Kimi-K3",
+};
+
 export function gatewayModelName(model: string): string {
+  const override = GATEWAY_MODEL_NAME_OVERRIDES[model];
+  if (override) return override;
   return model.replace(/^zai-org-/, "").replace(/^e2ee-/, "");
 }
 
@@ -853,6 +876,32 @@ export function gatewayModelName(model: string): string {
  */
 export function isModelRejection(error: string): boolean {
   return /modelUsed|doesn't look like a real model name|unknown model/i.test(error);
+}
+
+/**
+ * A recorded id-rejection condemns the WIRE NAME that was refused, not the
+ * model. Once an override changes what we send (see
+ * GATEWAY_MODEL_NAME_OVERRIDES), prior rejections of the old string are stale
+ * evidence and must not keep the arm sidelined forever — otherwise a corrected
+ * name can never be tested. Rejections of the name we would send TODAY still
+ * count, so a wrong correction is caught after a single solve.
+ */
+export function discountStaleIdRejections<
+  T extends { idRejected: number; idRejectedWireNames?: string[] },
+>(rates: Record<string, T>): Record<string, T> {
+  const out: Record<string, T> = {};
+  for (const [model, r] of Object.entries(rates)) {
+    const names = r.idRejectedWireNames;
+    // No recorded wire names (pre-2026-07-30 rows) → keep the rejection; we
+    // can't prove it was a different name, and the safe default is to distrust.
+    if (!r.idRejected || !names || names.length === 0) {
+      out[model] = r;
+      continue;
+    }
+    const current = gatewayModelName(model);
+    out[model] = names.includes(current) ? r : { ...r, idRejected: 0 };
+  }
+  return out;
 }
 
 /**
@@ -1455,7 +1504,7 @@ export async function discoverAndSolveMiningChallenges(
     // pickModelAB. Models with >= BOT_MODEL_PARSE_FAIL_THRESHOLD failure rate
     // in their last N calls are sidelined from rotation for the day.
     const { parseFailureRateByModel } = await import("./venice-cost.js");
-    const failureRates = parseFailureRateByModel(10);
+    const failureRates = discountStaleIdRejections(parseFailureRateByModel(10));
     const abRaw = pickModelAB("mining_solve", failureRates);
     // Only report models actually in rotation: the failure-rate history keeps
     // stats for retired pool members forever (their last N calls never change
@@ -1518,6 +1567,20 @@ export async function discoverAndSolveMiningChallenges(
         solved = await trySolve(ch, learnings, modelUsed, effortUsed, context, guide);
       }
       if (effortUsed) console.log(`   🧠 reasoning_effort=${effortUsed} for ${modelUsed}`);
+      // Tag the SUCCESS too, not just failures. parseFailureRateByModel counts
+      // only rows tagged callSite="mining_solve", and until now that tag was
+      // applied exclusively on parse-fail — so the breaker's denominator
+      // contained nothing but failures and every model read as 100%. Effect:
+      // an arm was sidelined permanently once it accumulated 5 lifetime
+      // parse-fails, no matter how well it performed afterwards, since
+      // successes could never dilute the window. (Observed 07-30: grok-4-5
+      // 1/1, opus-4-8 1/1, deepseek 10/10 — all "100% failing" while
+      // submitting fine.)
+      if (solved) {
+        void import("./venice-cost.js")
+          .then((m) => m.tagLatestCallOutcome(modelUsed, "parse-ok", "mining_solve"))
+          .catch(() => undefined);
+      }
 
       // Standard traces get a critique-revise pass (BOT_MINING_REFINE=0 to skip).
       if (solved && solved.traceContent) {
@@ -1858,7 +1921,7 @@ export async function discoverAndSolveMiningChallenges(
       // healthy model.
       if (isModelRejection(msg)) {
         void import("./venice-cost.js")
-          .then((m) => m.recordSubmitRejection(modelUsed, msg))
+          .then((m) => m.recordSubmitRejection(modelUsed, msg, gatewayModelName(modelUsed)))
           .catch(() => undefined); // telemetry must never break the loop
       }
       // Classify permanent failures and mark the appropriate skip cache so the

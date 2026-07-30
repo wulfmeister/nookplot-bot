@@ -111,7 +111,7 @@ import {
   enrichSummarySpecificity,
   passesSpecificityGate,
 } from "../specificity-gate.js";
-import { compareChallengePriority, challengeValueTier, computeVerifiableTilt, isModelRejection, isTransientGenerationError, type TiltInputs } from "../mining.js";
+import { compareChallengePriority, challengeValueTier, computeVerifiableTilt, isModelRejection, discountStaleIdRejections, isTransientGenerationError, type TiltInputs } from "../mining.js";
 import { pickAlternateModel } from "../models.js";
 import { selectBundleCids, bundleDue, sanitizeBundleTags, registeredPublishedCids } from "../bundles.js";
 import { countWithinDays, cohortAddresses } from "../cohort-benchmark.js";
@@ -169,11 +169,19 @@ describe("models", () => {
       // Every arm must actually be reachable — a typo'd id would silently
       // never be picked, or (worse) be picked and rejected at the wire.
       assert.equal(seen.size, allowed.size, `only ${[...seen].join(",")} were ever picked`);
-      // No arm may carry an org prefix: that is the exact shape the gateway's
-      // modelUsed validator rejects (GLM burned 52 paid solves on it).
+      // What goes on the WIRE must be a shape the gateway's modelUsed validator
+      // accepts: either a plain vendor-qualified id (claude-*, grok-*,
+      // openai-gpt-*) or an explicit `org/Model` override — the form the
+      // validator's own error cites (`meta/llama-3.1-70b-instruct`). What it
+      // rejects is Venice's flattened org-DASH id, which cost 52 paid solves
+      // on GLM and 3 on a bare `kimi-k3`.
       for (const m of allowed) {
-        assert.ok(!/^(zai-org-|e2ee-|moonshotai-|meta-)/.test(m), `${m} has an org prefix the gateway rejects`);
-        assert.equal(gatewayModelName(m), m, `${m} should pass through gatewayModelName unchanged`);
+        const wire = gatewayModelName(m);
+        assert.ok(!/^(zai-org-|e2ee-)/.test(wire), `${m} → "${wire}" keeps a flattened org prefix the gateway rejects`);
+        assert.ok(
+          /^(claude|grok|openai|gemini|deepseek)-/.test(wire) || wire.includes("/"),
+          `${m} → "${wire}" is neither vendor-qualified nor org/Model form`,
+        );
       }
       // Reasoning effort is configured ONLY for arms that expose the dial.
       // Per the live catalog (2026-07-28): grok-4-5 supports low|medium|high,
@@ -3795,5 +3803,47 @@ describe("venice-cost reasoning-token accounting (no double-count)", () => {
   it("never lets the output count exceed the total (input can't go negative)", () => {
     const c = estimateCallCost("claude-opus-5", 1000, 5000);
     assert.ok(c > 0 && Number.isFinite(c));
+  });
+});
+
+describe("mining circuit breaker — model-id rejection (deterministic evidence)", () => {
+  const base = { attempts: 3, failures: 3, rate: 1.0, idRejected: 0, idRejectedWireNames: [] as string[] };
+  const POOL = ["grok-4-5", "claude-opus-5", "openai-gpt-56-sol", "kimi-k3"];
+
+  it("sidelines on a SINGLE id rejection — no waiting for a rate to build", () => {
+    // A modelUsed rejection is deterministic: the gateway will refuse this id
+    // every time. GLM burned 52 paid solves and kimi-k3 3 before this existed.
+    const rates = { "kimi-k3": { ...base, attempts: 1, failures: 1, idRejected: 1, idRejectedWireNames: ["kimi-k3"] } };
+    const r = filterPoolByParseFailure(POOL, rates);
+    assert.deepEqual(r.sidelined, ["kimi-k3"]);
+    assert.ok(!r.filtered.includes("kimi-k3"));
+  });
+
+  it("a rejection of an OLD wire name does not condemn a corrected one", () => {
+    // Otherwise a fixed id could never be tested — the arm stays sidelined on
+    // evidence about a string we no longer send.
+    const rates = { "kimi-k3": { ...base, idRejected: 3, idRejectedWireNames: ["kimi-k3"] } };
+    const adjusted = discountStaleIdRejections(rates);
+    assert.equal(adjusted["kimi-k3"].idRejected, 0, "stale name should be discounted");
+    assert.ok(filterPoolByParseFailure(POOL, adjusted).filtered.includes("kimi-k3"));
+  });
+
+  it("but a rejection of the CURRENT wire name still counts", () => {
+    // gatewayModelName("kimi-k3") is currently the org/Model override.
+    const current = gatewayModelName("kimi-k3");
+    const rates = { "kimi-k3": { ...base, idRejected: 1, idRejectedWireNames: [current] } };
+    const adjusted = discountStaleIdRejections(rates);
+    assert.equal(adjusted["kimi-k3"].idRejected, 1, "current-name rejection must survive");
+    assert.deepEqual(filterPoolByParseFailure(POOL, adjusted).sidelined, ["kimi-k3"]);
+  });
+
+  it("rows with no recorded wire name are distrusted (safe default)", () => {
+    const rates = { "kimi-k3": { ...base, idRejected: 2, idRejectedWireNames: [] } };
+    assert.equal(discountStaleIdRejections(rates)["kimi-k3"].idRejected, 2);
+  });
+
+  it("a healthy arm is untouched", () => {
+    const rates = { "grok-4-5": { attempts: 10, failures: 1, rate: 0.1, idRejected: 0, idRejectedWireNames: [] } };
+    assert.deepEqual(filterPoolByParseFailure(POOL, rates).sidelined, []);
   });
 });

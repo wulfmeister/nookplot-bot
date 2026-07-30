@@ -214,12 +214,20 @@ export const PARSE_FAIL_MIN_ATTEMPTS = Number(process.env.BOT_MODEL_PARSE_FAIL_M
 
 export function filterPoolByParseFailure(
   pool: string[],
-  failureRates: Record<string, { attempts: number; failures: number; rate: number }>,
+  failureRates: Record<string, { attempts: number; failures: number; rate: number; idRejected?: number }>,
 ): { filtered: string[]; sidelined: string[] } {
   const sidelined: string[] = [];
   const filtered = pool.filter((m) => {
     const r = failureRates[m];
     if (!r) return true;
+    // A rejection of the model ID itself is deterministic — the gateway will
+    // refuse this id on every future submission, so waiting for a rate to
+    // accumulate just burns more paid solves (GLM burned 52, kimi-k3 3 before
+    // this rule existed). One is enough.
+    if ((r.idRejected ?? 0) > 0) {
+      sidelined.push(m);
+      return false;
+    }
     if (r.attempts < PARSE_FAIL_MIN_ATTEMPTS) return true;
     if (r.rate >= PARSE_FAIL_RATE_THRESHOLD) {
       sidelined.push(m);
