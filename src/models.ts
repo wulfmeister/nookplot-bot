@@ -79,8 +79,8 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   //     on output ($2.27/$6.80). reasoning_effort=xhigh.
   //   claude-opus-5     — Claude 5 Opus, 1M ctx, code-optimized. Replaced
   //     claude-fable-5 on 2026-07-28 (operator); effort=high.
-  //   kimi-k3           — Moonshot Kimi K3, 1M ctx, code-optimized. Added as the
-  //     4th arm 2026-07-28 (operator); effort=high.
+  //   gemini-3-1-pro-preview — Google's top model on Venice, 1M ctx, $2.50/$15.
+  //     4th arm 2026-08-05, replacing kimi-k3 (see below); effort=high.
   //   openai-gpt-56-sol — GPT-5.6 "Sol", 1M ctx, $6.25/$37.5. effort=high (OpenAI
   //     reasoning models empty-trace at xhigh — see MODEL_EFFORT note).
   // The parse-fail circuit-breaker (filterPoolByParseFailure) sidelines any arm
@@ -97,26 +97,30 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   // a single canary submission using a dotted id ("glm-5.2", fallback
   // "zai-org/GLM-5.2"); both are unverified guesses and each test costs a
   // paid solve.
-  // Roster set 2026-07-28 (operator): claude-opus-5 replaces claude-fable-5,
-  // kimi-k3 joins as the 4th arm. All four ids verified against the LIVE Venice
-  // catalog (GET /v1/models, 106 models) and probed with a solve-shaped request
-  // at both high and xhigh — every one returned parseable JSON with a working
-  // solution and a summary that clears our specificity gate. None carries an
-  // org prefix, which is the shape the gateway's modelUsed validator rejects
-  // (see the GLM note above); every plain-id model we have ever submitted has
-  // been accepted (grok-4-5 59/59, claude-opus-4-8 39/39, gpt-56-sol 32/32,
-  // claude-fable-5 8/8). If a new arm is nonetheless rejected at the wire, the
-  // submit-reject breaker now sidelines it automatically.
-  // BETA WATCH: kimi-k3 and openai-gpt-56-sol are flagged betaModel=true in the
-  // catalog — Venice may withdraw a beta model without the standard deprecation
-  // notice. A withdrawn arm 404s at generation, which is NOT matched by
+  // Roster set 2026-08-05 (operator): kimi-k3 REMOVED — the gateway's modelUsed
+  // validator rejected both wire names we were willing to try ("kimi-k3" 3x
+  // 07-29/30, "moonshotai/Kimi-K3" 1x 07-30), 0 acceptances ever, $2.24 burned.
+  // Note the org/Model hypothesis (see GATEWAY_MODEL_NAME_OVERRIDES in
+  // mining.ts) is now DISPROVEN — the validator refused the HF-style form too.
+  // gemini-3-1-pro-preview joins as the 4th arm (operator wants SOTA frontier
+  // from 4 distinct providers): verified in the LIVE catalog 2026-08-05
+  // (GET /v1/models, 108 models — $2.50/$15, 1M ctx, NOT beta), and its wire
+  // name is the only candidate with zero rejection risk — 27 historical
+  // gateway acceptances on record. Its 07-09 removal ("parse-failed and
+  // circuit-broken", below) is discounted: the 5/5 parse-fail record dates
+  // from June under the pre-07-28 breaker/accounting bugs (successes never
+  // tagged) AND an unsupported reasoning_effort=xhigh (catalog says
+  // low|medium|high) that plausibly caused the empty outputs itself.
+  // BETA WATCH: openai-gpt-56-sol is flagged betaModel=true in the catalog —
+  // Venice may withdraw a beta model without the standard deprecation notice.
+  // A withdrawn arm 404s at generation, which is NOT matched by
   // isTransientGenerationError, so the attempt is lost rather than rerouted.
-  // Re-probe these two first whenever the catalog is re-checked.
+  // Re-probe it first whenever the catalog is re-checked.
   mining_solve: [
     "grok-4-5",
     "claude-opus-5",
     "openai-gpt-56-sol",
-    "kimi-k3",
+    "gemini-3-1-pro-preview",
   ],
   mining_learning: undefined,
   verification_score: undefined,
@@ -153,15 +157,18 @@ const MODEL_EFFORT: Record<string, ReasoningEffort> = {
   // OpenAI reasoning models empty-trace at xhigh (observed on gpt-55) — keep
   // gpt-56-sol at high. GLM-5.2 at high pending its own calibration.
   "openai-gpt-56-sol": "high",
-  // claude-opus-5 and kimi-k3 are deliberately ABSENT: the live catalog reports
-  // supportsReasoningEffort=false / no reasoningEffortOptions for both, so any
-  // value here would be an ignored parameter. Both still reason (
-  // supportsReasoning=true) — they just don't expose a depth dial. Probing them
+  // claude-opus-5 is deliberately ABSENT: the live catalog reports
+  // supportsReasoningEffort=false / no reasoningEffortOptions, so any value
+  // here would be an ignored parameter. It still reasons (
+  // supportsReasoning=true) — it just doesn't expose a depth dial. Probing it
   // at high vs xhigh on 2026-07-28 produced different-length output, but since
   // the requests were served identically that was sampling noise, not a
   // calibration signal. effortFor() returning undefined omits the field.
-  // Probed live 2026-05-24: both accept xhigh and return non-empty.
-  "gemini-3-1-pro-preview": "xhigh",
+  // gemini-3-1-pro-preview accepts ONLY low|medium|high per the live catalog
+  // (2026-08-05). It ran at an unsupported "xhigh" from 05-24 → 07-09 — the
+  // same class of misconfig grok-4-5 had — which plausibly produced its
+  // "solver produced no output" errors and the parse-fails that got it benched.
+  "gemini-3-1-pro-preview": "high",
   "deepseek-v4-pro": "xhigh",
 };
 

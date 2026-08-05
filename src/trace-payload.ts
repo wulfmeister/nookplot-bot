@@ -63,11 +63,17 @@ export type CidStatus = "ok" | "permanent" | "transient" | "none";
  * `isPermanentCidError` to catch a genuine bad hash downstream.
  */
 const CIDV0_BASE58_RE = /^Qm[1-9A-HJ-NP-Za-km-z]{44}$/;
+// A 44-char tail drawn ENTIRELY from lowercase hex (minus 0, which base58
+// already forbids) is a hex digest dressed as a CID, not a real hash:
+// P(a genuine base58btc hash lands all-hex) = (15/58)^44 ≈ 1e-26. ~30 such
+// fakes passed the alphabet check 08-01→05 and burned 2×15s public-gateway
+// timeouts each before dying downstream.
+const CIDV0_HEX_TAIL_RE = /^Qm[1-9a-f]{44}$/;
 
 export function isWellFormedCid(cid: string): boolean {
   // CIDv0 is always "Qm" + 44 base58btc chars (46 total, no 0/O/I/l). Anything
   // claiming the Qm prefix must satisfy that exactly — hex-digest fakes don't.
-  if (cid.startsWith("Qm")) return CIDV0_BASE58_RE.test(cid);
+  if (cid.startsWith("Qm")) return CIDV0_BASE58_RE.test(cid) && !CIDV0_HEX_TAIL_RE.test(cid);
   return cid.length >= 40 && /^[A-Za-z0-9]+$/.test(cid);
 }
 
@@ -83,6 +89,8 @@ export function cidRejectReason(cid: string): string {
     if (cid.length !== 46) return `Qm-prefix but len=${cid.length} (CIDv0 must be 46) — truncated/placeholder`;
     const bad = cid.slice(2).match(/[^1-9A-HJ-NP-Za-km-z]/);
     if (bad) return `Qm-prefix, len=46 but non-base58 char '${bad[0]}' at idx ${cid.indexOf(bad[0])} — hex-digest fake (correct skip)`;
+    if (CIDV0_HEX_TAIL_RE.test(cid))
+      return "Qm-prefix, len=46, base58-valid but tail is PURE lowercase hex — hex-digest fake (P(real)≈1e-26, correct skip)";
     return "Qm-prefix, len=46, base58-valid (unexpected — should NOT have been rejected)";
   }
   if (cid.length < 40) return `len=${cid.length} (<40) — truncated/placeholder`;
@@ -95,6 +103,17 @@ export function cidRejectReason(cid: string): string {
  * 6h. Everything else (5xx, timeouts, gateway 502s) is transient IPFS
  * propagation and worth the retry.
  */
+/**
+ * A 5xx from the gateway's own IPFS endpoint is worth ONE bounded retry before
+ * falling back to public gateways: a CID pinned only on the Nookplot node is
+ * invisible to ipfs.io/dweb.link, so a single 502 blip burned a fetch strike
+ * (3 strikes = permanent retire) on real submissions — 12 strike cases
+ * 08-01→05. Excludes permanent CID errors, which no retry can fix.
+ */
+export function isTransientIpfsGatewayError(msg: string): boolean {
+  return !isPermanentCidError(msg) && /\(50[234]\)/.test(msg);
+}
+
 export function isPermanentCidError(msg: string): boolean {
   return /invalid cid format/i.test(msg);
 }

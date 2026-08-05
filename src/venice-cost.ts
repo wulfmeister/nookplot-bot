@@ -72,7 +72,7 @@ const DEFAULT_PRICING = { in: 5.0, out: 20.0 };
 
 const DAILY_COST_ALERT = Number(process.env.BOT_VENICE_DAILY_COST_ALERT ?? 50);
 
-interface CostEntry {
+export interface CostEntry {
   ts: string;
   model: string;
   promptTokens: number;
@@ -198,21 +198,43 @@ export function veniceRateLimited429Today(): Record<string, number> {
  *
  * Returns: per-model { attempts, failures, rate }.
  */
-export function parseFailureRateByModel(lookback = 10): Record<
-  string,
-  { attempts: number; failures: number; rate: number; idRejected: number; idRejectedWireNames: string[] }
-> {
-  const allCalls = readJsonl<CostEntry>(LOG).filter((e) => e.callSite === "mining_solve");
+/**
+ * Rate evidence goes stale after this many days. Rows older than the window
+ * predate model/config changes (and, before 2026-07-28, a broken accounting
+ * pipeline that never tagged successes) — and without a time bound, a BENCHED
+ * model's last-N rows are frozen forever: gemini-3-1-pro-preview sat at "5/5
+ * parse-fail" from June and could never re-enter the pool, because a sidelined
+ * arm generates no new rows to age the old ones out. Id rejections are exempt
+ * (deterministic evidence — see below).
+ */
+export const PARSE_FAIL_WINDOW_DAYS = Number(process.env.BOT_MODEL_PARSE_FAIL_WINDOW_DAYS ?? 14);
+
+/** Pure aggregation core of {@link parseFailureRateByModel} — testable. */
+export function computeParseFailureRates(
+  calls: CostEntry[],
+  lookback = 10,
+  nowMs = Date.now(),
+): Record<string, { attempts: number; failures: number; rate: number; idRejected: number; idRejectedWireNames: string[] }> {
   // Most-recent first
-  const sorted = [...allCalls].sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime());
+  const sorted = [...calls].sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime());
+  const cutoff = nowMs - PARSE_FAIL_WINDOW_DAYS * 86_400_000;
   const byModel: Record<string, CostEntry[]> = {};
+  const rejectsByModel: Record<string, CostEntry[]> = {};
   for (const e of sorted) {
     if (!e.model) continue;
+    // Rejections of the model ID ITSELF are DETERMINISTIC — the gateway will
+    // refuse this id every time, so one occurrence is proof at any age. They
+    // are never windowed out; a wire-name CHANGE (not time) is what discounts
+    // them, via discountStaleIdRejections.
+    if (e.outcome === "submit-reject") (rejectsByModel[e.model] ??= []).push(e);
+    if (new Date(e.ts).getTime() < cutoff) continue;
     if (!byModel[e.model]) byModel[e.model] = [];
     if (byModel[e.model].length < lookback) byModel[e.model].push(e);
   }
+  const models = new Set([...Object.keys(byModel), ...Object.keys(rejectsByModel)]);
   const result: Record<string, { attempts: number; failures: number; rate: number; idRejected: number; idRejectedWireNames: string[] }> = {};
-  for (const [model, recent] of Object.entries(byModel)) {
+  for (const model of models) {
+    const recent = byModel[model] ?? [];
     // "submit-reject" counts as a failure alongside "parse-fail": a model whose
     // output the GATEWAY refuses is just as worthless as one we can't parse,
     // and costs the same paid solve. Without this the breaker is blind to
@@ -220,28 +242,30 @@ export function parseFailureRateByModel(lookback = 10): Record<
     // its submissions 400'd, so the breaker rated it our healthiest arm for 13
     // days (52 solves, $12.31, zero accepted).
     const failures = recent.filter((e) => e.outcome === "parse-fail" || e.outcome === "submit-reject").length;
+    const rejects = rejectsByModel[model] ?? [];
     result[model] = {
       attempts: recent.length,
       failures,
       rate: recent.length > 0 ? failures / recent.length : 0,
-      // Rejections of the model ID ITSELF are reported separately because they
-      // are DETERMINISTIC — the gateway will refuse this id every time, so one
-      // occurrence is proof, where a parse-fail is only evidence. The breaker
-      // sidelines on a single one instead of waiting for a rate to build.
-      idRejected: recent.filter((e) => e.outcome === "submit-reject").length,
+      idRejected: rejects.length,
       // Which exact wire strings were refused. A caller that has since CHANGED
       // the wire name for this model can disregard rejections of the old one.
       idRejectedWireNames: [
-        ...new Set(
-          recent
-            .filter((e) => e.outcome === "submit-reject")
-            .map((e) => e.wireName)
-            .filter((w): w is string => Boolean(w)),
-        ),
+        ...new Set(rejects.map((e) => e.wireName).filter((w): w is string => Boolean(w))),
       ],
     };
   }
   return result;
+}
+
+export function parseFailureRateByModel(lookback = 10): Record<
+  string,
+  { attempts: number; failures: number; rate: number; idRejected: number; idRejectedWireNames: string[] }
+> {
+  return computeParseFailureRates(
+    readJsonl<CostEntry>(LOG).filter((e) => e.callSite === "mining_solve"),
+    lookback,
+  );
 }
 
 /**

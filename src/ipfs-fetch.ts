@@ -38,6 +38,12 @@ export function fallbackGateways(): string[] {
 export function traceTextFromGatewayBody(body: string): string | null {
   const trimmed = body.trim();
   if (!trimmed) return null;
+  // An HTML document is a gateway error/interstitial page, never a trace
+  // (traces are markdown or a JSON wrapper). This is the ONLY path where an
+  // HTTP body can become "trace" text without JSON.parse vetting it — letting
+  // an error page through would record it into the near-dupe cache and abstain
+  // every subsequent error page against it.
+  if (/^<(?:!doctype|html|head|body)\b/i.test(trimmed)) return null;
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     try {
       const dug = traceTextFromIpfsPayload(JSON.parse(trimmed));

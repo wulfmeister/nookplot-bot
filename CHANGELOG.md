@@ -4,7 +4,69 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
-## 2026-08-05 — the fixes a dead session left behind
+## 2026-08-05 (second pass) — roster repair, the self-poisoning near-dupe cache, CID hardening, and a reputation blind spot
+
+Four items from the morning's review, each investigated against live data
+before touching code.
+
+- **kimi-k3 out, gemini-3-1-pro-preview in.** Kimi is dead at the wire: the
+  gateway's modelUsed validator rejected the bare id 3x AND the org/Model form
+  ("moonshotai/Kimi-K3", 07-30) — disproving the hypothesis that the validator
+  accepts HF-style names; it matches a recognition list, so no override can
+  save an unrecognized model. 0 acceptances ever, $2.24 burned. Gemini is the
+  replacement because it is the only candidate that is simultaneously a 4th
+  distinct frontier provider, non-beta, correctly priced in our table, and
+  wire-name-proven (27 historical gateway acceptances — zero of the risk that
+  killed GLM and kimi). Its 07-09 removal-for-cause is discounted: the 5/5
+  parse-fail record dates from June under the pre-07-28 breaker bug (successes
+  never tagged) and an unsupported reasoning_effort=xhigh — now pinned to
+  "high" per the live catalog.
+- **The breaker needed an evidence window to make the re-add possible at all.**
+  parseFailureRateByModel took the last-10 rows per model at ANY age, and a
+  benched model generates no new rows — so gemini's June record was a
+  permanent bench no matter how good the model is today. Rate evidence now
+  ages out after 14 days (BOT_MODEL_PARSE_FAIL_WINDOW_DAYS); id rejections
+  deliberately do NOT age (deterministic evidence — a wire-name change
+  discounts them, time doesn't), so kimi stays condemned if ever re-added.
+- **The near-dupe cache was poisoning itself ~5x/day.** 74 confirmed cases
+  since 07-21: a legitimate submission processed twice matched its OWN cached
+  snippet at 100% and was falsely abstained. The 07-31 review blamed the two
+  recordTraceSeen call sites; that mechanism is factually wrong (the branches
+  are mutually exclusive). The real routes: the verify poll is a non-awaiting
+  setInterval with no re-entrancy guard while a worked batch takes >5 min, so
+  polls overlap and re-select in-flight subs (32/74); defer→retry within the
+  6h gate (33/74); daemon restarts. Fixed three ways: the near-dupe corpus now
+  excludes the submission's own cache entries (kills the false abstain on
+  every route — farm siblings have different ids, so anti-farm is unchanged),
+  recordTraceSeen is idempotent per id, and the poll got a re-entrancy guard.
+  With verify SUPPLY-bound, ~5 falsely-discarded genuine verifies/day was
+  material to the binding constraint.
+- **CID/IPFS hardening — without loosening any gate.** The investigation
+  overturned the framing: the "IPFS 502 storm" is mostly ANOTHER farm variant
+  (297 distinct never-pinned CIDs, mixed-case base58-valid, embedded in
+  fixed-length `[Ref:W46_…]` template summaries), and the feared error-HTML
+  cache poisoning had NOT happened (0 of 6,507 cache entries; the len=821
+  "error pages" were farm templates). What shipped: one bounded retry on a
+  primary-gateway 5xx before public fallback (the 12 real strike-burn cases
+  were CIDs pinned only on the Nookplot node, invisible to ipfs.io); an HTML
+  document guard on the public-gateway body path (the one place HTTP text can
+  become "trace" without JSON.parse vetting it); permanent CID verdicts now
+  persist across restarts (14d TTL — every launchd restart was re-spending a
+  detail GET + often a comprehension POST on ~770 dead-CID spam subs); a
+  zero-FP tightening that rejects base58-valid CIDs whose tail is pure
+  lowercase hex (P(real)≈1e-26, ~30 slipped through and burned 2×15s public
+  timeouts each); and warn-once/first-line log hygiene on the spam paths.
+- **The reputation "bleed" is decay-by-design and economically ~nothing — but
+  it exposed a real blind spot.** The commits dimension is network
+  workspace-project commits (+250 each, exponential decay λ≈0.387%/day,
+  half-life 179d); one gated project submission per month fully offsets it,
+  and no earning surface consumes the score (rank stays top 2% for years even
+  at zero commits; the weekly tier pool has paid us nothing in 331 epochs).
+  No maintenance loop built — manufacturing commits would contradict our own
+  anti-slop gates. The real fix: dimension-watch logged only 5 of the 10
+  dimensions (mirroring the SDK's stale type), so content=5000, social=2500,
+  citations=3750 were never observed — "citations were never measurable"
+  (10191c0) was false at the dimension level. All 10 now logged.
 
 The 07-31 overnight review (12 agents) root-caused the 27.9h verify blackout:
 ~86% of the pool is farm spam we rightly abstain on, **plus** two bugs of our

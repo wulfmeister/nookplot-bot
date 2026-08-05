@@ -77,7 +77,7 @@ import {
   hasLocalOnboardingRecord,
 } from "../onboarding.js";
 import { normalizeWorkspaceContent, statusForRegion, REGION_DEFAULT_STATUS } from "../workspace-solve.js";
-import { traceTextFromIpfsPayload, isWellFormedCid, cidRejectReason, isPermanentCidError, extractTraceCid, cidBearingKeys } from "../trace-payload.js";
+import { traceTextFromIpfsPayload, isWellFormedCid, cidRejectReason, isPermanentCidError, isTransientIpfsGatewayError, extractTraceCid, cidBearingKeys } from "../trace-payload.js";
 import { traceTextFromGatewayBody, fallbackGateways, fetchTraceViaPublicGateways } from "../ipfs-fetch.js";
 import {
   SkipCache,
@@ -122,9 +122,9 @@ import {
   descriptionSimilarity, isGateRelaxed, fallbackDomainOrder,
 } from "../challenge-posting.js";
 import { findRepetitiveLearning, findLearningMotifCollision } from "../learnings.js";
-import { findTemplateFingerprint, isFarmChallengeTitle, findNearDuplicateTrace, applyOffTopicClamp } from "../trace-fingerprint.js";
+import { findTemplateFingerprint, isFarmChallengeTitle, findNearDuplicateTrace, nearDupeCorpus, applyOffTopicClamp } from "../trace-fingerprint.js";
 import { scoreIntentFit } from "../manifest-intents.js";
-import { veniceRateLimited429Today } from "../venice-cost.js";
+import { veniceRateLimited429Today, computeParseFailureRates, type CostEntry } from "../venice-cost.js";
 
 // ── models.ts ──────────────────────────────────────────────────────────
 
@@ -152,14 +152,15 @@ describe("models", () => {
     // Non-lean A/B sampling (lean would force the cheap model, pool="lean").
     const savedLean = process.env.BOT_LEAN;
     delete process.env.BOT_LEAN;
-    // Pool as of 2026-07-28 (operator): opus-5 replaced fable-5, kimi-k3 added,
-    // GLM removed (0/52 accepted — the gateway rejects org-prefixed ids).
-    // All four verified against the live Venice catalog + solve-shaped probes.
+    // Pool as of 2026-08-05 (operator): kimi-k3 removed (both wire names
+    // rejected by the gateway validator, 0 acceptances ever), replaced by
+    // gemini-3-1-pro-preview — 4th distinct frontier provider, verified in the
+    // live catalog 2026-08-05, wire name proven by 27 historical acceptances.
     const allowed = new Set([
       "grok-4-5",
       "claude-opus-5",
       "openai-gpt-56-sol",
-      "kimi-k3",
+      "gemini-3-1-pro-preview",
     ]);
     try {
       const seen = new Set<string>();
@@ -187,15 +188,16 @@ describe("models", () => {
         );
       }
       // Reasoning effort is configured ONLY for arms that expose the dial.
-      // Per the live catalog (2026-07-28): grok-4-5 supports low|medium|high,
-      // openai-gpt-56-sol supports up to max, and claude-opus-5 / kimi-k3
-      // report supportsReasoningEffort=false — a value for those would be an
-      // ignored parameter dressed up as a calibration decision.
+      // Per the live catalog (2026-08-05): grok-4-5 and gemini-3-1-pro-preview
+      // support low|medium|high, openai-gpt-56-sol supports up to max, and
+      // claude-opus-5 reports supportsReasoningEffort=false — a value for it
+      // would be an ignored parameter dressed up as a calibration decision.
       assert.equal(effortFor("claude-opus-5"), undefined);
-      assert.equal(effortFor("kimi-k3"), undefined);
-      // And never send an effort a model doesn't accept: grok-4-5 tops out at
-      // "high" (it was set to an unsupported "xhigh" for three weeks).
+      // And never send an effort a model doesn't accept: grok-4-5 and gemini
+      // top out at "high" — gemini ran at an unsupported "xhigh" from 05-24 to
+      // 07-09, plausibly the source of the empty outputs that got it benched.
       assert.equal(effortFor("grok-4-5"), "high");
+      assert.equal(effortFor("gemini-3-1-pro-preview"), "high");
       assert.equal(effortFor("openai-gpt-56-sol"), "high");
     } finally {
       if (savedLean === undefined) delete process.env.BOT_LEAN;
@@ -208,11 +210,13 @@ describe("models", () => {
     assert.equal(p.pool, "default");
   });
 
-  it("effortFor returns xhigh for top-tier models, high for openai-gpt-55", () => {
+  it("effortFor returns xhigh for top-tier models, high where the catalog caps it", () => {
     assert.equal(effortFor("claude-opus-4-7"), "xhigh");
     assert.equal(effortFor("grok-4-3"), "xhigh");
     assert.equal(effortFor("deepseek-v4-pro"), "xhigh");
-    assert.equal(effortFor("gemini-3-1-pro-preview"), "xhigh");
+    // gemini caps at "high" per the live catalog (2026-08-05) — it ran at an
+    // unsupported "xhigh" for weeks, plausibly causing its empty outputs.
+    assert.equal(effortFor("gemini-3-1-pro-preview"), "high");
     assert.equal(effortFor("openai-gpt-55"), "high");
     assert.equal(effortFor("unknown-model"), undefined);
   });
@@ -476,6 +480,22 @@ describe("trace-fingerprint (anti-farm verification abstention)", () => {
     const distinct =
       "We prove the scheduler is starvation-free by exhibiting a variant function on the ready queue; the bound tightens from O(n^2) to O(n log n) when priorities are drawn from a bounded lattice.";
     assert.equal(findNearDuplicateTrace(distinct, seen), null);
+  });
+
+  it("nearDupeCorpus: a submission never near-dupes ITSELF", () => {
+    // The 1bb0a74a incident (2026-07-31): a sub processed twice 25s apart
+    // (overlapping polls) matched its own cached snippet at 100% and a
+    // legitimate trace was falsely abstained — 74 such pairs over 15 days.
+    const trace =
+      "Invariant: leader completeness holds. Failure injection: partition minority. Acceptance: 150ms commit at 20ms RTT, batch+pipe gives +3.5x. HNSW ef=64 reaches 95%@10 in 1.2ms vs IVF 88%. Validated over n=12 trials, CV<1%.";
+    const entries = [{ id: "sub-A", snippet: trace.slice(0, 1500) }];
+    assert.deepEqual(nearDupeCorpus(entries, "sub-A"), [], "own entries must be excluded");
+    assert.equal(findNearDuplicateTrace(trace, nearDupeCorpus(entries, "sub-A")), null);
+    // A farm sibling under a DIFFERENT id still matches — anti-farm unchanged.
+    const hit = findNearDuplicateTrace(trace, nearDupeCorpus(entries, "sub-B"));
+    assert.ok(hit && hit.similarity >= 0.5, "different-id sibling must still match");
+    // Entries with no id (malformed rows) are kept as anti-farm evidence.
+    assert.equal(nearDupeCorpus([{ snippet: "x" }], "sub-A").length, 1);
   });
 
   it("applyOffTopicClamp caps the other dims when correctness detects mismatch", () => {
@@ -1078,6 +1098,20 @@ describe("trace-payload.cidRejectReason (spam vs truncation — kills the phanto
     assert.match(r, /should NOT have been rejected/);
   });
 
+  it("rejects a base58-valid Qm CID whose 44-char tail is PURE lowercase hex (digest fake)", () => {
+    // The 0-free hex fakes slip the base58 alphabet check and burned 2×15s
+    // public-gateway timeouts each (~30 seen 08-01→05). P(a real base58btc
+    // hash lands entirely in [1-9a-f]) = (15/58)^44 ≈ 1e-26 — zero-FP rule.
+    const fake = "Qm" + "1a2b3c4d5e6f".repeat(4).slice(0, 44);
+    assert.equal(fake.length, 46);
+    assert.equal(isWellFormedCid(fake), false);
+    assert.match(cidRejectReason(fake), /pure lowercase hex/i);
+    assert.match(cidRejectReason(fake), /correct skip/);
+    // A single non-hex base58 char anywhere makes it plausible again.
+    const plausible = "Qm" + "g" + "1a2b3c4d5e6f".repeat(4).slice(0, 43);
+    assert.equal(isWellFormedCid(plausible), true);
+  });
+
   it("describes non-Qm truncation and junk", () => {
     assert.match(cidRejectReason("a".repeat(20)), /len=20 \(<40\)/);
     assert.match(cidRejectReason("b".repeat(40) + "/.."), /non-alphanumeric/);
@@ -1085,6 +1119,19 @@ describe("trace-payload.cidRejectReason (spam vs truncation — kills the phanto
 });
 
 describe("ipfs-fetch (public-gateway fallback for 502'd verify trace fetches)", () => {
+  it("traceTextFromGatewayBody rejects HTML documents (error pages are not traces)", () => {
+    // A public gateway can 200 with an HTML interstitial/error page. This is
+    // the ONLY path where an HTTP body becomes "trace" text without JSON.parse
+    // vetting it — an admitted error page would enter the near-dupe cache and
+    // abstain every later error page against it.
+    assert.equal(traceTextFromGatewayBody("<!DOCTYPE html><html><body>502 Bad Gateway</body></html>"), null);
+    assert.equal(traceTextFromGatewayBody('  <html lang="en"><head><title>Error</title>'), null);
+    assert.equal(traceTextFromGatewayBody("<HTML><BODY>rate limited</BODY></HTML>"), null);
+    // ...but an HTML tag MENTIONED mid-text is fine — only a document-shaped
+    // body is rejected.
+    assert.equal(traceTextFromGatewayBody("# Trace\nWe render <html> via a sandbox"), "# Trace\nWe render <html> via a sandbox");
+  });
+
   it("traceTextFromGatewayBody returns a raw markdown body untouched", () => {
     assert.equal(traceTextFromGatewayBody("# Trace\n\nstep 1 ...\n"), "# Trace\n\nstep 1 ...");
   });
@@ -1147,6 +1194,19 @@ describe("ipfs-fetch (public-gateway fallback for 502'd verify trace fetches)", 
     } finally {
       globalThis.fetch = realFetch;
     }
+  });
+});
+
+describe("trace-payload.isTransientIpfsGatewayError (bounded 5xx retry gate)", () => {
+  it("classifies gateway 5xx as retriable", () => {
+    assert.ok(isTransientIpfsGatewayError("Gateway request failed (502): <!DOCTYPE html>"));
+    assert.ok(isTransientIpfsGatewayError("Gateway request failed (503): unavailable"));
+    assert.ok(isTransientIpfsGatewayError("Gateway request failed (504): upstream timeout"));
+  });
+  it("never retries permanent CID errors or client errors", () => {
+    assert.equal(isTransientIpfsGatewayError("Gateway request failed (400): Invalid CID format"), false);
+    assert.equal(isTransientIpfsGatewayError("Gateway request failed (404): not found"), false);
+    assert.equal(isTransientIpfsGatewayError("fetch failed"), false);
   });
 });
 
@@ -3784,7 +3844,7 @@ describe("venice-cost.estimateCallCost (real per-model pricing)", () => {
     // A model missing from the table silently falls back to DEFAULT_PRICING,
     // which corrupts the NOOK-per-dollar comparison that decides A/B pruning.
     // Distinct prices prove each arm has its own entry.
-    const costs = ["grok-4-5", "claude-opus-5", "openai-gpt-56-sol", "kimi-k3"]
+    const costs = ["grok-4-5", "claude-opus-5", "openai-gpt-56-sol", "gemini-3-1-pro-preview"]
       .map((m) => estimateCallCost(m, 12000, 8000));
     assert.equal(new Set(costs.map((c) => c.toFixed(6))).size, 4, "arms share a price — one is falling back to the default");
     for (const c of costs) assert.ok(c > 0, "cost must never be zero");
@@ -3840,38 +3900,76 @@ describe("venice-cost reasoning-token accounting (no double-count)", () => {
 
 describe("mining circuit breaker — model-id rejection (deterministic evidence)", () => {
   const base = { attempts: 3, failures: 3, rate: 1.0, idRejected: 0, idRejectedWireNames: [] as string[] };
-  const POOL = ["grok-4-5", "claude-opus-5", "openai-gpt-56-sol", "kimi-k3"];
+  const POOL = ["grok-4-5", "claude-opus-5", "openai-gpt-56-sol", "gemini-3-1-pro-preview"];
 
   it("sidelines on a SINGLE id rejection — no waiting for a rate to build", () => {
     // A modelUsed rejection is deterministic: the gateway will refuse this id
     // every time. GLM burned 52 paid solves and kimi-k3 3 before this existed.
-    const rates = { "kimi-k3": { ...base, attempts: 1, failures: 1, idRejected: 1, idRejectedWireNames: ["kimi-k3"] } };
+    const rates = { "gemini-3-1-pro-preview": { ...base, attempts: 1, failures: 1, idRejected: 1, idRejectedWireNames: ["gemini-3-1-pro-preview"] } };
     const r = filterPoolByParseFailure(POOL, rates);
-    assert.deepEqual(r.sidelined, ["kimi-k3"]);
-    assert.ok(!r.filtered.includes("kimi-k3"));
+    assert.deepEqual(r.sidelined, ["gemini-3-1-pro-preview"]);
+    assert.ok(!r.filtered.includes("gemini-3-1-pro-preview"));
   });
 
   it("a rejection of an OLD wire name does not condemn a corrected one", () => {
     // Otherwise a fixed id could never be tested — the arm stays sidelined on
-    // evidence about a string we no longer send.
-    const rates = { "kimi-k3": { ...base, idRejected: 3, idRejectedWireNames: ["kimi-k3"] } };
+    // evidence about a string we no longer send. GLM's real shape: the
+    // flattened "zai-org-glm-5-2" was refused; gatewayModelName now strips the
+    // prefix, so the recorded rejection is of a string we no longer send.
+    const rates = { "zai-org-glm-5-2": { ...base, idRejected: 3, idRejectedWireNames: ["zai-org-glm-5-2"] } };
     const adjusted = discountStaleIdRejections(rates);
-    assert.equal(adjusted["kimi-k3"].idRejected, 0, "stale name should be discounted");
-    assert.ok(filterPoolByParseFailure(POOL, adjusted).filtered.includes("kimi-k3"));
+    assert.equal(adjusted["zai-org-glm-5-2"].idRejected, 0, "stale name should be discounted");
+    assert.ok(filterPoolByParseFailure(["zai-org-glm-5-2"], adjusted).filtered.includes("zai-org-glm-5-2"));
   });
 
   it("but a rejection of the CURRENT wire name still counts", () => {
-    // gatewayModelName("kimi-k3") is currently the org/Model override.
+    // kimi-k3's real shape after the override was removed (2026-08-05): with
+    // no override, gatewayModelName("kimi-k3") is the bare id — which the
+    // gateway rejected 3x. If kimi were ever re-added to the pool, those
+    // rejections must still sideline it immediately.
     const current = gatewayModelName("kimi-k3");
+    assert.equal(current, "kimi-k3", "override removal means the bare id is what we would send");
     const rates = { "kimi-k3": { ...base, idRejected: 1, idRejectedWireNames: [current] } };
     const adjusted = discountStaleIdRejections(rates);
     assert.equal(adjusted["kimi-k3"].idRejected, 1, "current-name rejection must survive");
-    assert.deepEqual(filterPoolByParseFailure(POOL, adjusted).sidelined, ["kimi-k3"]);
+    assert.deepEqual(filterPoolByParseFailure([...POOL, "kimi-k3"], adjusted).sidelined, ["kimi-k3"]);
   });
 
   it("rows with no recorded wire name are distrusted (safe default)", () => {
     const rates = { "kimi-k3": { ...base, idRejected: 2, idRejectedWireNames: [] } };
     assert.equal(discountStaleIdRejections(rates)["kimi-k3"].idRejected, 2);
+  });
+
+  it("stale parse-fail rows age out of the evidence window — a benched model can re-enter", () => {
+    // gemini-3-1-pro-preview's real shape at re-add (2026-08-05): exactly 5
+    // parse-fails, all from June (pre-breaker-fix, pre-effort-fix), zero rows
+    // since — a sidelined arm generates no new rows to age the old ones out,
+    // so without the time window this was a PERMANENT bench.
+    const NOW = Date.parse("2026-08-05T12:00:00Z");
+    const DAY = 86_400_000;
+    const entry = (daysAgo: number, model: string, outcome: CostEntry["outcome"], wireName?: string): CostEntry => ({
+      ts: new Date(NOW - daysAgo * DAY).toISOString(),
+      model, promptTokens: 1000, completionTokens: 500, totalTokens: 1500, estCost: 0.01,
+      callSite: "mining_solve", outcome, ...(wireName ? { wireName } : {}),
+    });
+    const stale = [50, 52, 55, 58, 62].map((d) => entry(d, "gemini-3-1-pro-preview", "parse-fail"));
+    const rates = computeParseFailureRates(stale, 10, NOW);
+    assert.equal(rates["gemini-3-1-pro-preview"], undefined, "stale-only history must not produce rate evidence");
+    assert.deepEqual(filterPoolByParseFailure(POOL, rates).filtered, POOL);
+
+    // Recent failures still count at full weight...
+    const fresh = [1, 2, 3, 4, 5].map((d) => entry(d, "gemini-3-1-pro-preview", "parse-fail"));
+    const freshRates = computeParseFailureRates(fresh, 10, NOW);
+    assert.equal(freshRates["gemini-3-1-pro-preview"].attempts, 5);
+    assert.equal(freshRates["gemini-3-1-pro-preview"].rate, 1.0);
+    assert.deepEqual(filterPoolByParseFailure(POOL, freshRates).sidelined, ["gemini-3-1-pro-preview"]);
+
+    // ...and id rejections are DETERMINISTIC — they never age out. (A wire-name
+    // CHANGE discounts them, via discountStaleIdRejections; time does not.)
+    const oldReject = [entry(60, "kimi-k3", "submit-reject", "kimi-k3")];
+    const rejectRates = computeParseFailureRates(oldReject, 10, NOW);
+    assert.equal(rejectRates["kimi-k3"].idRejected, 1);
+    assert.deepEqual(rejectRates["kimi-k3"].idRejectedWireNames, ["kimi-k3"]);
   });
 
   it("a healthy arm is untouched", () => {

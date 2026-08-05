@@ -1371,7 +1371,11 @@ function buildProjectReview(): { pending: null | { name: string; slug: string; t
  */
 function buildExperiments(): {
   generatedAt: string;
-  dims: null | { exec: number; collab: number; commits: number; projects: number; lines: number; score: number; velocity: number };
+  dims: null | {
+    exec: number; collab: number; commits: number; projects: number; lines: number;
+    content?: number; social?: number; marketplace?: number; citations?: number; launches?: number;
+    score: number; velocity: number;
+  };
   trend: null | { snapshots: number; firstTs: string; lastTs: string; execDelta: number; collabDelta: number; scoreDelta: number };
   exec: {
     reruns: number; matchTrue: number; matchFalse: number; matchUnknown: number; abstains: number; landed: number; verdict: string;
@@ -1383,7 +1387,11 @@ function buildExperiments(): {
     note: string;
   };
 } {
-  const dims = readJsonlSafe<{ ts: string; exec: number; collab: number; commits: number; projects: number; lines: number; score: number; velocity: number }>(
+  const dims = readJsonlSafe<{
+    ts: string; exec: number; collab: number; commits: number; projects: number; lines: number;
+    content?: number; social?: number; marketplace?: number; citations?: number; launches?: number;
+    score: number; velocity: number;
+  }>(
     join(NOOK_DIR, "dimension-watch.jsonl"),
   );
   const last = dims.length ? dims[dims.length - 1] : null;

@@ -78,6 +78,25 @@ export function isFarmChallengeTitle(title: string): boolean {
  */
 export const TRACE_NEAR_DUPE_THRESHOLD = Number(process.env.BOT_VERIFY_TRACE_DUPE_THRESHOLD ?? 0.5);
 
+/**
+ * Corpus for the near-dupe check: prior cached snippets EXCLUDING entries
+ * recorded for the submission itself. Without self-exclusion, a submission
+ * processed twice — overlapping verify polls, a 6h defer→retry, or a daemon
+ * restart — matches its OWN cached copy at 100% and a legitimate trace is
+ * falsely abstained: 74 confirmed clean→"100% near-dupe" pairs between
+ * 07-21 and 08-05 (~5/day) before this fix. Farm siblings have different
+ * submission ids, so anti-farm detection is unchanged. Pure — testable.
+ */
+export function nearDupeCorpus(
+  entries: Array<{ id?: string; snippet?: string }>,
+  selfId: string,
+): string[] {
+  return entries
+    .filter((e) => e.id !== selfId)
+    .map((e) => e.snippet ?? "")
+    .filter(Boolean);
+}
+
 export function findNearDuplicateTrace(
   trace: string,
   priorSnippets: string[],

@@ -854,12 +854,13 @@ async function trySolve(
  * wrong guess costs one solve rather than dozens.
  */
 const GATEWAY_MODEL_NAME_OVERRIDES: Record<string, string> = {
-  // kimi-k3 was rejected 3x as a bare id (2026-07-29/30). Moonshot publishes
-  // Kimi on HuggingFace under the `moonshotai` org, so this is the org/Model
-  // form the validator's own example endorses. UNVERIFIED — if the next
-  // submission is rejected again, drop kimi from the pool rather than guess a
-  // third time.
-  "kimi-k3": "moonshotai/Kimi-K3",
+  // Empty since 2026-08-05. The kimi-k3 → "moonshotai/Kimi-K3" hypothesis was
+  // DISPROVEN: the gateway rejected the org/Model form too (07-30T18:52,
+  // "doesn't look like a real model name"), so the validator is matching
+  // against a list of names it recognizes, not a shape — an override cannot
+  // fix an unrecognized model. Kimi was dropped from the pool per the stated
+  // policy (0 acceptances across both names, $2.24 burned). Keep the map for
+  // any future model whose recognized name differs from its Venice id.
 };
 
 export function gatewayModelName(model: string): string {

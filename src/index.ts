@@ -6,10 +6,10 @@ import { chat, VENICE_WEB_SEARCH, assertVeniceKey } from "./venice.js";
 import { pickModel, pickModelAB } from "./models.js";
 import { runsInLean, leanBanner } from "./lean.js";
 import { NOOK_DIR, appendJsonl, extractJson, readJsonl, readJsonlTail, sleep } from "./util.js";
-import { findTemplateFingerprint, findNearDuplicateTrace, applyOffTopicClamp } from "./trace-fingerprint.js";
+import { findTemplateFingerprint, findNearDuplicateTrace, nearDupeCorpus, applyOffTopicClamp } from "./trace-fingerprint.js";
 import { webSearch, arxivSearch, formatResultsForPrompt, type SearchResult } from "./research.js";
 import { refine } from "./refine.js";
-import { traceTextFromIpfsPayload, isWellFormedCid, cidRejectReason, isPermanentCidError, extractTraceCid, cidBearingKeys, type CidStatus } from "./trace-payload.js";
+import { traceTextFromIpfsPayload, isWellFormedCid, cidRejectReason, isPermanentCidError, isTransientIpfsGatewayError, extractTraceCid, cidBearingKeys, type CidStatus } from "./trace-payload.js";
 import { fetchTraceViaPublicGateways } from "./ipfs-fetch.js";
 import { computeVerifyBatch, pollsRemainingBeforeUtcReset } from "./verify-batch.js";
 import { VERIFY_CALIBRATION_PROMPT } from "./verify-calibration.js";
@@ -95,20 +95,67 @@ const KNOWLEDGE_LOG = join(NOOK_DIR, "knowledge-published.jsonl");
 // WITHOUT a /verify POST. See src/trace-fingerprint.ts for the evidence.
 const VERIFY_TRACE_CACHE = join(NOOK_DIR, "verify-trace-cache.jsonl");
 
-/** Reason to abstain from verifying this trace, or null to proceed. */
-function verifyAbstainReason(traceText: string): string | null {
+// Warn-once registry for malformed (spam) CIDs — the pool re-surfaces the same
+// fakes every poll; the skip decision is unchanged, only the log noise is.
+const malformedCidWarned = new Set<string>();
+
+/**
+ * Permanent CID verdicts, persisted across restarts. All other skip state is
+ * in-memory, so every launchd restart re-ran a detail GET (+ often a
+ * comprehension POST) against the entire dead-CID spam pool (~770 subs at the
+ * 08-05 count). Entries are loaded into finalizedSubmissionSkip at boot — the
+ * poll filter and verifyOneSubmission already honor that cache, so no new
+ * checks are needed. Append-only; entries older than the TTL are ignored at
+ * load, which keeps a restart from resurrecting stale verdicts.
+ */
+const PERMANENT_CID_SKIPS = join(NOOK_DIR, "permanent-cid-skips.jsonl");
+const PERMANENT_CID_SKIP_TTL_MS = 14 * 24 * 3600_000;
+
+function persistPermanentCidSkip(id: string, reason: string): void {
+  finalizedSubmissionSkip.markFor(id, PERMANENT_CID_SKIP_TTL_MS);
+  appendJsonl(PERMANENT_CID_SKIPS, { ts: new Date().toISOString(), id, reason });
+}
+
+function loadPermanentCidSkips(): number {
+  let restored = 0;
+  for (const e of readJsonl<{ ts?: string; id?: string }>(PERMANENT_CID_SKIPS)) {
+    if (!e.id || !e.ts) continue;
+    const until = new Date(e.ts).getTime() + PERMANENT_CID_SKIP_TTL_MS;
+    if (until > Date.now()) {
+      finalizedSubmissionSkip.markUntil(e.id, until);
+      restored++;
+    }
+  }
+  return restored;
+}
+
+/**
+ * Reason to abstain from verifying this trace, or null to proceed. Takes the
+ * submission id so the near-dupe check can exclude the submission's OWN cache
+ * entries — without that, a sub processed twice (overlapping polls, defer→
+ * retry, restart) self-matched at 100% and was falsely abstained (~5/day).
+ */
+function verifyAbstainReason(subId: string, traceText: string): string | null {
   if (traceText.length < 200) return null; // CID-broken paths handle themselves downstream
   const fp = findTemplateFingerprint(traceText);
   if (fp) return `template fingerprint "${fp}"`;
-  const prior = readJsonlTail<{ snippet?: string }>(VERIFY_TRACE_CACHE, 60).map((e) => e.snippet ?? "");
-  const dupe = findNearDuplicateTrace(traceText, prior);
+  const prior = readJsonlTail<{ id?: string; snippet?: string }>(VERIFY_TRACE_CACHE, 60);
+  const dupe = findNearDuplicateTrace(traceText, nearDupeCorpus(prior, subId));
   if (dupe) return `${Math.round(dupe.similarity * 100)}% near-dupe of a recently seen trace`;
   return null;
 }
 
-/** Remember every trace we saw (clean or abstained) for the near-dupe check. */
+/**
+ * Remember every trace we saw (clean or abstained) for the near-dupe check.
+ * Idempotent per submission id (in-memory): re-processing a sub must not append
+ * a second copy — duplicate records crowded genuine traces out of the 60-entry
+ * anti-farm window (817 duplicate pairs measured 07-21→08-05).
+ */
+const recordedTraceIds = new Set<string>();
 function recordTraceSeen(subId: string, traceText: string, abstained: string | null): void {
   if (traceText.length < 200) return;
+  if (recordedTraceIds.has(subId)) return;
+  recordedTraceIds.add(subId);
   appendJsonl(VERIFY_TRACE_CACHE, {
     ts: new Date().toISOString(),
     id: subId,
@@ -690,17 +737,34 @@ async function fetchSubmissionTrace(
   let cidStatus: CidStatus = traceCid ? "transient" : "none";
   if (traceCid) {
     if (!isWellFormedCid(traceCid)) {
-      // Truncated/placeholder CID — don't even spend the round-trip.
+      // Truncated/placeholder CID — don't even spend the round-trip. Warn once
+      // per CID: the spam pool re-surfaces the same fakes every poll and each
+      // one was a fresh log line (475 in 5 days).
       cidStatus = "permanent";
-      console.warn(`   ⚠ trace CID malformed (${traceCid.slice(0, 16)}…): ${cidRejectReason(traceCid)} — permanent skip`);
+      if (!malformedCidWarned.has(traceCid)) {
+        malformedCidWarned.add(traceCid);
+        console.warn(`   ⚠ trace CID malformed (${traceCid.slice(0, 16)}…): ${cidRejectReason(traceCid)} — permanent skip`);
+      }
     } else {
       let fullTrace: string | null = null;
       let fetchErr: string | null = null;
-      try {
-        const payload = await runtime.connection.request("GET", `/v1/ipfs/${encodeURIComponent(traceCid)}`);
-        fullTrace = traceTextFromIpfsPayload(payload);
-      } catch (err) {
-        fetchErr = (err as Error).message;
+      // One bounded retry on a transient 5xx from the primary gateway: a CID
+      // pinned only on the Nookplot node is invisible to the public fallback,
+      // so a single 502 blip was burning fetch strikes on real submissions.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const payload = await runtime.connection.request("GET", `/v1/ipfs/${encodeURIComponent(traceCid)}`);
+          fullTrace = traceTextFromIpfsPayload(payload);
+          fetchErr = null;
+          break;
+        } catch (err) {
+          fetchErr = (err as Error).message;
+          if (attempt === 0 && isTransientIpfsGatewayError(fetchErr)) {
+            await sleep(4000);
+            continue;
+          }
+          break;
+        }
       }
       // Gateway 502 / timeout / empty payload → try public IPFS gateways before
       // giving up, so a flaky gateway doesn't leave verify slots unused while
@@ -724,7 +788,9 @@ async function fetchSubmissionTrace(
       // Still nothing after the fallback — classify for the re-defer decision.
       if (fetchErr) {
         cidStatus = isPermanentCidError(fetchErr) ? "permanent" : "transient";
-        console.warn(`   ⚠ trace CID fetch failed (${traceCid.slice(0, 12)}): ${fetchErr.slice(0, 140)}`);
+        // First line only — gateway 502 bodies are multi-line HTML fragments
+        // that smeared ~3 raw lines into the log per failure.
+        console.warn(`   ⚠ trace CID fetch failed (${traceCid.slice(0, 12)}): ${fetchErr.split("\n")[0].slice(0, 140)}`);
       }
       // else: 200-but-empty and public fallback also empty → leave as transient
       // (the trace may pin/propagate later; a later poll will retry).
@@ -859,7 +925,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
     console.log(`   📄 trace source=${fetchedTrace.source} len=${fetchedTrace.trace.length}`);
     // Anti-farm abstention: withhold the quorum increment entirely — a low
     // score would still advance the spam toward payment.
-    const abstain = verifyAbstainReason(fetchedTrace.trace);
+    const abstain = verifyAbstainReason(sub.id, fetchedTrace.trace);
     recordTraceSeen(sub.id, fetchedTrace.trace, abstain);
     if (abstain) {
       verifiedSubmissions.add(sub.id);
@@ -893,6 +959,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
       const gateNote = questions.length > 0 ? " (comprehension-gated)" : "";
       if (fetchedTrace.cidStatus === "permanent") {
         verifiedSubmissions.add(sub.id);
+        persistPermanentCidSkip(sub.id, "malformed/invalid trace CID");
         console.log(`   ⏭ trace CID permanently invalid${gateNote} — skipping ${sub.id.slice(0, 8)} (no re-defer)`);
         return true;
       }
@@ -901,6 +968,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
       if (recordFetchStrikeAndShouldRetire(sub.id)) {
         verifiedSubmissions.add(sub.id);
         traceFetchStrikes.delete(sub.id);
+        persistPermanentCidSkip(sub.id, `trace unfetchable after ${FETCH_STRIKE_LIMIT} strikes (dead/unpinned CID)`);
         console.log(`   ⏭ trace persistently unfetchable (${FETCH_STRIKE_LIMIT} strikes${gateNote}) — retiring ${sub.id.slice(0, 8)} (dead/unpinned CID)`);
         return true;
       }
@@ -1040,7 +1108,7 @@ async function verifyArtifactSubmission(runtime: ReturnType<typeof getRuntime>, 
     const fetchedTrace = await fetchSubmissionTrace(runtime, sub);
     // Anti-farm abstention — same gate as the standard path (the farm posts
     // artifact kinds too, and a rerun of templated junk still grants quorum).
-    const abstain = verifyAbstainReason(fetchedTrace.trace);
+    const abstain = verifyAbstainReason(sub.id, fetchedTrace.trace);
     recordTraceSeen(sub.id, fetchedTrace.trace, abstain);
     if (abstain) {
       verifiedSubmissions.add(sub.id);
@@ -1206,6 +1274,12 @@ async function recordDimensionSnapshot(runtime: ReturnType<typeof getRuntime>): 
       breakdown?: Record<string, number>;
     };
     const b = c.breakdown ?? {};
+    // All 10 gateway dimensions. The row logged only 5 until 2026-08-05 —
+    // mirroring the SDK's stale 5-dim ScoreBreakdown type — which left
+    // content=5000, social=2500, citations=3750, marketplace, launches
+    // entirely unobserved: three large dims whose movement (or decay, cf. the
+    // commits bleed at λ≈0.387%/day) was invisible and would have been
+    // mis-attributed to the logged five.
     const row = {
       ts: new Date().toISOString(),
       score: c.score ?? 0,
@@ -1215,20 +1289,40 @@ async function recordDimensionSnapshot(runtime: ReturnType<typeof getRuntime>): 
       projects: b.projects ?? 0,
       lines: b.lines ?? 0,
       collab: b.collab ?? 0,
+      content: b.content ?? 0,
+      social: b.social ?? 0,
+      marketplace: b.marketplace ?? 0,
+      citations: b.citations ?? 0,
+      launches: b.launches ?? 0,
       artifactRerunsThisProcess: artifactRerunCount,
     };
     appendJsonl(join(NOOK_DIR, "dimension-watch.jsonl"), row);
     console.log(
-      `📐 dims: exec=${row.exec} collab=${row.collab} commits=${row.commits} projects=${row.projects} lines=${row.lines} | reruns(this proc)=${artifactRerunCount}`,
+      `📐 dims: exec=${row.exec} collab=${row.collab} commits=${row.commits} projects=${row.projects} lines=${row.lines} ` +
+      `content=${row.content} social=${row.social} marketplace=${row.marketplace} citations=${row.citations} launches=${row.launches} | reruns(this proc)=${artifactRerunCount}`,
     );
   } catch (err) {
     console.warn(`📐 dimension snapshot failed: ${(err as Error).message.slice(0, 100)}`);
   }
 }
 
+/**
+ * Re-entrancy guard: the poll runs on a non-awaiting setInterval(5 min), but a
+ * batch of ≥5 worked subs takes ≥350s of pacing sleeps — overlap is structural.
+ * Overlapping polls re-selected in-flight submissions (invisible to
+ * `verifiedSubmissions`, which is only marked at pass END), producing duplicate
+ * fetch/comprehension work, 429 self-amplification, and near-dupe SELF-matches
+ * (32 of the 74 measured false abstains had a <5min gap between passes).
+ */
+let verifyPollInFlight = false;
+
 async function pollVerifiableSubmissions(runtime: ReturnType<typeof getRuntime>) {
   if (config.dryRun) {
     console.log("💎 (DRY_RUN — skipping verification poll)");
+    return;
+  }
+  if (verifyPollInFlight) {
+    console.log("💎 previous verification poll still running — skipping this tick");
     return;
   }
   // Re-sync the local counter to the rolling-24h shared count (matches the
@@ -1242,6 +1336,7 @@ async function pollVerifiableSubmissions(runtime: ReturnType<typeof getRuntime>)
     return;
   }
   if (verifyDailyCount >= VERIFY_DAILY_CAP) return;
+  verifyPollInFlight = true;
   try {
     const res = (await runtime.connection.request(
       "GET",
@@ -1418,10 +1513,14 @@ async function pollVerifiableSubmissions(runtime: ReturnType<typeof getRuntime>)
     }
   } catch (err) {
     console.warn(`   ⚠ verification poll error: ${(err as Error).message}`);
+  } finally {
+    verifyPollInFlight = false;
   }
 }
 
 async function startVerificationLoop(runtime: ReturnType<typeof getRuntime>) {
+  const restoredSkips = loadPermanentCidSkips();
+  if (restoredSkips > 0) console.log(`💎 restored ${restoredSkips} permanent CID skip(s) from disk`);
   setTimeout(() => pollVerifiableSubmissions(runtime), 30 * 1000);
   verificationInterval = setInterval(() => pollVerifiableSubmissions(runtime), 5 * 60 * 1000);
   // Dimension-watch: snapshot the builder dims every 30 min to attribute exec/
