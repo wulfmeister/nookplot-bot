@@ -4,6 +4,39 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-08-05 — the fixes a dead session left behind
+
+The 07-31 overnight review (12 agents) root-caused the 27.9h verify blackout:
+~86% of the pool is farm spam we rightly abstain on, **plus** two bugs of our
+own. The session died mid-turn before applying either fix, and the findings sat
+in a tmp file for five days (now preserved at
+`~/.nookplot/reports/2026-07-31-overnight-review-12agent.json`). Applied today:
+
+- **Own-challenge submissions were filtered too late.** The guard lived inside
+  `verifyOneSubmission`, *after* batch selection — so when our own posts
+  dominated the pool (self-amplified by the 07-30 rescue/expert changes raising
+  posting to 3-4/day), every batch slot went to a no-op skip: 68 skips across
+  11 consecutive polls, zero verify attempts. Own-challenge subs are now
+  excluded at poll selection (with a count log); the in-function guard stays as
+  a backstop for the artifact path.
+- **The 70s pacing sleep was unconditional.** Every no-op skip still cost 70s
+  of the verify loop's budget. `verifyOneSubmission` now reports whether it
+  actually did gateway work, and the sleep is only paid when it did.
+- **`verifier_unavailable` was read as a real mismatch.** The gateway reports a
+  down runner as a *completed* rerun (`outcomesMatch=false`,
+  `rerunOutcome={pass:false, kind_specific:{reason:"verifier_unavailable"}}`),
+  which took `decideFromRerun`'s abstain branch — 8/8 of the window's
+  match=false results were this shape, so BOT_VERIFY_ARTIFACTS starved whenever
+  the gateway's runner was down (and the flag front-loads exactly that path).
+  The infra reason now routes to the existing inconclusive fallback (verify at
+  1.0 from the submit-time gate). Genuine non-reproductions still abstain.
+
+Not applied (flagged for a decision): the same review found the artifact path
+double-records traces into the near-dupe cache (`recordTraceSeen` at both the
+standard and artifact call sites), self-poisoning at least one clean submission
+into a "100% near-dupe" abstain. Left alone today because it wasn't in the
+approved scope; it deserves its own look.
+
 ## 2026-07-28–30 — a 53h blackout, three self-inflicted bugs, and one loop that never worked
 
 A week of finding things that were quietly broken rather than adding features.

@@ -799,31 +799,38 @@ function clampScore01(n: unknown): number {
 // `exec` movement in the dimension-watch to test the exec hypothesis.
 let artifactRerunCount = 0;
 
-async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: VerifiableSubmission) {
-  if (verifiedSubmissions.has(sub.id)) return;
-  if (isComprehensionGated(sub.id)) return;
-  if (finalizedSubmissionSkip.isSkipped(sub.id)) return;
+/**
+ * Returns true when the submission was actually WORKED (any gateway/IPFS call
+ * happened — verify, abstain-after-fetch, defer, error), false on a pure-local
+ * no-op skip. The caller uses this to decide whether the 70s pacing sleep is
+ * owed: sleeping after no-ops let a batch of own-challenge skips burn 11
+ * consecutive polls doing nothing (07-31 verify blackout).
+ */
+async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: VerifiableSubmission): Promise<boolean> {
+  if (verifiedSubmissions.has(sub.id)) return false;
+  if (isComprehensionGated(sub.id)) return false;
+  if (finalizedSubmissionSkip.isSkipped(sub.id)) return false;
   if (sub.solver_address && solverDiversityBlockedUntil.isSkipped(sub.solver_address.toLowerCase())) {
     verifiedSubmissions.add(sub.id);
-    return;
+    return false;
   }
   if (sub.solver_address && reciprocalVerifierSkipUntil.isSkipped(sub.solver_address.toLowerCase())) {
     verifiedSubmissions.add(sub.id);
-    return;
+    return false;
   }
   // Honor the shared gateway cap (verifies + crowd-jury combined). Once we've
   // hit the cap or seen a 429 today, we stop attempting to avoid the SDK
   // retry storm visible in the logs.
   if (!canVerifyNow()) {
     verifiedSubmissions.add(sub.id);
-    return;
+    return false;
   }
-  if (verifyDailyCount >= VERIFY_DAILY_CAP) return;
+  if (verifyDailyCount >= VERIFY_DAILY_CAP) return false;
   // EXPERIMENT (additive): when BOT_VERIFY_ARTIFACTS=1, code-executing verifiable
   // kinds get the rerun-based verify path below instead of being skipped. Every
   // other non-standard kind (crowd_jury/prediction/exact_answer) skips as before.
   const tryArtifacts = process.env.BOT_VERIFY_ARTIFACTS === "1" && isRerunnableKind(sub.verifier_kind);
-  if (sub.verifier_kind && sub.verifier_kind !== "standard" && !tryArtifacts) return;
+  if (sub.verifier_kind && sub.verifier_kind !== "standard" && !tryArtifacts) return false;
   // Per-solver diversity guard — gateway gates at 3+ verifications of the
   // same solver in 14 days. Pre-skip to avoid the 429 + wasted comprehension call.
   if (sub.solver_address) {
@@ -831,19 +838,20 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
     if (recentCount >= SOLVER_DIVERSITY_CAP) {
       verifiedSubmissions.add(sub.id);
       console.log(`💎 ${sub.id.slice(0, 8)} — diversity skip (${recentCount} prior on solver ${sub.solver_address.slice(0, 10)})`);
-      return;
+      return false;
     }
   }
   // Own-challenge guard — must precede BOTH verify paths (the artifact rerun
-  // path hits the same gateway 403).
+  // path hits the same gateway 403). Normally pre-filtered at poll selection;
+  // this is the belt-and-braces backstop for any other caller.
   if (sub.challenge_id && isOwnChallenge(sub.challenge_id)) {
     verifiedSubmissions.add(sub.id);
     console.log(`💎 ${sub.id.slice(0, 8)} — own-challenge skip (we posted ${sub.challenge_id.slice(0, 8)})`);
-    return;
+    return false;
   }
   if (tryArtifacts) {
     await verifyArtifactSubmission(runtime, sub);
-    return;
+    return true;
   }
   try {
     console.log(`💎 verifying submission ${sub.id.slice(0, 8)} (challenge=${sub.challenge_id?.slice(0, 8)}, kind=${sub.verifier_kind ?? "standard"})`);
@@ -856,7 +864,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
     if (abstain) {
       verifiedSubmissions.add(sub.id);
       console.log(`   ⛔ abstain — ${abstain}; no quorum credit, no verify slot spent`);
-      return;
+      return true;
     }
     // Probe comprehension FIRST — it decides whether a missing full trace is
     // actually fatal. Comprehension answers are graded by cosine similarity
@@ -874,7 +882,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
     } catch (err) {
       console.warn(`   ⚠ comprehension request failed: ${(err as Error).message}`);
       verifiedSubmissions.add(sub.id);
-      return;
+      return true;
     }
     // Full trace unavailable. If comprehension is required (or the salvage is
     // disabled via BOT_VERIFY_DETAIL_FALLBACK=0) we can't pass: skip (permanent
@@ -886,7 +894,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
       if (fetchedTrace.cidStatus === "permanent") {
         verifiedSubmissions.add(sub.id);
         console.log(`   ⏭ trace CID permanently invalid${gateNote} — skipping ${sub.id.slice(0, 8)} (no re-defer)`);
-        return;
+        return true;
       }
       // Deterministic 502s mean dead/unpinned content — retire after a few
       // strikes instead of re-deferring every 6h indefinitely.
@@ -894,11 +902,11 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
         verifiedSubmissions.add(sub.id);
         traceFetchStrikes.delete(sub.id);
         console.log(`   ⏭ trace persistently unfetchable (${FETCH_STRIKE_LIMIT} strikes${gateNote}) — retiring ${sub.id.slice(0, 8)} (dead/unpinned CID)`);
-        return;
+        return true;
       }
       markComprehensionGated(sub.id);
       console.log(`   ⏭ full trace unavailable (CID fetch failed${gateNote}) — deferring ${sub.id.slice(0, 8)} for ${COMPREHENSION_GATE_TTL_MS / 3600_000}h (strike ${traceFetchStrikes.get(sub.id)}/${FETCH_STRIKE_LIMIT})`);
-      return;
+      return true;
     }
     if (traceUnavailable) {
       console.log(`   🩹 no comprehension gate — verifying ${sub.id.slice(0, 8)} from detail summary (full trace unavailable)`);
@@ -912,19 +920,19 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
       } catch (err) {
         console.warn(`   ⚠ comprehension answers failed: ${(err as Error).message}`);
         verifiedSubmissions.add(sub.id);
-        return;
+        return true;
       }
     }
     const scored = await scoreSubmissionTrace(fetchedTrace.trace, sub.domain_tags ?? []);
     if (!scored) {
       console.warn(`   ⚠ score parse fail for ${sub.id.slice(0, 8)}`);
       verifiedSubmissions.add(sub.id);
-      return;
+      return true;
     }
     if (scored.skip) {
       console.log(`   → skip: ${scored.skip}`);
       verifiedSubmissions.add(sub.id);
-      return;
+      return true;
     }
     if (scored.justification.length < 50) {
       scored.justification = (scored.justification + " " + fetchedTrace.trace.slice(0, 120)).slice(0, 500);
@@ -1013,6 +1021,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
       console.warn(`   ⚠ verify error for ${sub.id.slice(0, 8)}: ${msg.slice(0, 200)}`);
     }
   }
+  return true;
 }
 
 /**
@@ -1241,9 +1250,22 @@ async function pollVerifiableSubmissions(runtime: ReturnType<typeof getRuntime>)
     // Exclude already-handled subs AND those currently in their 6h defer
     // window. Without the gate filter, deferred (dead/transient) subs still
     // get selected into the batch and then no-op in verifyOneSubmission —
-    // eating batch slots that should go to fetchable submissions.
-    const subs = (res.submissions ?? []).filter(
-      (s) => !verifiedSubmissions.has(s.id) && !isComprehensionGated(s.id) && !finalizedSubmissionSkip.isSkipped(s.id),
+    // eating batch slots that should go to fetchable submissions. Own-challenge
+    // subs are excluded here for the same reason: the in-function guard fires
+    // AFTER batch selection, so a pool dominated by our own challenges fills
+    // every slot with no-ops (07-31: 11 consecutive polls, 0 verify attempts,
+    // self-amplified by the rescue/expert changes raising posts to 3-4/day).
+    const raw = res.submissions ?? [];
+    const ownChallengeCount = raw.filter((s) => s.challenge_id && isOwnChallenge(s.challenge_id)).length;
+    if (ownChallengeCount > 0) {
+      console.log(`💎 ${ownChallengeCount} own-challenge sub(s) excluded at poll selection`);
+    }
+    const subs = raw.filter(
+      (s) =>
+        !verifiedSubmissions.has(s.id) &&
+        !isComprehensionGated(s.id) &&
+        !finalizedSubmissionSkip.isSkipped(s.id) &&
+        !(s.challenge_id && isOwnChallenge(s.challenge_id)),
     );
     // Standard reasoning traces are the default surface. EXPERIMENT: when
     // BOT_VERIFY_ARTIFACTS=1 we ALSO fold in code-executing verifiable kinds
@@ -1385,8 +1407,10 @@ async function pollVerifiableSubmissions(runtime: ReturnType<typeof getRuntime>)
     }
     for (const sub of plannedBatch) {
       if (verifyDailyCount >= VERIFY_DAILY_CAP) break;
-      await verifyOneSubmission(runtime, sub);
-      await sleep(70 * 1000);
+      const worked = await verifyOneSubmission(runtime, sub);
+      // Pacing sleep only after real gateway work — a no-op skip must not cost
+      // 70s (07-31: a batch of own-challenge no-ops burned every poll's budget).
+      if (worked) await sleep(70 * 1000);
     }
     // End-of-poll budget telemetry — surfaces under-utilization at a glance.
     if (Number(hoursLeftUtc) <= 4 && verifyDailyCount < VERIFY_DAILY_CAP - 5) {

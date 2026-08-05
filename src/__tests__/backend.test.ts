@@ -3516,6 +3516,33 @@ describe("verify-kinds.decideFromRerun (correctness from independent rerun)", ()
     assert.equal(d.action, "verify");
     assert.match(d.note, /inconclusive|submit-time/);
   });
+
+  it("falls back to 1.0 when match=false is a verifier_unavailable infra failure", () => {
+    // Real shape observed 2026-07-30..31 (8/8 of that window's match=false
+    // results): the gateway reports a down runner as a COMPLETED rerun.
+    const d = decideFromRerun({
+      success: true,
+      outcomesMatch: false,
+      rerunOutcome: { pass: false, kind_specific: { reason: "verifier_unavailable" } },
+    });
+    assert.equal(d.action, "verify");
+    assert.equal(d.action === "verify" && d.correctness, 1.0);
+    assert.match(d.note, /verifier_unavailable|infra/);
+  });
+
+  it("still ABSTAINS on a genuine non-reproduction (match=false without the infra reason)", () => {
+    for (const rerunOutcome of [
+      undefined,
+      null,
+      "exit 1",
+      { pass: false },
+      { pass: false, kind_specific: {} },
+      { pass: false, kind_specific: { reason: "assertion_failed" } },
+    ]) {
+      const d = decideFromRerun({ success: true, outcomesMatch: false, rerunOutcome });
+      assert.equal(d.action, "abstain");
+    }
+  });
 });
 
 // ── instance-lock.ts single-instance daemon lock ────────────────────────
