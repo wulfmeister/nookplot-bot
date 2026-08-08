@@ -4,6 +4,47 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-08-08 — three zombies silence a tracker for four days
+
+`mining-verified.jsonl` recorded nothing after 08-04T08:28Z while verified
+solves kept landing and paying. Root cause is a composition of a gateway-side
+regression and our own head-of-line vulnerability:
+
+- **Gateway side (the trigger):** the network's expiry/finalization job
+  evidently stopped ~08-03. Quorum-stalled submissions used to auto-expire at
+  ~80-94h; since then, nothing submitted 07-31 or later has ever expired —
+  nine subs sit at `status:"submitted"` today, three of them showing
+  verificationCount 3/3 (quorum REACHED) with null scores, never finalized.
+- **Our side (the vulnerability):** the learnings poll walks
+  `candidates.slice(0, 3)` oldest-first, and the only branch that writes
+  nothing is the non-terminal "wait for quorum" one — no backoff, no age-out.
+  Three permanent zombies therefore occupied the entire head window every
+  30-minute tick from 08-04 on, and the 46 newer candidates (including all of
+  gemini's debut solves) were never polled. The "checking N submissions" count
+  climbing 31→79 was the failure signature hiding in plain sight.
+
+Fix: after polling, a candidate still non-terminal past 7 days
+(BOT_LEARNINGS_STUCK_MAX_AGE_DAYS) is recorded as expired and leaves the
+candidate set. 7d safely exceeds the gateway's historical ~94h auto-expiry and
+the 77h late-finalization outlier, and the check runs AFTER the poll so a
+late-verifying sub still gets its real outcome. No scripted backfill: the
+unblocked loop drains the ~79-sub backlog itself at 3 per tick (~13h), posting
+the missed learnings as it goes — a scripted mining-verified-only backfill
+would desync the LEARNING_LOG dedupe and double-write once the loop re-polled.
+Known cosmetic cost: drained rows carry drain-time `ts`, so settlement-lag
+analytics will show a false 4-day spike this week.
+
+Blast radius while it was dark: the verifiable-tilt EV inputs (happened to be
+pointing the right direction anyway), mining-stats pass-rate joins (blind to
+all 18 post-08-04 verified solves — including gemini's, right when arm-pruning
+judgment needs them), and 4 days of unposted post-solve learnings.
+
+Also diagnosed, no action: the "costUsd=0 since 08-03" flag was an
+investigation artifact — that field has never existed in venice-costs.jsonl;
+every consumer reads `estCost`, which is healthy. The gateway finalization
+stall itself is a network-side issue worth adding to the open quorum report
+(nookplot#10) — operator's call.
+
 ## 2026-08-05 (second pass) — roster repair, the self-poisoning near-dupe cache, CID hardening, and a reputation blind spot
 
 Four items from the morning's review, each investigated against live data

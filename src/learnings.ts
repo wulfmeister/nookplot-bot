@@ -27,6 +27,38 @@ interface MiningEntry {
   model?: string;
 }
 
+/**
+ * How long a candidate may sit gateway-side in a NON-terminal status before we
+ * age it out of the poll set. Must safely exceed both the gateway's historical
+ * auto-expiry of quorum-stalled subs (~80-94h, measured on the 08-03 expiry
+ * flush) and the latest late-finalization ever observed (77h). 7 days = >2x
+ * the outlier.
+ */
+const STUCK_SUBMISSION_MAX_AGE_MS = Number(process.env.BOT_LEARNINGS_STUCK_MAX_AGE_DAYS ?? 7) * 86_400_000;
+
+export type StuckPollDecision = "wait" | "age-out";
+
+/**
+ * Decide what to do with a candidate whose polled status is NON-terminal
+ * (anything but verified/rejected/expired). Normally: wait for quorum. But a
+ * submission the gateway never finalizes would otherwise occupy one of the 3
+ * head slots on EVERY tick and starve all newer candidates — the poll window
+ * is `candidates.slice(0, 3)` oldest-first, so 3 permanent zombies silence
+ * the entire loop. That happened 08-04→08-08: the gateway's expiry job
+ * stopped ~08-03, three subs sat at status="submitted" forever (quorum 3/3,
+ * null scores, never finalized), and mining-verified.jsonl recorded nothing
+ * for 4 days while 46 newer candidates queued behind them. A malformed
+ * timestamp waits (safe default) rather than aging out. Pure — testable.
+ */
+export function decideNonTerminalCandidate(
+  submittedTsIso: string,
+  nowMs: number,
+  maxAgeMs = STUCK_SUBMISSION_MAX_AGE_MS,
+): StuckPollDecision {
+  const age = nowMs - Date.parse(submittedTsIso);
+  return Number.isFinite(age) && age > maxAgeMs ? "age-out" : "wait";
+}
+
 /** Persist a terminal verification outcome once per submission (the loop drops
  *  each sub from the candidate set after its terminal branch, so no dupes). */
 function recordMiningOutcome(m: MiningEntry, status: "verified" | "expired" | "rejected"): void {
@@ -387,6 +419,21 @@ export async function publishPostSolveLearnings(
         continue;
       }
       if (status !== "verified") {
+        // Age-out check AFTER polling, so a sub that late-finalizes still gets
+        // its real terminal branch above; only a still-non-terminal zombie is
+        // retired. See decideNonTerminalCandidate for the 08-04→08-08 incident.
+        if (decideNonTerminalCandidate(m.ts, Date.now()) === "age-out") {
+          recordMiningOutcome(m, "expired");
+          appendJsonl(LEARNING_LOG, {
+            ts: new Date().toISOString(),
+            submissionId: subId,
+            challengeId: m.challengeId,
+            status: "expired" as const,
+            notes: `stuck at status=${status ?? "unknown"} beyond max age — aged out (gateway never finalized)`,
+          });
+          console.log(`   ⌛ ${subId.slice(0, 8)} stuck at status=${status ?? "unknown"} — aged out, will not re-poll`);
+          continue;
+        }
         console.log(`   ⏳ ${subId.slice(0, 8)} status=${status ?? "unknown"} — wait for quorum`);
         continue;
       }

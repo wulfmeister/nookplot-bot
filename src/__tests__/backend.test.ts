@@ -121,7 +121,7 @@ import {
   recentGroundingKeys, noteKey, titleTokenList, gateCorpus, findMotifCollision,
   descriptionSimilarity, isGateRelaxed, fallbackDomainOrder,
 } from "../challenge-posting.js";
-import { findRepetitiveLearning, findLearningMotifCollision } from "../learnings.js";
+import { findRepetitiveLearning, findLearningMotifCollision, decideNonTerminalCandidate } from "../learnings.js";
 import { findTemplateFingerprint, isFarmChallengeTitle, findNearDuplicateTrace, nearDupeCorpus, applyOffTopicClamp } from "../trace-fingerprint.js";
 import { scoreIntentFit } from "../manifest-intents.js";
 import { veniceRateLimited429Today, computeParseFailureRates, type CostEntry } from "../venice-cost.js";
@@ -2077,6 +2077,25 @@ describe("challenge-posting anti-repeat gate", () => {
     const fresh =
       "The verifier's hidden tests included a zero-capacity self-loop, which my adjacency-matrix representation silently dropped; an explicit edge-list with per-edge residuals handled it.";
     assert.equal(findRepetitiveLearning(fresh, prior), null);
+  });
+
+  it("decideNonTerminalCandidate ages out gateway-zombie submissions (head-of-line incident)", () => {
+    // 08-04→08-08: the gateway's expiry job stopped ~08-03, three subs sat at
+    // status="submitted" forever, and — because the learnings poll walks
+    // candidates.slice(0, 3) oldest-first — they monopolized the head window
+    // every tick: mining-verified.jsonl recorded NOTHING for 4 days while 46
+    // newer candidates (including all of gemini's debut solves) queued behind.
+    const NOW = Date.parse("2026-08-08T12:00:00Z");
+    const DAY = 86_400_000;
+    assert.equal(decideNonTerminalCandidate(new Date(NOW - 8 * DAY).toISOString(), NOW), "age-out");
+    // Anything younger waits — late finalization up to 77h is real (fb25596c),
+    // and the gateway's own auto-expiry historically ran at ~80-94h.
+    assert.equal(decideNonTerminalCandidate(new Date(NOW - 4 * DAY).toISOString(), NOW), "wait");
+    assert.equal(decideNonTerminalCandidate(new Date(NOW - 6.9 * DAY).toISOString(), NOW), "wait");
+    // A malformed timestamp must wait (safe default), never age out.
+    assert.equal(decideNonTerminalCandidate("not-a-date", NOW), "wait");
+    // Env-independent override path.
+    assert.equal(decideNonTerminalCandidate(new Date(NOW - 2 * DAY).toISOString(), NOW, 1 * DAY), "age-out");
   });
 
   it("findLearningMotifCollision blocks paraphrased retellings via their anchor bigrams", () => {
