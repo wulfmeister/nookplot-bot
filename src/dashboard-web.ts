@@ -34,7 +34,7 @@ import { attentionSummary } from "./attention-signals.js";
 import { diagnosticsSummary } from "./diagnostics.js";
 import { subscriptionSummary } from "./subscriptions.js";
 import { egressSummary } from "./egress.js";
-import { quotaSummary } from "./quotas.js";
+import { quotaSummary, VERIFY_SHARED_CAP } from "./quotas.js";
 import { semaphoreSnapshot } from "./generation-semaphore.js";
 import { veniceCostSummary } from "./venice-cost.js";
 import { driftSummary } from "./specialization-drift.js";
@@ -638,9 +638,12 @@ export function computeNetPnl(
     .filter((d) => d.date >= cutoffDate)
     .reduce((s, d) => s + (d.spendUsd ?? 0), 0);
   const today = new Date(nowMs).toISOString().slice(0, 10);
-  const todayNook = claims
-    .filter((c) => c.kind === "off-chain" && (c.ts ?? "").slice(0, 10) === today)
-    .reduce((s, c) => s + (c.claimed ?? 0), 0);
+  const todayRows = claims.filter((c) => c.kind === "off-chain" && (c.ts ?? "").slice(0, 10) === today);
+  const todayNook = todayRows.reduce((s, c) => s + (c.claimed ?? 0), 0);
+  // Claim-time price here too — the window revenue above already uses it, but
+  // this line used the live quote, so "today's net" disagreed with the same
+  // day's row in the daily-earnings series whenever the price moved intraday.
+  const todayRevenue = todayRows.reduce((s, c) => s + (c.claimed ?? 0) * (c.priceUsdAtClaim ?? priceUsd), 0);
   const todaySpend = spendByDay.find((d) => d.date === today)?.spendUsd ?? 0;
   return {
     windowDays,
@@ -652,7 +655,7 @@ export function computeNetPnl(
     breakevenPriceUsd: nookEarned > 0 ? usdCost / nookEarned : null,
     priceUsd,
     todayNook,
-    todayUsdNet: todayNook * priceUsd - todaySpend,
+    todayUsdNet: todayRevenue - todaySpend,
   };
 }
 
@@ -1220,7 +1223,9 @@ async function buildEpochProgress() {
     nextRes?.timeUntilEpochSeconds ?? Math.max(0, Math.round((curStart + 24 * 3600_000 - now) / 1000));
   const elapsedFrac = Math.min(1, Math.max(0, 1 - secondsRemaining / 86400));
   const SOLVE_CAP = Number(process.env.BOT_MINING_DAILY_CAP ?? 12);
-  const VERIFY_CAP = 30;
+  // Same source of truth as /api/capacity — this was a hardcoded 30 while the
+  // real (env-configurable) cap is 38, so the two panels disagreed.
+  const VERIFY_CAP = VERIFY_SHARED_CAP;
 
   return {
     epoch: {
@@ -1432,10 +1437,20 @@ function buildExperiments(): {
     original: e.meta?.original ?? null,
     rerun: e.meta?.rerun ?? null,
   }));
+  // "exec > 0" is NOT evidence the lever works — exec stepped once on 07-16
+  // and sat flat for weeks while this verdict read "moving". Movement means a
+  // CHANGE within the recent window (~7d of 30-min snapshots). And a
+  // match=false whose rerun outcome is verifier_unavailable is the gateway's
+  // runner being down, not a non-reproduction — count it separately.
+  const execMoved7d = dims.slice(-336).some((d, i, a) => i > 0 && d.exec !== a[i - 1].exec);
+  const infraFails = reruns.filter(
+    (e) => matchOf(e) === false && JSON.stringify(e.meta?.rerun ?? "").includes("verifier_unavailable"),
+  ).length;
   const verdict =
     reruns.length === 0 ? "no reruns yet — waiting for code submissions"
-    : matchTrue > 0 && (last?.exec ?? 0) > 0 ? "exec moving — the rerun lever works"
-    : matchTrue > 0 ? "match=true seen but exec still 0 — recompute lag, or exec ≠ reruns"
+    : execMoved7d ? "exec moved within 7d — the rerun lever works"
+    : infraFails === reruns.length ? `all ${reruns.length} reruns blocked by verifier_unavailable — runner down, no reproduction signal`
+    : matchTrue > 0 ? `${matchTrue} rerun(s) reproduced but exec flat ≥7d — lever unproven${infraFails > 0 ? ` (${infraFails} blocked by verifier_unavailable)` : ""}`
     : `0/${reruns.length} reruns reproduced — exec blocked (systematic non-reproduction)`;
 
   let reviewsGiven: Array<{ project: string; author: string; verdict: string; ts: string }> = [];
