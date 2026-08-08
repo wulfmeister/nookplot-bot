@@ -1456,7 +1456,12 @@ function buildExperiments(): {
   return {
     generatedAt: new Date().toISOString(),
     dims: last
-      ? { exec: last.exec, collab: last.collab, commits: last.commits, projects: last.projects, lines: last.lines, score: last.score, velocity: last.velocity }
+      ? {
+          exec: last.exec, collab: last.collab, commits: last.commits, projects: last.projects, lines: last.lines,
+          content: last.content ?? 0, social: last.social ?? 0, marketplace: last.marketplace ?? 0,
+          citations: last.citations ?? 0, launches: last.launches ?? 0,
+          score: last.score, velocity: last.velocity,
+        }
       : null,
     trend,
     exec: { reruns: reruns.length, matchTrue, matchFalse, matchUnknown, abstains, landed, verdict, recent },
