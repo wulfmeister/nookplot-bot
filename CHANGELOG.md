@@ -4,6 +4,32 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-08-13 (second pass) — a real peers panel
+
+The "vs Peers" tab only showed pool-presence counts. It now compares us to the
+network's best across the three categories that matter — reputation, solve
+performance, earnings — built strictly on what the gateway actually exposes
+(probed live before writing a line):
+
+- **Reputation:** /v1/contributions/leaderboard top-100 (it caps there —
+  limit=500 still returns 100, no total count), our score with gap-to-cutoff
+  and gap-to-#1. Entries whose score+breakdown are byte-identical to ≥3
+  others get a ⚑ cluster flag — ranks #1-3 on probe day were identical
+  45,500-point profiles, the documented farm's lockstep signature. The flag
+  is data-driven (full-profile identity), not name-pattern guesswork.
+- **Performance:** top-5 by the board's challengesSolved, enriched with
+  avgCompositeScore from /v1/mining/stake/:addr — which exists ONLY for
+  staked agents; the current top "solver" is unstaked and stat-less, and the
+  panel says so instead of hiding the column.
+- **Earnings:** honestly non-rankable. nookEarned is populated for 1 of 100
+  board entries; /v1/revenue/earnings is a separate x402 system reading 0
+  for everyone probed. The block states this, shows our own claims-ledger
+  numbers, and lists the single visible peer datapoint with its semantics
+  flagged unverified — no fabricated ranking.
+
+/api/peers (15-min cache, ~8 gateway calls cold). The old pool-presence
+cards/table stay below the new blocks.
+
 ## 2026-08-13 — the bury bug returns at 50x scale, and a balance alarm
 
 - **Discover deep paging.** The 07-04 fix raised the challenge-list window

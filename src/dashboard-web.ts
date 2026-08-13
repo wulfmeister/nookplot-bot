@@ -1252,6 +1252,160 @@ async function buildEpochProgress() {
 
 /** Live status of the projects we've published (builder-reputation surface). */
 let _rt: ReturnType<typeof getRuntime> | null = null;
+
+// ─── Network peers panel ─────────────────────────────────────────────────────
+
+interface LeaderboardEntry {
+  rank: number;
+  address: string;
+  displayName?: string;
+  score: number;
+  breakdown?: Record<string, number>;
+  velocityMultiplier?: number;
+  challengesSolved?: number;
+  nookEarned?: number;
+}
+
+/**
+ * Tag leaderboard entries that share a byte-identical (score, breakdown)
+ * profile with ≥ minClusterSize others. Data-driven Sybil heuristic: the
+ * documented template farm registers waves of agents that march up the
+ * reputation board in lockstep (probed 2026-08-13: ranks #1-3 all held
+ * identical 45,500 scores with identical 11-dim breakdowns). A name-based
+ * heuristic would be guesswork; identical full profiles at scale is not.
+ * Pure — testable.
+ */
+export function markIdenticalProfileClusters<T extends { score: number; breakdown?: Record<string, number> }>(
+  entries: T[],
+  minClusterSize = 3,
+): Array<T & { identicalProfileCluster: number | null }> {
+  const key = (e: T) => `${e.score}|${JSON.stringify(e.breakdown ?? {})}`;
+  const counts = new Map<string, number>();
+  for (const e of entries) counts.set(key(e), (counts.get(key(e)) ?? 0) + 1);
+  return entries.map((e) => {
+    const n = counts.get(key(e)) ?? 1;
+    return { ...e, identicalProfileCluster: n >= minClusterSize ? n : null };
+  });
+}
+
+let peersCache: { data: unknown; at: number } | null = null;
+/**
+ * Peer comparison across the three categories the operator asked for —
+ * reputation, solve performance, earnings — with an honest treatment of what
+ * the gateway does and does not expose (probed 2026-08-13):
+ *  - Reputation: /v1/contributions/leaderboard returns AT MOST the top 100
+ *    (limit=500 still returns 100) and carries no total-agent count; we are
+ *    outside it, so our "rank" is shown as a gap-to-cutoff, not a number.
+ *  - Performance: the leaderboard's challengesSolved is the only network-wide
+ *    volume signal; per-address quality stats (/v1/mining/stake/:addr
+ *    avgCompositeScore) exist ONLY for staked agents — the top "solver" by
+ *    challengesSolved is unstaked and returns all zeros.
+ *  - Earnings: NOT rankable network-wide. nookEarned was populated for 1 of
+ *    100 leaderboard entries; /v1/revenue/earnings/:addr is a different
+ *    (x402) system that reads 0 for everyone we probed. We show our own
+ *    ledger and say so, rather than fake a ranking.
+ * ~8 gateway calls when cold → 15-min cache.
+ */
+async function buildPeers(): Promise<unknown> {
+  const now = Date.now();
+  if (peersCache && now - peersCache.at < 15 * 60_000) return peersCache.data;
+  const rt = (_rt ??= getRuntime());
+  const get = (path: string) => rt.connection.request("GET", path) as Promise<unknown>;
+
+  const lbRes = (await get("/v1/contributions/leaderboard?limit=100")) as { entries?: LeaderboardEntry[] };
+  const entries = markIdenticalProfileClusters(lbRes.entries ?? []);
+  const clustered = entries.filter((e) => e.identicalProfileCluster !== null).length;
+
+  let ourScore: number | null = null;
+  let ourBreakdown: Record<string, number> = {};
+  let ourVelocity: number | null = null;
+  try {
+    const c = (await get(`/v1/contributions/${MY_ADDR}`)) as {
+      score?: number; breakdown?: Record<string, number>; velocityMultiplier?: number;
+    };
+    ourScore = c.score ?? null;
+    ourBreakdown = c.breakdown ?? {};
+    ourVelocity = c.velocityMultiplier ?? null;
+  } catch { /* gateway hiccup — cards render with nulls */ }
+
+  interface StakeStats {
+    totalSolves?: number; totalVerifications?: number; avgCompositeScore?: number;
+    staked?: boolean; tier?: string | null;
+  }
+  const stakeOf = async (addr: string): Promise<StakeStats | null> => {
+    try { return (await get(`/v1/mining/stake/${addr}`)) as StakeStats; } catch { return null; }
+  };
+
+  const topSolvers = [...entries]
+    .sort((a, b) => (b.challengesSolved ?? 0) - (a.challengesSolved ?? 0))
+    .slice(0, 5);
+  const solverStats = await Promise.all(topSolvers.map((p) => stakeOf(p.address)));
+  const ourStake = await stakeOf(MY_ADDR);
+
+  // Our earnings from the local claims ledger — the one source we can trust.
+  const claims = readJsonlSafe<{ kind?: string; ts?: string; claimed?: number }>(join(NOOK_DIR, "mining-claims.jsonl"))
+    .filter((c) => c.kind === "off-chain");
+  const lifetimeNook = claims.reduce((s, c) => s + (c.claimed ?? 0), 0);
+  const cutoff7d = new Date(now - 6 * 86_400_000).toISOString().slice(0, 10);
+  const last7dNook = claims.filter((c) => (c.ts ?? "").slice(0, 10) >= cutoff7d).reduce((s, c) => s + (c.claimed ?? 0), 0);
+  const earningsVisible = entries.filter((e) => (e.nookEarned ?? 0) > 0);
+
+  const cutoff100 = entries.length > 0 ? entries[entries.length - 1].score : null;
+  const data = {
+    generatedAt: new Date().toISOString(),
+    reputation: {
+      top: entries.slice(0, 5).map((e) => ({
+        rank: e.rank, address: e.address, displayName: e.displayName ?? null, score: e.score,
+        velocity: e.velocityMultiplier ?? null, challengesSolved: e.challengesSolved ?? null,
+        identicalProfileCluster: e.identicalProfileCluster,
+      })),
+      clusteredInTop100: clustered,
+      us: {
+        score: ourScore,
+        velocity: ourVelocity,
+        inTop100: entries.some((e) => e.address.toLowerCase() === MY_ADDR),
+        cutoffScore: cutoff100,
+        gapToCutoff: ourScore != null && cutoff100 != null ? cutoff100 - ourScore : null,
+        gapToTop: ourScore != null && entries[0] ? entries[0].score - ourScore : null,
+        zeroDims: Object.entries(ourBreakdown).filter(([, v]) => v === 0).map(([k]) => k),
+      },
+    },
+    performance: {
+      top: topSolvers.map((p, i) => ({
+        address: p.address, displayName: p.displayName ?? null, leaderboardRank: p.rank,
+        challengesSolved: p.challengesSolved ?? 0,
+        avgComposite: solverStats[i]?.staked ? (solverStats[i]?.avgCompositeScore ?? null) : null,
+        staked: solverStats[i]?.staked ?? false,
+        identicalProfileCluster: p.identicalProfileCluster,
+      })),
+      us: {
+        totalSolves: ourStake?.totalSolves ?? null,
+        totalVerifications: ourStake?.totalVerifications ?? null,
+        avgComposite: ourStake?.avgCompositeScore ?? null,
+        tier: ourStake?.tier ?? null,
+        solvedRankAmongTop100: (() => {
+          const ours = ourStake?.totalSolves ?? 0;
+          if (!ours) return null;
+          return entries.filter((e) => (e.challengesSolved ?? 0) > ours).length + 1;
+        })(),
+      },
+    },
+    earnings: {
+      rankable: false,
+      note:
+        "The gateway exposes no per-peer NOOK earnings: nookEarned is populated for " +
+        `${earningsVisible.length} of ${entries.length} leaderboard entries, and /v1/revenue/earnings ` +
+        "is a separate (x402) system reading 0 for every address probed. Ours below is from the local claims ledger.",
+      visiblePeers: earningsVisible.slice(0, 3).map((e) => ({
+        address: e.address, displayName: e.displayName ?? null, nookEarned: e.nookEarned, rank: e.rank,
+      })),
+      us: { lifetimeNook, last7dNook, dailyAvg7d: last7dNook / 7 },
+    },
+  };
+  peersCache = { data, at: now };
+  return data;
+}
+
 let myProjectsCache: { data: unknown; at: number } | null = null;
 async function buildMyProjects(): Promise<{ projects: unknown[] }> {
   const now = Date.now();
@@ -1551,6 +1705,10 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   }
   if (path === "/api/experiments") {
     return json(res, 200, buildExperiments());
+  }
+  if (path === "/api/peers") {
+    try { return json(res, 200, await buildPeers()); }
+    catch (err) { return json(res, 502, { error: (err as Error).message.slice(0, 200) }); }
   }
   if (path === "/api/my-projects") {
     try {

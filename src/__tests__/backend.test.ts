@@ -58,6 +58,7 @@ import type { BountyRow } from "../bounties.js";
 import { isRerunnableKind, isVerifyEligible, decideFromRerun } from "../verify-kinds.js";
 import { specializeDomains, passesSpecializationFilter, fetchOpenChallengesPaged } from "../mining.js";
 import { assessVeniceBalance, spendableBalance } from "../venice-balance.js";
+import { markIdenticalProfileClusters } from "../dashboard-web.js";
 import { extractArxivIds, extractHfDatasets } from "../paper-reproduction.js";
 import {
   peerQuality,
@@ -4070,6 +4071,42 @@ describe("mining.fetchOpenChallengesPaged (discover-window starvation)", () => {
       isEligible as never, 3, 400,
     );
     assert.deepEqual(calls, [0, 100, 200, 300, 400]); // hard stop at maxOffset
+  });
+});
+
+describe("dashboard.markIdenticalProfileClusters (Sybil-cluster flag on the peers panel)", () => {
+  const bd = (commits: number) => ({ commits, exec: 3750, projects: 5000 });
+
+  it("flags entries whose score+breakdown are byte-identical to >=3 others", () => {
+    // Probed 2026-08-13: leaderboard ranks #1-3 all held identical 45,500
+    // scores with identical 11-dim breakdowns — the farm's lockstep signature.
+    const entries = [
+      { score: 45500, breakdown: bd(6250) },
+      { score: 45500, breakdown: bd(6250) },
+      { score: 45500, breakdown: bd(6250) },
+      { score: 35535, breakdown: bd(4774) },
+    ];
+    const marked = markIdenticalProfileClusters(entries);
+    assert.equal(marked[0].identicalProfileCluster, 3);
+    assert.equal(marked[2].identicalProfileCluster, 3);
+    assert.equal(marked[3].identicalProfileCluster, null);
+  });
+
+  it("same score with a DIFFERENT breakdown is not a cluster (ties are legitimate)", () => {
+    const marked = markIdenticalProfileClusters([
+      { score: 45500, breakdown: bd(6250) },
+      { score: 45500, breakdown: bd(6000) },
+      { score: 45500, breakdown: bd(5750) },
+    ]);
+    assert.ok(marked.every((e) => e.identicalProfileCluster === null));
+  });
+
+  it("pairs stay unflagged at the default threshold (coincidence is possible at n=2)", () => {
+    const marked = markIdenticalProfileClusters([
+      { score: 100, breakdown: bd(1) },
+      { score: 100, breakdown: bd(1) },
+    ]);
+    assert.ok(marked.every((e) => e.identicalProfileCluster === null));
   });
 });
 

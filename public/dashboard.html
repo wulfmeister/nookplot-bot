@@ -412,11 +412,34 @@ canvas { max-width: 100%; }
   <!-- vs Peers -->
   <section class="section" data-section="peers">
     <p class="explainer">
-      <strong>What's here:</strong> our rank vs other solvers active in the verifiable pool right now.
-      Note: the gateway hides our own submissions from us when we query — what you see is from the
-      perspective of an outside observer. Top solvers tend to concentrate in 1-2 domains; we're using a
-      soft-specialization preference for <code>distributed-systems</code>.
+      <strong>What's here:</strong> how we stack up against the network's best bots on reputation,
+      solve performance, and earnings — plus our live position in the verifiable pool. Entries whose
+      score+breakdown are byte-identical to ≥3 others are flagged <span style="color:var(--red)">⚑ cluster</span>
+      (the documented Sybil farm registers agents that march up the board in lockstep). Earnings are
+      <em>not</em> rankable network-wide — the gateway doesn't expose per-peer NOOK — so that block shows
+      what's verifiable and says what isn't.
     </p>
+    <div class="grid" id="peers-net-cards"></div>
+    <div class="row-card">
+      <h2>🏆 Reputation leaders <span id="peers-rep-meta" class="legend" style="text-transform:none; font-weight:normal"></span></h2>
+      <table id="peers-rep-tbl">
+        <thead><tr><th>Rank</th><th>Agent</th><th>Score</th><th>Velocity</th><th>Solved</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="legend" id="peers-rep-us"></div>
+    </div>
+    <div class="row-card">
+      <h2>⚡ Top solvers by volume <span class="legend" style="text-transform:none; font-weight:normal">(challengesSolved; quality stats exist only for staked agents)</span></h2>
+      <table id="peers-perf-tbl">
+        <thead><tr><th>Agent</th><th>Solved</th><th>Avg composite</th><th>Staked</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="legend" id="peers-perf-us"></div>
+    </div>
+    <div class="row-card">
+      <h2>💰 Earnings visibility</h2>
+      <div id="peers-earn"></div>
+    </div>
     <div class="grid" id="peers-cards"></div>
     <div class="row-card">
       <h2>Our position in the verifiable pool</h2>
@@ -1624,8 +1647,81 @@ function renderVerificationTrend() {
   });
 }
 
+// ─── render: peers (network comparison) ───
+let peersNet = null;
+let peersNetAt = 0;
+async function loadPeersNet() {
+  if (peersNet && Date.now() - peersNetAt < 5 * 60_000) return peersNet;
+  const r = await fetch("/api/peers");
+  if (!r.ok) throw new Error(`peers ${r.status}`);
+  peersNet = await r.json();
+  peersNetAt = Date.now();
+  return peersNet;
+}
+
+function clusterFlag(n) {
+  return n ? `<span style="color:var(--red)" title="score+breakdown byte-identical to ${n} entries — Sybil-cluster signature">⚑ cluster×${n}</span>` : "";
+}
+
+function agentLabel(p) {
+  const name = p.displayName ? `${p.displayName} ` : "";
+  return `${name}<span class="addr muted">${shortAddr(p.address)}</span>`;
+}
+
+function renderPeersNet(d) {
+  const rep = d.reputation ?? {}, perf = d.performance ?? {}, earn = d.earnings ?? {};
+  const us = rep.us ?? {};
+  const cards = [
+    { label: "Our reputation score", big: us.score != null ? us.score.toLocaleString() : "—",
+      sub: us.inTop100 ? "IN the top-100 board" : `top-100 cutoff ${us.cutoffScore?.toLocaleString() ?? "?"} (gap ${us.gapToCutoff?.toLocaleString() ?? "?"})` },
+    { label: "Our solves (lifetime)", big: perf.us?.totalSolves ?? "—",
+      sub: perf.us?.solvedRankAmongTop100 ? `#${perf.us.solvedRankAmongTop100} if ranked among top-100 board` : "" },
+    { label: "Our avg composite", big: perf.us?.avgComposite != null ? perf.us.avgComposite.toFixed(3) : "—",
+      sub: `stake ${perf.us?.tier ?? "—"} · ${perf.us?.totalVerifications ?? 0} verifications given` },
+    { label: "Our NOOK (7d)", big: earn.us ? Math.round(earn.us.last7dNook).toLocaleString() : "—",
+      sub: earn.us ? `${Math.round(earn.us.dailyAvg7d).toLocaleString()}/day · lifetime ${Math.round(earn.us.lifetimeNook / 1e6)}M` : "" },
+  ];
+  document.getElementById("peers-net-cards").innerHTML = cards
+    .map((c) => `<div class="card"><h3>${c.label}</h3><div class="big">${c.big}</div><div class="sub">${c.sub}</div></div>`)
+    .join("");
+
+  document.getElementById("peers-rep-meta").textContent =
+    rep.clusteredInTop100 ? `${rep.clusteredInTop100}/100 board entries sit in identical-profile clusters` : "";
+  document.querySelector("#peers-rep-tbl tbody").innerHTML = (rep.top ?? [])
+    .map((p) => `<tr><td>#${p.rank}</td><td>${agentLabel(p)}</td><td>${p.score.toLocaleString()}</td>
+      <td>${p.velocity ?? "—"}×</td><td>${p.challengesSolved ?? "—"}</td><td>${clusterFlag(p.identicalProfileCluster)}</td></tr>`)
+    .join("") || `<tr><td colspan="6" class="empty">No leaderboard data.</td></tr>`;
+  document.getElementById("peers-rep-us").innerHTML = us.score != null
+    ? `<strong>Us:</strong> ${us.score.toLocaleString()} at ${us.velocity ?? "?"}× velocity — ` +
+      (us.inTop100 ? "on the board" : `${us.gapToCutoff?.toLocaleString() ?? "?"} below the #100 cutoff, ${us.gapToTop?.toLocaleString() ?? "?"} below #1`) +
+      (us.zeroDims?.length ? ` · zero-scored dims: ${us.zeroDims.join(", ")}` : "")
+    : "";
+
+  document.querySelector("#peers-perf-tbl tbody").innerHTML = (perf.top ?? [])
+    .map((p) => `<tr><td>${agentLabel(p)} <span class="muted">(board #${p.leaderboardRank})</span></td>
+      <td>${p.challengesSolved}</td><td>${p.avgComposite != null ? p.avgComposite.toFixed(3) : '<span class="muted">— unstaked</span>'}</td>
+      <td>${p.staked ? "yes" : "no"}</td><td>${clusterFlag(p.identicalProfileCluster)}</td></tr>`)
+    .join("") || `<tr><td colspan="5" class="empty">No solver data.</td></tr>`;
+  document.getElementById("peers-perf-us").innerHTML = perf.us
+    ? `<strong>Us:</strong> ${perf.us.totalSolves ?? "?"} solved at avg composite ${perf.us.avgComposite?.toFixed(3) ?? "?"} — ` +
+      `top-100 boards list only challengesSolved, so quality comparison is possible only against staked agents`
+    : "";
+
+  const vis = (earn.visiblePeers ?? [])
+    .map((p) => `<li>${agentLabel(p)} — ${Math.round(p.nookEarned).toLocaleString()} NOOK (board #${p.rank}; field semantics unverified)</li>`)
+    .join("");
+  document.getElementById("peers-earn").innerHTML =
+    `<div class="legend">${earn.note ?? ""}</div>` +
+    (earn.us ? `<div style="margin:8px 0"><strong>Us (local claims ledger):</strong> ${Math.round(earn.us.lifetimeNook).toLocaleString()} NOOK lifetime · ` +
+      `${Math.round(earn.us.last7dNook).toLocaleString()} last 7d (${Math.round(earn.us.dailyAvg7d).toLocaleString()}/day)</div>` : "") +
+    (vis ? `<div class="legend">Only peer datapoint(s) the gateway exposes:</div><ul>${vis}</ul>` : "");
+}
+
 // ─── render: peers ───
 function renderPeers() {
+  loadPeersNet().then(renderPeersNet).catch((e) => {
+    document.getElementById("peers-earn").innerHTML = `<div class="muted">peer comparison unavailable: ${e.message}</div>`;
+  });
   const s = snapshot;
   const us = s.mine?.poolPresence ?? { subs: 0, nearQuorum: 0 };
   const cards = [
