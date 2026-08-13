@@ -49,6 +49,7 @@ const LOG = join(NOOK_DIR, "venice-costs.jsonl");
 const MODEL_PRICING: Record<string, { in: number; out: number }> = {
   // Current mining A/B arms
   "grok-4-5": { in: 2.27, out: 6.8 },
+  "grok-4-6": { in: 2.27, out: 6.8 },
   "claude-opus-5": { in: 6, out: 30 },
   // Live catalog 2026-08-13; luna also has cache tiers ($0.027 cached-in) the
   // flat table can't express — mining calls are uncached, so immaterial.

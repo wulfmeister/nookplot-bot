@@ -51,8 +51,10 @@ const DEFAULTS: Record<Task, string> = {
   // from 06-11: the scoring prompt was calibrated on grok-4-3, so score
   // distributions may shift — same family keeps the drift small, but watch
   // verification-stats.jsonl for a step change in mean scores.
-  verification_score: "grok-4-5",
-  verification_comprehension: "grok-4-5",
+  // grok-4-5 → grok-4-6 on 2026-08-13 (operator): same price, same 500k ctx,
+  // NOT beta, and it restores the xhigh effort tier 4-5 dropped.
+  verification_score: "grok-4-6",
+  verification_comprehension: "grok-4-6",
   crowd_jury_score: "grok-4-3",
   knowledge_topic: "grok-4-3",
   knowledge_body: "grok-4-3",
@@ -121,7 +123,7 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   // isTransientGenerationError, so the attempt is lost rather than rerouted.
   // Re-probe it first whenever the catalog is re-checked.
   mining_solve: [
-    "grok-4-5",
+    "grok-4-6",
     "claude-opus-5",
     "openai-gpt-56-luna",
     "gemini-3-1-pro-preview",
@@ -157,6 +159,9 @@ const MODEL_EFFORT: Record<string, ReasoningEffort> = {
   // (reasoningEffortOptions) — it was set to "xhigh" from 2026-07-09 until
   // 2026-07-28, an unsupported value Venice appears to have silently ignored.
   "grok-4-5": "high",
+  // grok-4-6 DOES list xhigh (catalog 2026-08-13: low|medium|high|xhigh,
+  // default high) — operator wants it at xhigh, and this time it's supported.
+  "grok-4-6": "xhigh",
   "openai-gpt-55": "high",
   // OpenAI reasoning models empty-trace at xhigh (observed on gpt-55) — keep
   // gpt-56-sol at high. GLM-5.2 at high pending its own calibration.
