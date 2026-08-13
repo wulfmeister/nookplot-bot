@@ -81,8 +81,12 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   //     claude-fable-5 on 2026-07-28 (operator); effort=high.
   //   gemini-3-1-pro-preview — Google's top model on Venice, 1M ctx, $2.50/$15.
   //     4th arm 2026-08-05, replacing kimi-k3 (see below); effort=high.
-  //   openai-gpt-56-sol — GPT-5.6 "Sol", 1M ctx, $6.25/$37.5. effort=high (OpenAI
-  //     reasoning models empty-trace at xhigh — see MODEL_EFFORT note).
+  //   openai-gpt-56-luna — GPT-5.6 "Luna", 1M ctx, $0.27/$1.60. Replaced
+  //     gpt-56-sol 2026-08-13 (operator): sol had the roster's worst settled
+  //     verified-rate (40%, a 27pp gap to grok/gemini at n≥15) and worst
+  //     NOOK/$. Operator optimizes GROSS NOOK, not cost — luna is the same
+  //     family at effort=max (catalog-verified supported) as the
+  //     highest-effort configuration of the 5.6 line we can buy.
   // The parse-fail circuit-breaker (filterPoolByParseFailure) sidelines any arm
   // that fails ≥30% over ≥5 attempts, and DEFAULTS.mining_solve (opus-4-8) is the
   // safe fallback if all four get filtered. At 12/day that's ~3 attempts/arm/day;
@@ -111,7 +115,7 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   // from June under the pre-07-28 breaker/accounting bugs (successes never
   // tagged) AND an unsupported reasoning_effort=xhigh (catalog says
   // low|medium|high) that plausibly caused the empty outputs itself.
-  // BETA WATCH: openai-gpt-56-sol is flagged betaModel=true in the catalog —
+  // BETA WATCH: openai-gpt-56-luna is flagged betaModel=true in the catalog —
   // Venice may withdraw a beta model without the standard deprecation notice.
   // A withdrawn arm 404s at generation, which is NOT matched by
   // isTransientGenerationError, so the attempt is lost rather than rerouted.
@@ -119,7 +123,7 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   mining_solve: [
     "grok-4-5",
     "claude-opus-5",
-    "openai-gpt-56-sol",
+    "openai-gpt-56-luna",
     "gemini-3-1-pro-preview",
   ],
   mining_learning: undefined,
@@ -157,6 +161,13 @@ const MODEL_EFFORT: Record<string, ReasoningEffort> = {
   // OpenAI reasoning models empty-trace at xhigh (observed on gpt-55) — keep
   // gpt-56-sol at high. GLM-5.2 at high pending its own calibration.
   "openai-gpt-56-sol": "high",
+  // Luna at "max" per operator (2026-08-13) — catalog-verified supported
+  // (options none..max, default high). KNOWN RISK: gpt-55 empty-traced at
+  // xhigh, and sol was held at "high" prophylactically; if luna empty-traces
+  // at max the parse-fail breaker sidelines it at ≥30% over 5 attempts and
+  // salvageMarkdownTrace recovers partial output — bounded, so we honor the
+  // operator's max-effort ask rather than pre-nerfing it.
+  "openai-gpt-56-luna": "max",
   // claude-opus-5 is deliberately ABSENT: the live catalog reports
   // supportsReasoningEffort=false / no reasoningEffortOptions, so any value
   // here would be an ignored parameter. It still reasons (

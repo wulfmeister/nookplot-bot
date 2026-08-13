@@ -4,6 +4,22 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-08-13 (third pass) — sol out, luna in at max effort
+
+Roster change (operator): gpt-5.6-sol → gpt-5.6-luna. Eight days of four-arm
+data made sol the roster's worst arm where it counts — 40% settled
+verified-rate (27pp below grok/gemini at n≥15) — despite the best composite
+quality. The operator's framing, worth recording: **we optimize gross NOOK
+earnings, not cost reduction** (inference runs on free credits). Luna is the
+same 5.6 family at effort=max — catalog-verified this time (options none..max,
+default high; the effort fields live under model_spec.capabilities, which an
+earlier probe misread as null at the top level) — i.e. the highest-effort
+configuration of the line, and incidentally 23x cheaper ($0.27/$1.60 vs
+$6.25/$37.50). Wire-name risk ≈ zero (same family shape as sol's 61+
+acceptances); if luna empty-traces at max the way gpt-55 did at xhigh, the
+parse-fail breaker bounds it at 5 attempts. Sol's pricing/effort entries stay
+for historical cost rows.
+
 ## 2026-08-13 (second pass) — a real peers panel
 
 The "vs Peers" tab only showed pool-presence counts. It now compares us to the

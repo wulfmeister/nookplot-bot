@@ -50,6 +50,9 @@ const MODEL_PRICING: Record<string, { in: number; out: number }> = {
   // Current mining A/B arms
   "grok-4-5": { in: 2.27, out: 6.8 },
   "claude-opus-5": { in: 6, out: 30 },
+  // Live catalog 2026-08-13; luna also has cache tiers ($0.027 cached-in) the
+  // flat table can't express — mining calls are uncached, so immaterial.
+  "openai-gpt-56-luna": { in: 0.26666667, out: 1.6 },
   "openai-gpt-56-sol": { in: 6.25, out: 37.5 },
   "kimi-k3": { in: 4.6875, out: 23.4375 },
   // Fallback / other-task models

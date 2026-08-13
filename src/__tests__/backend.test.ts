@@ -154,14 +154,15 @@ describe("models", () => {
     // Non-lean A/B sampling (lean would force the cheap model, pool="lean").
     const savedLean = process.env.BOT_LEAN;
     delete process.env.BOT_LEAN;
-    // Pool as of 2026-08-05 (operator): kimi-k3 removed (both wire names
-    // rejected by the gateway validator, 0 acceptances ever), replaced by
-    // gemini-3-1-pro-preview — 4th distinct frontier provider, verified in the
-    // live catalog 2026-08-05, wire name proven by 27 historical acceptances.
+    // Pool as of 2026-08-13 (operator): gpt-56-sol out (40% settled
+    // verified-rate, 27pp below grok/gemini at n≥15), gpt-56-luna in at
+    // effort=max — operator optimizes gross NOOK, and luna is the 5.6
+    // family's highest-effort configuration. Same-family wire-name shape as
+    // sol (61+ gateway acceptances), so rejection risk ≈ zero.
     const allowed = new Set([
       "grok-4-5",
       "claude-opus-5",
-      "openai-gpt-56-sol",
+      "openai-gpt-56-luna",
       "gemini-3-1-pro-preview",
     ]);
     try {
@@ -190,8 +191,8 @@ describe("models", () => {
         );
       }
       // Reasoning effort is configured ONLY for arms that expose the dial.
-      // Per the live catalog (2026-08-05): grok-4-5 and gemini-3-1-pro-preview
-      // support low|medium|high, openai-gpt-56-sol supports up to max, and
+      // Per the live catalog (2026-08-13): grok-4-5 and gemini-3-1-pro-preview
+      // support low|medium|high, openai-gpt-56-luna supports none..max, and
       // claude-opus-5 reports supportsReasoningEffort=false — a value for it
       // would be an ignored parameter dressed up as a calibration decision.
       assert.equal(effortFor("claude-opus-5"), undefined);
@@ -200,7 +201,8 @@ describe("models", () => {
       // 07-09, plausibly the source of the empty outputs that got it benched.
       assert.equal(effortFor("grok-4-5"), "high");
       assert.equal(effortFor("gemini-3-1-pro-preview"), "high");
-      assert.equal(effortFor("openai-gpt-56-sol"), "high");
+      // Luna at max per operator 2026-08-13 (catalog-verified supported).
+      assert.equal(effortFor("openai-gpt-56-luna"), "max");
     } finally {
       if (savedLean === undefined) delete process.env.BOT_LEAN;
       else process.env.BOT_LEAN = savedLean;
@@ -3865,7 +3867,7 @@ describe("venice-cost.estimateCallCost (real per-model pricing)", () => {
     // A model missing from the table silently falls back to DEFAULT_PRICING,
     // which corrupts the NOOK-per-dollar comparison that decides A/B pruning.
     // Distinct prices prove each arm has its own entry.
-    const costs = ["grok-4-5", "claude-opus-5", "openai-gpt-56-sol", "gemini-3-1-pro-preview"]
+    const costs = ["grok-4-5", "claude-opus-5", "openai-gpt-56-luna", "gemini-3-1-pro-preview"]
       .map((m) => estimateCallCost(m, 12000, 8000));
     assert.equal(new Set(costs.map((c) => c.toFixed(6))).size, 4, "arms share a price — one is falling back to the default");
     for (const c of costs) assert.ok(c > 0, "cost must never be zero");
@@ -3921,7 +3923,7 @@ describe("venice-cost reasoning-token accounting (no double-count)", () => {
 
 describe("mining circuit breaker — model-id rejection (deterministic evidence)", () => {
   const base = { attempts: 3, failures: 3, rate: 1.0, idRejected: 0, idRejectedWireNames: [] as string[] };
-  const POOL = ["grok-4-5", "claude-opus-5", "openai-gpt-56-sol", "gemini-3-1-pro-preview"];
+  const POOL = ["grok-4-5", "claude-opus-5", "openai-gpt-56-luna", "gemini-3-1-pro-preview"];
 
   it("sidelines on a SINGLE id rejection — no waiting for a rate to build", () => {
     // A modelUsed rejection is deterministic: the gateway will refuse this id
