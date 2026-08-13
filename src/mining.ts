@@ -1345,6 +1345,54 @@ export function meetsValueFloor(ch: Challenge, floor = MIN_CHALLENGE_REWARD): bo
   return est >= floor;
 }
 
+/**
+ * Depth-on-demand challenge discovery. The open pool grew to ≥5,000 with ~500
+ * arrivals/day (2026-08-08 measurement), so a single newest-100 window covers
+ * only hours of arrivals; when a batch of pre-filled or sub-floor items floods
+ * in, every visible item is ineligible while hundreds of eligible standards
+ * sit at offset 100+ (755 eligible in the first 1,000 that day; 8 of 10
+ * multi-hour submission gaps since 08-01 were wall-to-wall "no eligible"
+ * polls). This is the limit=25→100 bury bug at the next scale.
+ *
+ * Pages deeper ONLY until `pollNeed` eligible items are visible — steady state
+ * stays 1 request; a starved poll costs ≤4 extra GETs. Stops on: enough
+ * eligible, a short page (pool exhausted), an all-duplicate page (gateway
+ * ignoring offset — it does on some endpoints), or a deep-page error (first
+ * page errors rethrow; later ones return what we have via `stoppedEarly`).
+ * Eligibility is the caller's full gate stack — deep pages get no special
+ * treatment. Pure given the injected fetcher — testable.
+ */
+export async function fetchOpenChallengesPaged(
+  fetchPage: (offset: number) => Promise<Challenge[]>,
+  isEligible: (c: Challenge) => boolean,
+  pollNeed: number,
+  maxOffset = 400,
+): Promise<{ challenges: Challenge[]; pages: number; stoppedEarly?: string }> {
+  const challenges: Challenge[] = [];
+  const seenIds = new Set<string>();
+  let pages = 0;
+  let eligibleCount = 0;
+  for (let offset = 0; offset <= maxOffset; offset += 100) {
+    let page: Challenge[];
+    try {
+      page = await fetchPage(offset);
+    } catch (err) {
+      if (pages === 0) throw err;
+      return { challenges, pages, stoppedEarly: (err as Error).message };
+    }
+    pages += 1;
+    const batch = page.filter((c) => c.id && !seenIds.has(c.id));
+    for (const c of batch) {
+      seenIds.add(c.id);
+      challenges.push(c);
+      if (isEligible(c)) eligibleCount += 1;
+    }
+    if (batch.length < 100) break;
+    if (eligibleCount >= pollNeed) break;
+  }
+  return { challenges, pages };
+}
+
 function challengeFitsBudget(ch: Challenge): boolean {
   if (ch.status && ch.status !== "open") return false;
   if (ch.submissionCount !== undefined && ch.maxSubmissions !== undefined && ch.submissionCount >= ch.maxSubmissions) return false;
@@ -1435,6 +1483,20 @@ export async function discoverAndSolveMiningChallenges(
     return;
   }
 
+  // Batch size + paging need, hoisted: 3 per poll in catch-up, 1 in the paced
+  // regime (see the pacing note at the batch slice below).
+  const budget = DAILY_CAP - todayCount;
+  const paced = process.env.BOT_MINING_PACING !== "0" &&
+    rollingCapInfo(Date.now()).used >= REGULAR_ROLLING_CAP / 2;
+  const pollNeed = Math.min(paced ? 1 : 3, budget);
+
+  const isEligible = (c: Challenge): boolean => {
+    if (!challengeFitsBudget(c)) return false;
+    if (attempted.has(c.id)) return false;
+    if (opts.myAddress && c.posterAddress?.toLowerCase() === opts.myAddress.toLowerCase()) return false;
+    return true;
+  };
+
   let challenges: Challenge[] = [];
   try {
     // limit=100 (observed gateway max), NOT 25: the list is newest-first and
@@ -1442,22 +1504,32 @@ export async function discoverAndSolveMiningChallenges(
     // challenges below a 25-item cutoff — which silently flipped our cap mix to 68% python at
     // ~8k NOOK/slot while standard (~41-52k/slot, 5-6.5x) sat unseen at #26+.
     // The tier sort below prefers standard strictly; it just needs to SEE them.
-    const res = (await runtime.connection.request(
-      "GET",
-      "/v1/mining/challenges?status=open&limit=100",
-    )) as { challenges?: Challenge[] };
-    challenges = res.challenges ?? [];
+    // DEEP PAGING (2026-08-13): the same bury bug recurred at the next scale;
+    // see fetchOpenChallengesPaged for the mechanics + evidence.
+    const paged = await fetchOpenChallengesPaged(
+      async (offset) => {
+        const res = (await runtime.connection.request(
+          "GET",
+          `/v1/mining/challenges?status=open&limit=100${offset > 0 ? `&offset=${offset}` : ""}`,
+        )) as { challenges?: Challenge[] };
+        return res.challenges ?? [];
+      },
+      isEligible,
+      pollNeed,
+    );
+    challenges = paged.challenges;
+    if (paged.stoppedEarly) {
+      console.warn(`   ⚠ discover paging stopped early (${challenges.length} scanned): ${paged.stoppedEarly.slice(0, 120)}`);
+    }
+    if (paged.pages > 1) {
+      console.log(`⛏ discover window starved — paged ${paged.pages}x deep (${challenges.length} challenges scanned)`);
+    }
   } catch (err) {
     console.warn(`   ⚠ mining list fetch failed: ${(err as Error).message}`);
     return;
   }
 
-  const eligible = challenges.filter((c) => {
-    if (!challengeFitsBudget(c)) return false;
-    if (attempted.has(c.id)) return false;
-    if (opts.myAddress && c.posterAddress?.toLowerCase() === opts.myAddress.toLowerCase()) return false;
-    return true;
-  });
+  const eligible = challenges.filter(isEligible);
 
   if (eligible.length === 0) {
     // Distinguish "nothing open" from "everything open is too cheap" — the
@@ -1498,13 +1570,11 @@ export async function discoverAndSolveMiningChallenges(
     recordSpecializationMatch(ratio);
     maybeWarnSpecializationUnderSupply(targets);
   }
-  const budget = DAILY_CAP - todayCount;
   // Up to 3 per 15-min poll in catch-up (window over half free — recover from
   // outages fast), but 1 per poll in the paced regime so a single tick can't
   // recreate the burst-cluster pattern the pacing gate exists to dissolve.
-  const paced = process.env.BOT_MINING_PACING !== "0" &&
-    rollingCapInfo(Date.now()).used >= REGULAR_ROLLING_CAP / 2;
-  const todo = eligible.slice(0, Math.min(paced ? 1 : 3, budget));
+  // (paced/pollNeed hoisted above the fetch — paging depth needs them.)
+  const todo = eligible.slice(0, pollNeed);
 
   for (const ch of todo) {
     const idShort = ch.id.slice(0, 8);

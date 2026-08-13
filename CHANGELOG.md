@@ -4,6 +4,28 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-08-13 — the bury bug returns at 50x scale, and a balance alarm
+
+- **Discover deep paging.** The 07-04 fix raised the challenge-list window
+  from 25 to 100 because templated batches buried the standards we wanted.
+  The pool then grew to ≥5,000 open challenges with ~500 arrivals/day, and
+  the same bury happened to the whole window: 8 of 10 multi-hour submission
+  gaps since 08-01 were wall-to-wall "no eligible" polls while ~755 eligible
+  standards sat at offset 100+ (measured 08-08). Discover now pages deeper
+  ONLY until the current poll's batch can fill (`fetchOpenChallengesPaged`):
+  steady state stays 1 request, a starved poll costs ≤4 extra GETs, every
+  eligibility gate applies to deep pages unchanged, and an all-duplicate page
+  (a gateway that ignores offset) stops the dig. Honest expectations, written
+  before the after-data exists: ~1.3-1.5 recovered slots/day ≈ 40-50k
+  NOOK/day at the measured 34.6k/slot — NOOK-accretive, roughly USD-neutral
+  at spot, and per-slot value swings ~10x with the exogenous R.
+- **Venice balance watch** (src/venice-balance.ts). The 08-05 DIEM exhaustion
+  402'd every inference call for ~5.7h (~3 slots, ~90-100k NOOK) with zero
+  signal until a log dig days later. Venice's /api_keys/rate_limits exposes
+  `balances {USD, DIEM}` + the daily DIEM refill time; a 30-min tick now
+  warns (once per crossing) when spendable — DIEM plus only-positive USD —
+  drops under 10. Warn-only by design: credit purchases stay manual.
+
 ## 2026-08-08 — three zombies silence a tracker for four days
 
 `mining-verified.jsonl` recorded nothing after 08-04T08:28Z while verified

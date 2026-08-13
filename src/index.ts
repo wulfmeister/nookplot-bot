@@ -67,6 +67,7 @@ import { runManifestTick, runIntentsTick, pendingSubsFromSnapshot } from "./mani
 import { runInboxWatchTick } from "./inbox-watch.js";
 import { runCohortBenchmarkTick } from "./cohort-benchmark.js";
 import { runEarningSurfacesTick } from "./earning-surfaces.js";
+import { maybeWarnVeniceBalance } from "./venice-balance.js";
 import { discoverAndSolveAggregations } from "./aggregation.js";
 import { discoverAndSolveEmbeddings } from "./embedding-mining.js";
 import { runApiMarketplaceTick } from "./api-marketplace-sell.js";
@@ -2498,6 +2499,11 @@ async function startWeeklyRewardsLoop(runtime: ReturnType<typeof getRuntime>) {
   // via real MCP dispatch every 6h and shout the moment any flips live.
   setTimeout(() => safe("earningSurfacesTick", () => runEarningSurfacesTick(runtime)), 28 * 60_000);
   setInterval(() => safe("earningSurfacesTick", () => runEarningSurfacesTick(runtime)), 6 * 3600_000);
+  // Venice balance watch — the 08-05 DIEM exhaustion 402'd every inference
+  // call for ~5.7h with no signal. Warn-only (no auto-buy; purchases stay
+  // manual via npm run buy-credits). 30-min cadence, warn-once per crossing.
+  setTimeout(() => safe("veniceBalanceTick", () => maybeWarnVeniceBalance()), 7 * 60_000);
+  setInterval(() => safe("veniceBalanceTick", () => maybeWarnVeniceBalance()), 30 * 60_000);
   // ── Inference-y drafting + dormant surfaces ────────────────────────────
   // These either draft with an LLM (project/peer/exec/bounty-review) or probe
   // not-yet-live surfaces (aggregation/embedding/API mining). Lean mode skips

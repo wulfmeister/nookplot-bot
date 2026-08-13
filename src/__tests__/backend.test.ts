@@ -56,7 +56,8 @@ import { isTerminalHeartbeatError } from "../swarms.js";
 import { rankBounties } from "../bounty-review.js";
 import type { BountyRow } from "../bounties.js";
 import { isRerunnableKind, isVerifyEligible, decideFromRerun } from "../verify-kinds.js";
-import { specializeDomains, passesSpecializationFilter } from "../mining.js";
+import { specializeDomains, passesSpecializationFilter, fetchOpenChallengesPaged } from "../mining.js";
+import { assessVeniceBalance, spendableBalance } from "../venice-balance.js";
 import { extractArxivIds, extractHfDatasets } from "../paper-reproduction.js";
 import {
   peerQuality,
@@ -3994,6 +3995,106 @@ describe("mining circuit breaker — model-id rejection (deterministic evidence)
   it("a healthy arm is untouched", () => {
     const rates = { "grok-4-5": { attempts: 10, failures: 1, rate: 0.1, idRejected: 0, idRejectedWireNames: [] } };
     assert.deepEqual(filterPoolByParseFailure(POOL, rates).sidelined, []);
+  });
+});
+
+describe("mining.fetchOpenChallengesPaged (discover-window starvation)", () => {
+  // Shapes from the 08-08 measurement: pool ≥5,000 deep, ~500 arrivals/day —
+  // a flood of ineligible items in the newest-100 window starved 8 of 10
+  // multi-hour submission gaps while 755 eligible sat at offset 100+.
+  type C = { id: string; ok?: boolean };
+  const mk = (n: number, prefix: string, ok: boolean): C[] =>
+    Array.from({ length: n }, (_, i) => ({ id: `${prefix}-${i}`, ok }));
+  const isEligible = (c: C) => Boolean(c.ok);
+
+  it("steady state: one request when the first window can fill the poll", async () => {
+    const calls: number[] = [];
+    const r = await fetchOpenChallengesPaged(
+      async (o) => { calls.push(o); return mk(100, `p${o}`, true) as never; },
+      isEligible as never, 3,
+    );
+    assert.deepEqual(calls, [0]);
+    assert.equal(r.pages, 1);
+  });
+
+  it("starved window: pages deeper until eligible items appear, then stops", async () => {
+    const calls: number[] = [];
+    // Pages 0-1 all ineligible (the flood); page 2 has eligible items.
+    const r = await fetchOpenChallengesPaged(
+      async (o) => { calls.push(o); return mk(100, `p${o}`, o >= 200) as never; },
+      isEligible as never, 1,
+    );
+    assert.deepEqual(calls, [0, 100, 200]);
+    assert.equal(r.challenges.length, 300);
+  });
+
+  it("short page = pool exhausted — stops even with zero eligible found", async () => {
+    const r = await fetchOpenChallengesPaged(
+      async (o) => (o === 0 ? mk(100, "a", false) : mk(40, "b", false)) as never,
+      isEligible as never, 3,
+    );
+    assert.equal(r.pages, 2);
+    assert.equal(r.challenges.length, 140);
+  });
+
+  it("gateway ignoring offset (all-duplicate page) stops the dig", async () => {
+    // /v1/mining/submissions/agent silently ignores offset — if this endpoint
+    // ever does the same, identical pages must not loop to maxOffset.
+    const same = mk(100, "dup", false);
+    let calls = 0;
+    const r = await fetchOpenChallengesPaged(
+      async () => { calls += 1; return same as never; },
+      isEligible as never, 3,
+    );
+    assert.equal(calls, 2); // page 0 + one duplicate page, then stop
+    assert.equal(r.challenges.length, 100);
+  });
+
+  it("first-page error rethrows; deep-page error returns partial with stoppedEarly", async () => {
+    await assert.rejects(
+      fetchOpenChallengesPaged(async () => { throw new Error("502"); }, isEligible as never, 3),
+      /502/,
+    );
+    const r = await fetchOpenChallengesPaged(
+      async (o) => { if (o > 0) throw new Error("504 deep"); return mk(100, "x", false) as never; },
+      isEligible as never, 3,
+    );
+    assert.equal(r.challenges.length, 100);
+    assert.match(r.stoppedEarly ?? "", /504/);
+  });
+
+  it("respects maxOffset even when still starved", async () => {
+    const calls: number[] = [];
+    await fetchOpenChallengesPaged(
+      async (o) => { calls.push(o); return mk(100, `p${o}`, false) as never; },
+      isEligible as never, 3, 400,
+    );
+    assert.deepEqual(calls, [0, 100, 200, 300, 400]); // hard stop at maxOffset
+  });
+});
+
+describe("venice-balance (the 08-05 402-outage early warning)", () => {
+  it("negative USD is debt, not spendable balance", () => {
+    // Real 08-13 shape: USD -1.48, DIEM 41.5 — spendable is DIEM only.
+    assert.equal(spendableBalance({ usd: -1.48, diem: 41.5, nextEpochBegins: null }), 41.5);
+    assert.equal(spendableBalance({ usd: 2.5, diem: 5, nextEpochBegins: null }), 7.5);
+  });
+
+  it("warns below threshold, carries the DIEM refill time, stays silent above", () => {
+    const low = assessVeniceBalance(
+      { usd: -1.0, diem: 3.2, nextEpochBegins: "2026-08-14T00:00:00.000Z" }, 10,
+    );
+    assert.ok(low && /balance low/i.test(low));
+    assert.ok(low && low.includes("2026-08-14T00:00:00.000Z"));
+    assert.ok(low && /buy-credits/.test(low), "must point at the manual top-up path");
+    assert.equal(
+      assessVeniceBalance({ usd: -1.48, diem: 41.5, nextEpochBegins: null }, 10),
+      null,
+    );
+  });
+
+  it("exactly at threshold does not warn (>= is healthy)", () => {
+    assert.equal(assessVeniceBalance({ usd: 0, diem: 10, nextEpochBegins: null }, 10), null);
   });
 });
 
