@@ -4,6 +4,55 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-08-17 — value-floor idle-release (the floor meets a collapsed pool)
+
+The 10-NOOK value floor (shipped 07-30) assumed floor-passing work exists.
+From ~08-14T08Z it didn't: every discover poll found 490-500 of the full
+500-deep paged scan below the floor, the bot correctly submitted nothing —
+and the 250k/day posting royalty, which requires ≥1 in-epoch verified solve,
+died with it (streak broke at 15 on the 08-16 claim). A sub-floor solve that
+verifies is worth ~250k in royalty continuity, not its 16-21 NOOK face value.
+
+Operator-approved fix, mirroring the verify loop's threshold-release: when a
+poll (after full-depth paging) finds ZERO floor-passing eligible challenges,
+take the single best sub-floor challenge instead of idling. Bounds: 1 per
+poll, max 3 release attempts per rolling 24h (`floorRelease: true` tags on
+mining-submissions.jsonl rows — persists across restarts; errored attempts
+count, they burn Venice spend), so a permanently-cheap pool can spend at most
+3 of the 12 rolling-cap slots. Every other gate still applies — farm-title
+skip (a verified farm solve pays the FARM's royalty), attempted cache,
+own-challenge, guild claims, and the cap/pacing gates above the release.
+`BOT_FLOOR_IDLE_RELEASE=0` disables; `BOT_FLOOR_RELEASE_MAX_PER_DAY` tunes.
+
+### Post-review hardening (adversarial 12-agent pass, 7 findings confirmed → 4 distinct defects, all fixed)
+
+1. **Skip-cache blindness would have wedged the release for hours** (major; all
+   three review lenses found it independently). The release picker didn't
+   consult the in-memory pre-flight caches (already-submitted / guild-claimed /
+   specificity-rejected) that the solve loop enforces via bare `continue`. In
+   release mode there is no next candidate, so one specificity-gate failure —
+   historically our top verifiable killer (39 solves) — would deterministically
+   re-pick the same vetoed challenge every poll for ~4h, logging "taking X"
+   while attempting nothing. The picker now checks the same three caches, so
+   the pick always lands on a challenge the loop will actually attempt.
+2. **Release could fire on a truncated scan** (major). A transient deep-page
+   error returns a partial scan; the release keyed only on "zero eligible" and
+   could burn a slot on page-1 spam while floor-passers sat unseen at offset
+   100+. Now a truncated scan idles to the next poll instead of releasing.
+3. **One failing candidate could absorb the whole budget** (minor). A retryable
+   error keeps a challenge out of `attempted` for the 4h cooldown, so the
+   deterministic sort would re-release the same failer until the 3/day budget
+   was gone (~45 min). Release attempts are now one per DISTINCT challenge per
+   window (`floorReleaseWindow` returns the tried ids).
+4. **Cap env var failed open on a typo** (minor). `Number("three")` = NaN and
+   `used >= NaN` is always false — a typo in the bounding knob would have
+   REMOVED the bound. `parseFloorReleaseCap` fails closed to the default; an
+   explicit 0 disables the release.
+
+Tests: 502 pass (13 new: release-cap counting/re-arm + distinct-id tracking,
+best-candidate pick, farm-gate retention under release, disabled/capped/
+no-candidate refusals, fail-closed cap parsing).
+
 ## 2026-08-13 (third pass) — sol out, luna in at max effort
 
 Roster change (operator): gpt-5.6-sol → gpt-5.6-luna. Eight days of four-arm

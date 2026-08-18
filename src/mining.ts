@@ -289,6 +289,8 @@ interface MiningLogEntry {
   submissionId?: string;
   model?: string;
   notes?: string;
+  /** Row came from a value-floor idle-release (gates the 3/24h release cap). */
+  floorRelease?: boolean;
 }
 
 /**
@@ -1346,6 +1348,87 @@ export function meetsValueFloor(ch: Challenge, floor = MIN_CHALLENGE_REWARD): bo
 }
 
 /**
+ * Value-floor idle-release.
+ *
+ * The floor's economics ("a slot spent cheap is a slot not spent expensive")
+ * assume floor-passing work exists. In a pool value-collapse regime (≥490/500
+ * of the full paged scan below the floor from ~2026-08-14) the floor becomes a
+ * total shutdown — and because the 250k/day posting royalty requires ≥1
+ * in-epoch VERIFIED solve, the royalty dies with it (streak broke at 15 on the
+ * 08-16 claim). A sub-floor solve that verifies is worth ~250k in royalty
+ * continuity, not its face-value estimate.
+ *
+ * Mirrors the verify loop's threshold-release: relax ONLY when the slot would
+ * otherwise idle. Fires only after UNTRUNCATED full-depth paging finds ZERO
+ * floor-passing eligible work (a partial scan idles instead — floor-passers
+ * may sit unseen in the unscanned tail); takes 1 challenge per poll, at most
+ * FLOOR_RELEASE_MAX_PER_DAY attempts per rolling 24h, each on a DISTINCT
+ * challenge — so a permanently-cheap pool can spend at most 3 of the 12
+ * rolling-cap slots (and bounded Venice inference), and one retryably-failing
+ * candidate can't absorb the whole budget. Every other gate — farm-title
+ * skip, attempted cache, the in-memory pre-flight skip caches, own-challenge,
+ * guild claims — still applies. BOT_FLOOR_IDLE_RELEASE=0 disables; absent
+ * means on.
+ */
+/** NaN from a typo'd env var would fail the `used >= max` cap check OPEN
+ *  (every NaN comparison is false) — the one direction a bounding knob must
+ *  never fail. Invalid/negative → default; explicit 0 disables the release. */
+export function parseFloorReleaseCap(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return 3;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 3;
+}
+const FLOOR_RELEASE_MAX_PER_DAY = parseFloorReleaseCap(process.env.BOT_FLOOR_RELEASE_MAX_PER_DAY);
+
+/**
+ * Release ATTEMPTS in the trailing window. Errors count (they burned Venice
+ * spend even without consuming a cap slot); pre-flight "skipped" rows don't.
+ * The tag re-arms as rows age out of the 24h window. `challengeIds` lets the
+ * caller exclude already-tried candidates, spreading the budget across
+ * DISTINCT challenges — without it, a pick that errors retryably (kept out of
+ * `attempted` for the 4h cooldown) is deterministically re-picked next poll
+ * and one bad candidate burns the whole day's budget in ~45 min. Pure.
+ */
+export function floorReleaseWindow(
+  entries: Array<{ ts?: string; floorRelease?: boolean; outcome?: string; challengeId?: string }>,
+  nowMs: number,
+  windowMs = ROLLING_WINDOW_MS,
+): { used: number; challengeIds: Set<string> } {
+  let used = 0;
+  const challengeIds = new Set<string>();
+  for (const e of entries) {
+    if (!e.floorRelease || e.outcome === "skipped") continue;
+    const t = e.ts ? Date.parse(e.ts) : NaN;
+    if (Number.isFinite(t) && t > nowMs - windowMs) {
+      used++;
+      if (e.challengeId) challengeIds.add(e.challengeId);
+    }
+  }
+  return { used, challengeIds };
+}
+
+/** Pick the single best sub-floor challenge for an idle-release, or explain
+ *  why not. `isReleasable` is the caller's full gate stack minus the floor. */
+export function pickFloorRelease(
+  challenges: Challenge[],
+  isReleasable: (c: Challenge) => boolean,
+  used24h: number,
+  opts: { enabled?: boolean; maxPerDay?: number } = {},
+): { pick: Challenge | null; reason: string } {
+  const enabled = opts.enabled ?? process.env.BOT_FLOOR_IDLE_RELEASE !== "0";
+  const maxPerDay = opts.maxPerDay ?? FLOOR_RELEASE_MAX_PER_DAY;
+  if (!enabled) return { pick: null, reason: "disabled (BOT_FLOOR_IDLE_RELEASE=0)" };
+  if (used24h >= maxPerDay) return { pick: null, reason: `release cap reached (${used24h}/${maxPerDay} in 24h)` };
+  const candidates = challenges.filter(isReleasable);
+  if (candidates.length === 0) return { pick: null, reason: "no releasable sub-floor candidates" };
+  candidates.sort((a, b) => compareChallengePriority(a, b, []));
+  return {
+    pick: candidates[0],
+    reason: `${candidates.length} sub-floor candidate(s), ${used24h}/${maxPerDay} released in 24h`,
+  };
+}
+
+/**
  * Depth-on-demand challenge discovery. The open pool grew to ≥5,000 with ~500
  * arrivals/day (2026-08-08 measurement), so a single newest-100 window covers
  * only hours of arrivals; when a batch of pre-filled or sub-floor items floods
@@ -1393,10 +1476,10 @@ export async function fetchOpenChallengesPaged(
   return { challenges, pages };
 }
 
-function challengeFitsBudget(ch: Challenge): boolean {
+export function challengeFitsBudget(ch: Challenge, opts: { ignoreValueFloor?: boolean } = {}): boolean {
   if (ch.status && ch.status !== "open") return false;
   if (ch.submissionCount !== undefined && ch.maxSubmissions !== undefined && ch.submissionCount >= ch.maxSubmissions) return false;
-  if (!meetsValueFloor(ch)) return false;
+  if (!opts.ignoreValueFloor && !meetsValueFloor(ch)) return false;
   // Sybil-farm challenges ("<Name> <domain> expert analysis <hex>", inflated
   // to expert difficulty to bait the 500K base reward): a verified solve of
   // one pays the FARM's poster royalty. Skip unless explicitly re-enabled.
@@ -1498,6 +1581,7 @@ export async function discoverAndSolveMiningChallenges(
   };
 
   let challenges: Challenge[] = [];
+  let scanTruncated = false;
   try {
     // limit=100 (observed gateway max), NOT 25: the list is newest-first and
     // templated python challenges arrive in batches that bury standard
@@ -1518,6 +1602,7 @@ export async function discoverAndSolveMiningChallenges(
       pollNeed,
     );
     challenges = paged.challenges;
+    scanTruncated = Boolean(paged.stoppedEarly);
     if (paged.stoppedEarly) {
       console.warn(`   ⚠ discover paging stopped early (${challenges.length} scanned): ${paged.stoppedEarly.slice(0, 120)}`);
     }
@@ -1529,7 +1614,8 @@ export async function discoverAndSolveMiningChallenges(
     return;
   }
 
-  const eligible = challenges.filter(isEligible);
+  let eligible = challenges.filter(isEligible);
+  const floorReleasedIds = new Set<string>();
 
   if (eligible.length === 0) {
     // Distinguish "nothing open" from "everything open is too cheap" — the
@@ -1541,7 +1627,50 @@ export async function discoverAndSolveMiningChallenges(
         (belowFloor > 0 ? `, ${belowFloor} skipped below the ${MIN_CHALLENGE_REWARD}-NOOK value floor` : "") +
         `)`,
     );
-    return;
+    // Idle-release: the slot is free RIGHT NOW (cap + pacing gates passed
+    // above) and full-depth paging found zero floor-passers — take the single
+    // best sub-floor challenge rather than idling, for royalty continuity.
+    // See the FLOOR_RELEASE_MAX_PER_DAY note for the economics and bounds.
+    if (belowFloor === 0) return; // pool is empty, not cheap — nothing to release
+    if (scanTruncated) {
+      // A deep-page error means floor-passers may sit unseen in the unscanned
+      // tail — on a partial scan the right move is a 15-min idle and rescan,
+      // not spending a release slot on a challenge that only LOOKS best.
+      console.log(`   🪙 floor idle-release: not firing — scan truncated by a paging error; idling to the next poll`);
+      return;
+    }
+    const relWindow = floorReleaseWindow(readJsonl<MiningLogEntry>(MINING_LOG), Date.now());
+    const isReleasable = (c: Challenge): boolean => {
+      if (!challengeFitsBudget(c, { ignoreValueFloor: true })) return false;
+      if (attempted.has(c.id)) return false;
+      // One release attempt per DISTINCT challenge per window — a retryable
+      // error keeps a challenge out of `attempted` for 4h, and without this
+      // the deterministic sort would re-pick the same failer every poll.
+      if (relWindow.challengeIds.has(c.id)) return false;
+      // The solve loop's pre-flight vetoes below `continue` WITHOUT logging a
+      // row, and in release mode there is no next candidate — a vetoed pick
+      // would wedge the release into a logged no-op until the veto expires.
+      // Checking the same caches here makes the pick land on a candidate the
+      // loop will actually attempt.
+      if (alreadySubmittedChallenges.isSkipped(c.id)) return false;
+      if (guildClaimedUntil.isSkipped(c.id)) return false;
+      if (specificityRejectedChallenges.isSkipped(c.id)) return false;
+      if (opts.myAddress && c.posterAddress?.toLowerCase() === opts.myAddress.toLowerCase()) return false;
+      return true;
+    };
+    const rel = pickFloorRelease(challenges, isReleasable, relWindow.used);
+    if (!rel.pick) {
+      if (process.env.BOT_FLOOR_IDLE_RELEASE !== "0") {
+        console.log(`   🪙 floor idle-release: not firing — ${rel.reason}`);
+      }
+      return;
+    }
+    floorReleasedIds.add(rel.pick.id);
+    eligible = [rel.pick];
+    console.log(
+      `   🪙 floor idle-release: ${rel.reason} — taking ${rel.pick.id.slice(0, 8)} ` +
+        `(est ${rel.pick.estimatedRewardNook ?? "?"} NOOK) instead of idling`,
+    );
   }
 
   const targets = specializeDomains();
@@ -1578,6 +1707,9 @@ export async function discoverAndSolveMiningChallenges(
 
   for (const ch of todo) {
     const idShort = ch.id.slice(0, 8);
+    // Spread into every MINING_LOG row for this challenge — floorReleaseUsed
+    // counts these tags to enforce the 3/24h release cap across restarts.
+    const releaseTag = floorReleasedIds.has(ch.id) ? { floorRelease: true } : {};
     // Skip-cache pre-flight: any challenge we know is gated (already-submitted
     // by us, or claimed by another guild) gets dropped here, BEFORE we burn
     // Venice spend or the SDK 4-retry ladder. The gateway re-surfaces these
@@ -1722,6 +1854,7 @@ export async function discoverAndSolveMiningChallenges(
             outcome: "error" as const,
             notes: `dryrun hard-fail (retryable): ${gate.details}`.slice(0, 200),
             model: modelUsed,
+            ...releaseTag,
           });
           continue;
         }
@@ -1749,6 +1882,7 @@ export async function discoverAndSolveMiningChallenges(
           outcome: "error" as const,
           notes: "solver produced no output",
           model: modelUsed,
+          ...releaseTag,
         });
         continue;
       }
@@ -1789,6 +1923,7 @@ export async function discoverAndSolveMiningChallenges(
             outcome: "error" as const,
             notes: "specificity gate: summary unfixable locally (submit skipped)",
             model: modelUsed,
+            ...releaseTag,
           });
           specificityRejectedChallenges.markFor(ch.id, ALREADY_SUBMITTED_TTL_MS);
           continue;
@@ -1814,6 +1949,7 @@ export async function discoverAndSolveMiningChallenges(
             outcome: "error" as const,
             notes: "IPFS upload failed",
             model: modelUsed,
+            ...releaseTag,
           });
           continue;
         }
@@ -1897,6 +2033,7 @@ export async function discoverAndSolveMiningChallenges(
           outcome: "error" as const,
           notes: sub.error,
           model: modelUsed,
+          ...releaseTag,
         });
         continue;
       }
@@ -1984,6 +2121,7 @@ export async function discoverAndSolveMiningChallenges(
           : pass
             ? "deterministic-pass; awaiting reasoning/efficiency/novelty quorum"
             : undefined,
+        ...releaseTag,
       });
       recordAudit("mining_solve", status === "pass" ? "submitted" : status === "fail" ? "rejected" : status === "deferred" ? "pending" : "error", `${kind} ${(ch.title ?? "").slice(0, 50)}`, {
         challengeId: ch.id,
@@ -2062,6 +2200,7 @@ export async function discoverAndSolveMiningChallenges(
         outcome: "error" as const,
         notes: msg.slice(0, 200),
         model: modelUsed,
+        ...releaseTag,
       });
     }
   }

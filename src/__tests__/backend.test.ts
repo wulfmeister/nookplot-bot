@@ -113,7 +113,7 @@ import {
   enrichSummarySpecificity,
   passesSpecificityGate,
 } from "../specificity-gate.js";
-import { compareChallengePriority, challengeValueTier, computeVerifiableTilt, isModelRejection, discountStaleIdRejections, meetsValueFloor, isTransientGenerationError, type TiltInputs } from "../mining.js";
+import { compareChallengePriority, challengeValueTier, computeVerifiableTilt, isModelRejection, discountStaleIdRejections, meetsValueFloor, floorReleaseWindow, parseFloorReleaseCap, pickFloorRelease, challengeFitsBudget, isTransientGenerationError, type TiltInputs } from "../mining.js";
 import { pickAlternateModel } from "../models.js";
 import { selectBundleCids, bundleDue, sanitizeBundleTags, registeredPublishedCids } from "../bundles.js";
 import { countWithinDays, cohortAddresses } from "../cohort-benchmark.js";
@@ -4158,6 +4158,117 @@ describe("mining.meetsValueFloor (protects the rolling-cap slot)", () => {
   });
   it("floor 0 disables the check entirely", () => {
     assert.equal(meetsValueFloor({ id: "a", estimatedRewardNook: 1 }, 0), true);
+  });
+});
+
+describe("mining value-floor idle-release (pool value-collapse regime)", () => {
+  const NOW = Date.UTC(2026, 7, 17, 12, 0, 0);
+  const hoursAgo = (h: number) => new Date(NOW - h * 3600_000).toISOString();
+
+  describe("floorReleaseWindow", () => {
+    it("counts tagged attempts in the trailing 24h and re-arms as rows age out", () => {
+      const entries = [
+        { ts: hoursAgo(1), floorRelease: true, outcome: "deferred", challengeId: "c1" },
+        { ts: hoursAgo(12), floorRelease: true, outcome: "error", challengeId: "c2" }, // errors burn Venice spend — they count
+        { ts: hoursAgo(25), floorRelease: true, outcome: "deferred", challengeId: "c3" }, // aged out
+      ];
+      const w = floorReleaseWindow(entries, NOW);
+      assert.equal(w.used, 2);
+      assert.deepEqual([...w.challengeIds].sort(), ["c1", "c2"]); // c3 aged out — releasable again
+    });
+    it("ignores untagged rows, skipped rows, and unparseable timestamps", () => {
+      const entries = [
+        { ts: hoursAgo(1), outcome: "deferred", challengeId: "n1" }, // normal submission — not a release
+        { ts: hoursAgo(2), floorRelease: true, outcome: "skipped", challengeId: "n2" }, // pre-flight skip — no spend
+        { ts: "not-a-date", floorRelease: true, outcome: "deferred", challengeId: "n3" },
+        { floorRelease: true, outcome: "deferred", challengeId: "n4" }, // no ts
+      ];
+      const w = floorReleaseWindow(entries, NOW);
+      assert.equal(w.used, 0);
+      assert.equal(w.challengeIds.size, 0);
+    });
+  });
+
+  describe("parseFloorReleaseCap (must fail CLOSED on bad input)", () => {
+    it("defaults to 3 when unset or empty", () => {
+      assert.equal(parseFloorReleaseCap(undefined), 3);
+      assert.equal(parseFloorReleaseCap(""), 3);
+      assert.equal(parseFloorReleaseCap("  "), 3);
+    });
+    it("a typo yields the default, never NaN (NaN fails the >= cap check open)", () => {
+      assert.equal(parseFloorReleaseCap("three"), 3);
+      assert.equal(parseFloorReleaseCap("3/day"), 3);
+      assert.equal(parseFloorReleaseCap("-1"), 3);
+    });
+    it("explicit values pass through; 0 disables the release", () => {
+      assert.equal(parseFloorReleaseCap("5"), 5);
+      assert.equal(parseFloorReleaseCap("0"), 0);
+    });
+  });
+
+  describe("pickFloorRelease", () => {
+    const subFloorStandard = { id: "std-cheap-1", challengeType: "standard", estimatedRewardNook: 8 };
+    const subFloorStandardRicher = { id: "std-cheap-2", challengeType: "standard", estimatedRewardNook: 9 };
+    const subFloorVerifiable = { id: "py-cheap-1", verifierKind: "python_tests", estimatedRewardNook: 9 };
+    const all = [subFloorVerifiable, subFloorStandard, subFloorStandardRicher];
+    const releasableAll = () => true;
+
+    it("releases the best sub-floor candidate when under the cap", () => {
+      const r = pickFloorRelease(all, releasableAll, 0, { enabled: true, maxPerDay: 3 });
+      // Standard tier beats verifiable even sub-floor; higher estimate wins within tier.
+      assert.equal(r.pick?.id, "std-cheap-2");
+    });
+    it("refuses at the daily cap — a permanently-cheap pool cannot burn the slots", () => {
+      const r = pickFloorRelease(all, releasableAll, 3, { enabled: true, maxPerDay: 3 });
+      assert.equal(r.pick, null);
+      assert.match(r.reason, /cap/);
+    });
+    it("refuses when disabled", () => {
+      const r = pickFloorRelease(all, releasableAll, 0, { enabled: false, maxPerDay: 3 });
+      assert.equal(r.pick, null);
+      assert.match(r.reason, /disabled/);
+    });
+    it("refuses when the gate stack rejects every candidate (e.g. all farm-titled)", () => {
+      const r = pickFloorRelease(all, () => false, 0, { enabled: true, maxPerDay: 3 });
+      assert.equal(r.pick, null);
+      assert.match(r.reason, /no releasable/);
+    });
+    it("respects the caller's gate stack per-candidate", () => {
+      const r = pickFloorRelease(all, (c) => c.id === "py-cheap-1", 0, { enabled: true, maxPerDay: 3 });
+      assert.equal(r.pick?.id, "py-cheap-1");
+    });
+  });
+
+  describe("challengeFitsBudget ignoreValueFloor", () => {
+    it("keeps the farm-title skip even when the floor is released", () => {
+      // A verified solve of a farm challenge pays the FARM's poster royalty —
+      // the release must never relax this gate.
+      const farm = {
+        id: "farm-1",
+        title: "Marcus blockchain expert analysis a3f9c2",
+        challengeType: "standard",
+        estimatedRewardNook: 8,
+      };
+      assert.equal(challengeFitsBudget(farm, { ignoreValueFloor: true }), false);
+    });
+    it("admits a sub-floor standard challenge only via ignoreValueFloor", () => {
+      const cheap = { id: "c1", challengeType: "standard", estimatedRewardNook: 8 };
+      assert.equal(challengeFitsBudget(cheap), false);
+      assert.equal(challengeFitsBudget(cheap, { ignoreValueFloor: true }), true);
+    });
+    it("still rejects closed and submission-capped challenges under release", () => {
+      assert.equal(
+        challengeFitsBudget({ id: "c2", status: "closed", challengeType: "standard" }, { ignoreValueFloor: true }),
+        false,
+      );
+      assert.equal(
+        challengeFitsBudget(
+          { id: "c3", challengeType: "standard", submissionCount: 20, maxSubmissions: 20 },
+          { ignoreValueFloor: true },
+        ),
+        false,
+      );
+    });
   });
 });
 
