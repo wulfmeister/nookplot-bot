@@ -1540,7 +1540,36 @@ export function composePostSolveLearning(reasoning: string, traceSummary: string
   return body.slice(0, 1500);
 }
 
+/**
+ * Re-entrancy guard (2026-08-19). The 15-min setInterval fires whether or not
+ * the previous poll finished, and a max/xhigh-effort solve can run 10-15+
+ * minutes. An overlapping poll re-picks the SAME in-flight challenge — its
+ * MINING_LOG row doesn't exist until submit, so no exclusion sees it — and
+ * burns a duplicate full-effort Venice solve into a 409 (observed on release
+ * e156738b: grok-4-6 submitted 02:32:48Z, the overlapped poll's gemini solve
+ * 409'd at 02:34:45Z). Same mechanism as the verify loop's poll-overlap
+ * self-poison, same fix (verifyPollInFlight in index.ts). A skipped tick
+ * costs one 15-min wait; a duplicate solve costs real spend.
+ */
+let miningPollInFlight = false;
+
 export async function discoverAndSolveMiningChallenges(
+  runtime: RuntimeLike,
+  opts: { dryRun?: boolean; myAddress?: string | null; guildId?: number | null } = {},
+): Promise<void> {
+  if (miningPollInFlight) {
+    console.log("⛏ previous mining poll still in flight — skipping this tick (overlap guard)");
+    return;
+  }
+  miningPollInFlight = true;
+  try {
+    await discoverAndSolveMiningChallengesInner(runtime, opts);
+  } finally {
+    miningPollInFlight = false;
+  }
+}
+
+async function discoverAndSolveMiningChallengesInner(
   runtime: RuntimeLike,
   opts: { dryRun?: boolean; myAddress?: string | null; guildId?: number | null } = {},
 ): Promise<void> {
