@@ -210,6 +210,15 @@ canvas { max-width: 100%; }
   <!-- Overview -->
   <section class="section active" data-section="overview">
     <div class="row-card">
+      <h2>Money — credits vs NOOK (the three balances)</h2>
+      <div class="grid" id="money-cards"></div>
+      <div class="legend">
+        <strong>credits</strong> ≠ NOOK. Credits pay for gateway service fees (relays, /v1/exec sandbox calls).
+        <strong>NOOK</strong> is the protocol token, earned by mining + verifying.
+        It lives in three places: <em>off-chain ledger</em> (gateway IOU), <em>Merkle-proof</em> (claimable on-chain), and <em>wallet</em> (settled, transferable).
+      </div>
+    </div>
+    <div class="row-card">
       <h2>💵 Net P&amp;L</h2>
       <div id="pnl-panel"></div>
     </div>
@@ -238,15 +247,6 @@ canvas { max-width: 100%; }
         <strong>pending</strong> is waiting on verifiers; <strong>rejected</strong> was verified but scored too low;
         <strong>expired</strong> = the window closed before quorum (forfeited, unpaid). A rising <strong>expired%</strong>
         is the trigger to tilt mining toward sandbox-graded verifiable kinds; while it's low, standard's higher EV wins.
-      </div>
-    </div>
-    <div class="row-card">
-      <h2>Money — credits vs NOOK (the three balances)</h2>
-      <div class="grid" id="money-cards"></div>
-      <div class="legend">
-        <strong>credits</strong> ≠ NOOK. Credits pay for gateway service fees (relays, /v1/exec sandbox calls).
-        <strong>NOOK</strong> is the protocol token, earned by mining + verifying.
-        It lives in three places: <em>off-chain ledger</em> (gateway IOU), <em>Merkle-proof</em> (claimable on-chain), and <em>wallet</em> (settled, transferable).
       </div>
     </div>
     <div class="grid" id="overview-cards"></div>
@@ -616,7 +616,11 @@ function renderWalletHeader() {
   if (!w && staked === undefined) { el.textContent = ""; return; }
   const parts = [w ? `💰 ${fmt(w.nook)} NOOK` : "💰 — NOOK"];
   if (staked !== undefined) parts.push(`${fmt(staked)} staked`);
-  if (w && staked !== undefined) parts.push(`= ${fmt(w.nook + staked)} total`);
+  const price = snapshot.money?.usd?.nookPriceUsd;
+  if (w && staked !== undefined) {
+    const total = w.nook + staked;
+    parts.push(`= ${fmt(total)} total${price ? ` (~$${(total * price).toFixed(2)})` : ""}`);
+  }
   el.textContent = parts.join(" · ");
   const exact = [
     w ? `wallet (on Base): ${w.nook.toLocaleString()} NOOK` : "wallet: RPC fetch failed this refresh",
@@ -624,6 +628,7 @@ function renderWalletHeader() {
   if (staked !== undefined) {
     exact.push(`staked (${snapshot.stake?.tier ?? "?"}, ${snapshot.stake?.multiplier ?? "?"}x): ${Number(staked).toLocaleString()} NOOK`);
   }
+  if (price) exact.push(`NOOK price: $${price} (${snapshot.money?.usd?.priceSource ?? "?"})`);
   el.title = exact.join("\n");
 }
 function usdFmt(n) {
