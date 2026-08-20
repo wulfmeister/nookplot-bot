@@ -187,6 +187,7 @@ canvas { max-width: 100%; }
   <span id="bot-status" class="bot-status unknown" title="daemon (src/index.ts) status">● checking…</span>
   <span id="agent-name" class="meta">…</span>
   <span id="agent-addr" class="meta"></span>
+  <span id="wallet-balance" class="meta" style="font-weight:600"></span>
   <span class="meta" style="margin-left:auto">last refresh <span id="last-refresh">never</span></span>
   <button class="refresh-btn" onclick="loadAll()">↻ Refresh</button>
 </header>
@@ -607,6 +608,24 @@ function pct(num, den) {
   if (!den || den === 0) return "0%";
   return Math.round((num / den) * 100) + "%";
 }
+function renderWalletHeader() {
+  const el = document.getElementById("wallet-balance");
+  if (!el) return;
+  const w = snapshot.money?.wallet;
+  const staked = snapshot.stake?.stakedNook;
+  if (!w && staked === undefined) { el.textContent = ""; return; }
+  const parts = [w ? `💰 ${fmt(w.nook)} NOOK` : "💰 — NOOK"];
+  if (staked !== undefined) parts.push(`${fmt(staked)} staked`);
+  if (w && staked !== undefined) parts.push(`= ${fmt(w.nook + staked)} total`);
+  el.textContent = parts.join(" · ");
+  const exact = [
+    w ? `wallet (on Base): ${w.nook.toLocaleString()} NOOK` : "wallet: RPC fetch failed this refresh",
+  ];
+  if (staked !== undefined) {
+    exact.push(`staked (${snapshot.stake?.tier ?? "?"}, ${snapshot.stake?.multiplier ?? "?"}x): ${Number(staked).toLocaleString()} NOOK`);
+  }
+  el.title = exact.join("\n");
+}
 function usdFmt(n) {
   if (n == null || isNaN(n)) return "$0";
   const abs = Math.abs(n);
@@ -741,6 +760,7 @@ async function loadAll() {
     refreshBotStatus();
     document.getElementById("agent-name").textContent = snapshot.agent?.name ?? "?";
     document.getElementById("agent-addr").textContent = shortAddr(snapshot.agent?.address ?? "");
+    renderWalletHeader();
     renderActiveTab();
   } catch (e) {
     document.getElementById("last-refresh").textContent = "ERROR: " + e.message;
