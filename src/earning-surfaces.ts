@@ -67,6 +67,90 @@ interface ProbeOutcome {
 }
 
 /**
+ * Direct-GET opportunity watches (added 2026-08-20 after the RLM/improvement
+ * recon): surfaces whose ECONOMICS are right but whose SUPPLY is currently
+ * zero — the flip we're watching for is supply appearing, not an endpoint
+ * deploying. (a) improvement requests: escrow-funded, genuinely bypass the
+ * collapsed pro-rata R; endpoints live, zero sponsors. (b) RLM solve track:
+ * NO-GO verdict on the stale May stock (settled payouts read 0 through
+ * pro-rata R) — fresh rows or any buyer-escrowed distillation_request row
+ * reopen the question and warrant re-recon BEFORE any spend.
+ */
+interface GetWatch {
+  key: string;
+  label: string;
+  path: string;
+  isLive: (body: unknown) => ProbeOutcome;
+  onLive: string;
+  prereq?: string;
+}
+
+/** First array-valued field in a response body, tolerant of key naming. */
+function firstRows(body: unknown): unknown[] {
+  if (!body || typeof body !== "object") return [];
+  for (const v of Object.values(body as Record<string, unknown>)) {
+    if (Array.isArray(v)) return v;
+  }
+  return [];
+}
+
+export function classifyAnyRows(body: unknown): ProbeOutcome {
+  const rows = firstRows(body);
+  return rows.length > 0
+    ? { live: true, detail: `live rows=${rows.length}` }
+    : { live: false, detail: "no rows" };
+}
+
+/** Fresh RLM stock: any row created inside the window (the stale May stock is
+ *  value-exhausted; only NEW rows change the NO-GO verdict). */
+export function classifyFreshRlm(body: unknown, nowMs: number, windowDays = 14): ProbeOutcome {
+  const rows = firstRows(body) as Array<{ createdAt?: string; sourceType?: string }>;
+  const cutoff = nowMs - windowDays * 86_400_000;
+  const fresh = rows.filter((r) => {
+    const t = r.createdAt ? Date.parse(r.createdAt) : NaN;
+    return Number.isFinite(t) && t > cutoff;
+  });
+  if (fresh.length > 0) return { live: true, detail: `live fresh=${fresh.length}/${rows.length} (≤${windowDays}d)` };
+  return { live: false, detail: `stale stock only (${rows.length} rows)` };
+}
+
+const GET_WATCHES: GetWatch[] = [
+  {
+    key: "improvement_requests",
+    label: "Project-improvement escrows (bypass pro-rata R)",
+    path: "/v1/improvement/requests?status=open&limit=5",
+    isLive: classifyAnyRows,
+    onLive:
+      "check slot status FIRST (first-verified-fill-wins — later fills earn 0) and the inferenceFilter (fail-closed: filtered → route receipted calls through POST /v1/inference/chat with challengeId BEFORE submit); repo_tests dry-run (20/hr) to de-risk",
+  },
+  {
+    key: "rlm_fresh_stock",
+    label: "RLM fresh stock (NO-GO 08-20 on stale rows)",
+    path: "/v1/mining/rlm-challenges?limit=100",
+    isLive: (b) => classifyFreshRlm(b, Date.now()),
+    onLive:
+      "RLM settled payouts on the May stock read 0 NOOK (pro-rata R, value-exhausted) — fresh rows reopen the EV question; RE-RUN the recon before any spend (session costs are server-side and unguarded)",
+  },
+  {
+    key: "distillation_requests",
+    label: "Buyer-escrowed distillation_request rows",
+    path: "/v1/mining/challenges?status=open&sourceType=distillation_request&limit=5",
+    isLive: classifyAnyRows,
+    onLive: "the only buyer-funded RLM variant (escrow, not emission pool) — economics untested because none have ever existed; recon before spend",
+  },
+];
+
+async function probeGet(runtime: NookplotRuntime, w: GetWatch): Promise<ProbeOutcome> {
+  try {
+    const body = await (runtime as unknown as { connection: { request: (m: string, p: string) => Promise<unknown> } })
+      .connection.request("GET", w.path);
+    return w.isLive(body);
+  } catch (err) {
+    return classifyError(err);
+  }
+}
+
+/**
  * Classify a probe result. The gateway distinguishes "not deployed" from "exists
  * but you called it wrong" — only the former means dormant. "Unknown tool" /
  * "Endpoint does not exist" / 404 → dormant; a validation/auth rejection means
@@ -131,8 +215,12 @@ export async function runEarningSurfacesTick(runtime: NookplotRuntime): Promise<
   const now = new Date().toISOString();
   const reports: SurfaceReport[] = [];
 
-  for (const s of SURFACES) {
-    const outcome = await probe(runtime, s);
+  const probes: Array<{ s: Surface | GetWatch; run: () => Promise<ProbeOutcome> }> = [
+    ...SURFACES.map((s) => ({ s, run: () => probe(runtime, s) })),
+    ...GET_WATCHES.map((s) => ({ s, run: () => probeGet(runtime, s) })),
+  ];
+  for (const { s, run } of probes) {
+    const outcome = await run();
     const was = prev[s.key]?.live ?? false;
     const flippedLive = outcome.live && !was;
     reports.push({ key: s.key, label: s.label, live: outcome.live, detail: outcome.detail, flippedLive });

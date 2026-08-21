@@ -114,6 +114,7 @@ import {
   passesSpecificityGate,
 } from "../specificity-gate.js";
 import { compareChallengePriority, challengeValueTier, computeVerifiableTilt, isModelRejection, discountStaleIdRejections, meetsValueFloor, floorReleaseWindow, parseFloorReleaseCap, pickFloorRelease, challengeFitsBudget, isTransientGenerationError, type TiltInputs } from "../mining.js";
+import { classifyAnyRows, classifyFreshRlm } from "../earning-surfaces.js";
 import { pickAlternateModel } from "../models.js";
 import { selectBundleCids, bundleDue, sanitizeBundleTags, registeredPublishedCids } from "../bundles.js";
 import { countWithinDays, cohortAddresses } from "../cohort-benchmark.js";
@@ -4282,6 +4283,28 @@ describe("mining value-floor idle-release (pool value-collapse regime)", () => {
         false,
       );
     });
+  });
+});
+
+describe("earning-surfaces opportunity watches (supply flips, not deploys)", () => {
+  const NOW = Date.UTC(2026, 7, 20, 12, 0, 0);
+  it("classifyAnyRows: any row in any array-valued field = live", () => {
+    assert.equal(classifyAnyRows({ requests: [{ id: "r1" }] }).live, true);
+    assert.equal(classifyAnyRows({ challenges: [] }).live, false);
+    assert.equal(classifyAnyRows({ count: 0 }).live, false);
+    assert.equal(classifyAnyRows(null).live, false);
+  });
+  it("classifyFreshRlm: stale May stock stays dormant; a fresh row flips live", () => {
+    const stale = { challenges: [{ createdAt: "2026-05-15T00:00:00Z" }, { createdAt: "2026-05-06T00:00:00Z" }] };
+    assert.equal(classifyFreshRlm(stale, NOW).live, false);
+    const fresh = { challenges: [{ createdAt: "2026-05-15T00:00:00Z" }, { createdAt: "2026-08-18T00:00:00Z" }] };
+    const r = classifyFreshRlm(fresh, NOW);
+    assert.equal(r.live, true);
+    assert.match(r.detail, /fresh=1/);
+  });
+  it("classifyFreshRlm: unparseable/missing createdAt never counts as fresh", () => {
+    assert.equal(classifyFreshRlm({ challenges: [{ createdAt: "nope" }, {}] }, NOW).live, false);
+    assert.equal(classifyFreshRlm({}, NOW).live, false);
   });
 });
 
