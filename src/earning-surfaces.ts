@@ -47,23 +47,10 @@ interface Surface {
 }
 
 const SURFACES: Surface[] = [
-  {
-    key: "aggregation_mining",
-    label: "P2.1 Tier-3 aggregation mining",
-    action: "list_aggregation_challenges",
-    args: { status: "open", limit: 1 },
-    onLive:
-      "solver READY (src/aggregation.ts) — set BOT_AGGREGATION_AUTO=1 to start submitting (miner 50%; 2/day)",
-  },
-  {
-    key: "embedding_mining",
-    label: "P2.2 Tier-1 embedding mining",
-    action: "list_embedding_challenges",
-    args: { status: "open", limit: 1 },
-    prereq: "local nomic-embed-text-v1.5 via Ollama (run: `ollama pull nomic-embed-text`)",
-    onLive:
-      "solver READY (src/embedding-mining.ts) — `ollama pull nomic-embed-text` + BOT_EMBEDDING_AUTO=1 (consensus cosine>0.95; near-zero cost)",
-  },
+  // aggregation_mining and embedding_mining probes RETIRED 2026-08-20: the
+  // actions were REMOVED from the SDK in @nookplot/runtime 0.5.156 (verified
+  // by tarball diff 0.5.145→0.5.162) — they are dead, not dormant, and the
+  // probe could only ever report "dormant" forever. Solver modules kept.
   {
     key: "api_marketplace_sell",
     label: "P2.3 API-marketplace selling + remediation",

@@ -1476,9 +1476,21 @@ export async function fetchOpenChallengesPaged(
   return { challenges, pages };
 }
 
+/**
+ * Row types the ordinary challenge list now carries (SDK 0.5.156+/0.5.161+)
+ * that our submit flow CANNOT serve: rlm_trajectory / distillation_request
+ * hard-reject submit_reasoning_trace, and project_improvement requires an
+ * inference receipt we don't attach (INFERENCE_FILTER_UNMET) plus
+ * first-verified-fill-wins racing. Skipping them pre-slot is pure savings;
+ * revisit project_improvement if we build the receipted flow.
+ */
+const UNSERVABLE_SOURCE_TYPES = new Set(["rlm_trajectory", "distillation_request", "project_improvement"]);
+
 export function challengeFitsBudget(ch: Challenge, opts: { ignoreValueFloor?: boolean } = {}): boolean {
   if (ch.status && ch.status !== "open") return false;
   if (ch.submissionCount !== undefined && ch.maxSubmissions !== undefined && ch.submissionCount >= ch.maxSubmissions) return false;
+  const sourceType = (ch.sourceType ?? (ch as { source_type?: string }).source_type ?? "").toLowerCase();
+  if (UNSERVABLE_SOURCE_TYPES.has(sourceType)) return false;
   if (!opts.ignoreValueFloor && !meetsValueFloor(ch)) return false;
   // Sybil-farm challenges ("<Name> <domain> expert analysis <hex>", inflated
   // to expert difficulty to bait the 500K base reward): a verified solve of

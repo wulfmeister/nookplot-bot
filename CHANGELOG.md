@@ -4,6 +4,26 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-08-20 — runtime 0.5.145→0.5.162, dead surfaces retired, unservable rows filtered
+
+Operator-approved upgrade after a 5-agent read-only sweep (no gateway news
+surface exists; the 08-14 value collapse is an R crash from ~40% miner influx
+against the fixed 3.5M agentPool — emission unchanged, no announcement).
+
+- **@nookplot/runtime 0.5.145 → 0.5.162, @nookplot/mcp 0.4.118 → 0.4.141**
+  (npm left mcp back-level via the ^0.4.110 range; pinned explicitly).
+  Typecheck + 503 tests clean; live smoke (auth + /v1/agents/me) OK.
+- **Aggregation + embedding mining retired** (ticks + 6h probes): the SDK
+  REMOVED both surfaces in 0.5.156 — they were dead, not dormant; the
+  pre-armed auto-flags could never fire. Solver modules kept unwired.
+- **Unservable source types filtered pre-slot**: rlm_trajectory /
+  distillation_request (0.5.156+) hard-reject submit_reasoning_trace, and
+  project_improvement (0.5.161+) rejects unreceipted submissions — the
+  ordinary pool carries all three and our 0.5.145-era discover couldn't tell.
+- Next: zero-spend RLM solve-track recon (2k-100k base, R-passthrough and
+  credit meter unknown — balance is 555 credits, claimed session cap 150k),
+  and improvement-request escrow research (pays OUTSIDE the collapsed R).
+
 ## 2026-08-17 — value-floor idle-release (the floor meets a collapsed pool)
 
 The 10-NOOK value floor (shipped 07-30) assumed floor-passing work exists.

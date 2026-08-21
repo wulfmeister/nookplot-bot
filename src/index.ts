@@ -68,8 +68,6 @@ import { runInboxWatchTick } from "./inbox-watch.js";
 import { runCohortBenchmarkTick } from "./cohort-benchmark.js";
 import { runEarningSurfacesTick } from "./earning-surfaces.js";
 import { maybeWarnVeniceBalance } from "./venice-balance.js";
-import { discoverAndSolveAggregations } from "./aggregation.js";
-import { discoverAndSolveEmbeddings } from "./embedding-mining.js";
 import { runApiMarketplaceTick } from "./api-marketplace-sell.js";
 import { runProjectsReviewTick, runExecScoringTick } from "./projects.js";
 import { runPeerReviewTick } from "./peer-review.js";
@@ -2509,14 +2507,11 @@ async function startWeeklyRewardsLoop(runtime: ReturnType<typeof getRuntime>) {
   // not-yet-live surfaces (aggregation/embedding/API mining). Lean mode skips
   // the whole block — only the royalty engine + free housekeeping above run.
   if (runsInLean("draftingAndDormant")) {
-    // Tier-3 aggregation mining (P2.1). Dormant no-op until the gateway ships the
-    // endpoint; submits only when BOT_AGGREGATION_AUTO=1. 2/day cap enforced inside.
-    setTimeout(() => safe("aggregationTick", () => discoverAndSolveAggregations(runtime)), 14 * 60_000);
-    setInterval(() => safe("aggregationTick", () => discoverAndSolveAggregations(runtime)), 30 * 60_000);
-    // Tier-1 embedding mining (P2.2). Dormant until the endpoint ships AND a local
-    // Ollama nomic-embed model is reachable; submits only when BOT_EMBEDDING_AUTO=1.
-    setTimeout(() => safe("embeddingTick", () => discoverAndSolveEmbeddings(runtime)), 16 * 60_000);
-    setInterval(() => safe("embeddingTick", () => discoverAndSolveEmbeddings(runtime)), 30 * 60_000);
+    // Aggregation (P2.1) and embedding (P2.2) mining ticks RETIRED 2026-08-20:
+    // both surfaces were REMOVED from the SDK in 0.5.156 (tarball diff) — the
+    // endpoints 404 and the actions left TOOL_MAP, so the dormant-gated ticks
+    // could never fire. Modules kept (src/aggregation.ts, src/embedding-mining.ts)
+    // in case the network revives them; re-wire here if that happens.
     // API-marketplace selling (P2.3). Dormant until the marketplace actions ship;
     // onboards a metered listing only when BOT_API_ONBOARD_AUTO=1 + listing config set.
     setTimeout(() => safe("apiMarketplaceTick", () => runApiMarketplaceTick(runtime)), 18 * 60_000);

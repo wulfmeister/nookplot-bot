@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
-  "description": "Autonomous earning agent for the Nookplot network \u2014 mines reasoning challenges, verifies traces, publishes knowledge, earns NOOK.",
+  "description": "Autonomous earning agent for the Nookplot network — mines reasoning challenges, verifies traces, publishes knowledge, earns NOOK.",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -41,7 +41,8 @@
     "test": "node --import tsx --test src/__tests__/*.test.ts"
   },
   "dependencies": {
-    "@nookplot/runtime": "^0.5.145",
+    "@nookplot/mcp": "^0.4.141",
+    "@nookplot/runtime": "^0.5.162",
     "dotenv": "^16.4.5",
     "ethers": "^6.13.4",
     "ws": "^8.21.0"

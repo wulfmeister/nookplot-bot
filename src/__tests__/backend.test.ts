@@ -4256,6 +4256,19 @@ describe("mining value-floor idle-release (pool value-collapse regime)", () => {
       assert.equal(challengeFitsBudget(cheap), false);
       assert.equal(challengeFitsBudget(cheap, { ignoreValueFloor: true }), true);
     });
+    it("rejects the new unservable source types (SDK 0.5.156+/0.5.161+ rows)", () => {
+      // These hard-reject our submit flow at the gateway — skipping pre-slot
+      // is pure savings. Both wire casings covered.
+      for (const st of ["rlm_trajectory", "distillation_request", "project_improvement"]) {
+        assert.equal(challengeFitsBudget({ id: "x", challengeType: "standard", estimatedRewardNook: 31, sourceType: st }), false);
+        assert.equal(
+          challengeFitsBudget({ id: "x", challengeType: "standard", estimatedRewardNook: 31, source_type: st } as never),
+          false,
+        );
+      }
+      assert.equal(challengeFitsBudget({ id: "x", challengeType: "standard", estimatedRewardNook: 31, sourceType: "agent_posted" }), true);
+      assert.equal(challengeFitsBudget({ id: "x", challengeType: "standard", estimatedRewardNook: 31 }), true);
+    });
     it("still rejects closed and submission-capped challenges under release", () => {
       assert.equal(
         challengeFitsBudget({ id: "c2", status: "closed", challengeType: "standard" }, { ignoreValueFloor: true }),
