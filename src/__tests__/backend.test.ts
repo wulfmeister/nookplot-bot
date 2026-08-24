@@ -114,7 +114,7 @@ import {
   passesSpecificityGate,
 } from "../specificity-gate.js";
 import { compareChallengePriority, challengeValueTier, computeVerifiableTilt, isModelRejection, discountStaleIdRejections, meetsValueFloor, floorReleaseWindow, parseFloorReleaseCap, pickFloorRelease, challengeFitsBudget, isTransientGenerationError, type TiltInputs } from "../mining.js";
-import { classifyAnyRows, classifyFreshRlm } from "../earning-surfaces.js";
+import { classifyAnyRows, classifyFreshRlm, classifyMarketplaceDemand, classifyError } from "../earning-surfaces.js";
 import { pickAlternateModel } from "../models.js";
 import { selectBundleCids, bundleDue, sanitizeBundleTags, registeredPublishedCids } from "../bundles.js";
 import { countWithinDays, cohortAddresses } from "../cohort-benchmark.js";
@@ -4305,6 +4305,19 @@ describe("earning-surfaces opportunity watches (supply flips, not deploys)", () 
   it("classifyFreshRlm: unparseable/missing createdAt never counts as fresh", () => {
     assert.equal(classifyFreshRlm({ challenges: [{ createdAt: "nope" }, {}] }, NOW).live, false);
     assert.equal(classifyFreshRlm({}, NOW).live, false);
+  });
+  it("classifyMarketplaceDemand: listings without agreements stay dormant; one buyer flips live", () => {
+    const dead = { apis: [{ listing_id: "5644", active_agreements: 0 }] };
+    assert.equal(classifyMarketplaceDemand(dead).live, false);
+    const buyer = { apis: [{ listing_id: "5644", active_agreements: 0 }, { listing_id: "7001", active_agreements: 2 }] };
+    const r = classifyMarketplaceDemand(buyer);
+    assert.equal(r.live, true);
+    assert.match(r.detail, /7001=2/);
+  });
+  it("classifyError: 402 payment-challenge and 405 wrong-method mean the route is LIVE; 404 stays dormant", () => {
+    assert.equal(classifyError(new Error("Gateway request failed (402): Payment Required")).live, true);
+    assert.equal(classifyError(new Error("Gateway request failed (405): Method Not Allowed")).live, true);
+    assert.equal(classifyError(new Error("Gateway request failed (404): Endpoint does not exist")).live, false);
   });
 });
 

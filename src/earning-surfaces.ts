@@ -114,7 +114,38 @@ export function classifyFreshRlm(body: unknown, nowMs: number, windowDays = 14):
   return { live: false, detail: `stale stock only (${rows.length} rows)` };
 }
 
+/** Marketplace DEMAND (distinct from the listing-count probe): live the
+ *  moment ANY listing has a paying agreement — the marketplace's first-ever
+ *  real transaction, and the signal the operator wants before we list. */
+export function classifyMarketplaceDemand(body: unknown): ProbeOutcome {
+  const rows = firstRows(body) as Array<{ active_agreements?: number; listing_id?: string }>;
+  const withBuyers = rows.filter((r) => (r.active_agreements ?? 0) > 0);
+  if (withBuyers.length > 0) {
+    return {
+      live: true,
+      detail: `live BUYERS EXIST: ${withBuyers.map((r) => `listing ${r.listing_id}=${r.active_agreements}`).join(", ")}`,
+    };
+  }
+  return { live: false, detail: `${rows.length} listing(s), 0 agreements` };
+}
+
 const GET_WATCHES: GetWatch[] = [
+  {
+    key: "marketplace_demand",
+    label: "API-marketplace DEMAND (any paying agreement)",
+    path: "/v1/api/availability?limit=20",
+    isLive: classifyMarketplaceDemand,
+    onLive:
+      "first real marketplace transaction ever — re-read docs/api-marketplace.md and memory api-marketplace-watch; operator decision 08-24 was list-on-demand-signal (needs public HTTPS tunnel + the undocumented activation step)",
+  },
+  {
+    key: "x402_rail",
+    label: "x402 per-call payment rail (preview → live)",
+    path: "/v1/api-x402/5644/health",
+    isLive: classifyAnyRows, // success body = open access; the real live signal is a 402/405 via classifyError
+    onLive:
+      "x402 rail shipped (was 404-by-design) — accountless per-call USDC purchases become possible; buyers can finally price via the 402 challenge; re-evaluate listing per docs/api-marketplace.md",
+  },
   {
     key: "improvement_requests",
     label: "Project-improvement escrows (bypass pro-rata R)",
@@ -156,12 +187,14 @@ async function probeGet(runtime: NookplotRuntime, w: GetWatch): Promise<ProbeOut
  * "Endpoint does not exist" / 404 → dormant; a validation/auth rejection means
  * the endpoint is live (it got far enough to reject our args).
  */
-function classifyError(err: unknown): ProbeOutcome {
+export function classifyError(err: unknown): ProbeOutcome {
   const msg = ((err as Error)?.message ?? String(err)).replace(/\s+/g, " ");
   if (/Endpoint does not exist|Unknown tool|Not found|\b404\b/i.test(msg)) {
     return { live: false, detail: "not deployed" };
   }
-  if (/Invalid arguments|\b(400|401|403|409|422|429)\b/i.test(msg)) {
+  // 402 = payment challenge (the x402 rail's LIVE signal), 405 = route exists
+  // but wrong method — both mean the endpoint is deployed and answering.
+  if (/Invalid arguments|\b(400|401|402|403|405|409|422|429)\b/i.test(msg)) {
     return { live: true, detail: `live (rejected probe: ${msg.slice(0, 70)})` };
   }
   return { live: false, detail: msg.slice(0, 90) };
