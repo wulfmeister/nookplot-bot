@@ -169,16 +169,21 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
         console.warn(`   ↩ ${model} rejected max_tokens — retrying at ${effectiveMaxTokens}`);
         continue;
       }
+      // An abort = OUR OWN timeout fired. Re-running the SAME model at the
+      // same timeout usually re-times-out — 3 internal attempts stack to
+      // 3×timeoutMs before the caller's cross-model failover (which is the
+      // productive path) ever fires. One same-model retry max for aborts.
+      const isAbort = lastErr.message.includes("aborted");
       const transient =
         lastErr.message.includes("timeout") ||
         lastErr.message.includes("ECONNRESET") ||
         lastErr.message.includes("ENOTFOUND") ||
-        lastErr.message.includes("aborted") ||
+        isAbort ||
         lastErr.message.includes("UND_ERR_CONNECT_TIMEOUT") ||
         lastErr.message.includes("Venice API 502") ||
         lastErr.message.includes("Venice API 503") ||
         lastErr.message.includes("Venice API 504");
-      if (!transient || attempt === maxAttempts - 1) throw lastErr;
+      if (!transient || attempt === maxAttempts - 1 || (isAbort && attempt >= 1)) throw lastErr;
       await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
     }
   }

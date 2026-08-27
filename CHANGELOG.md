@@ -4,6 +4,47 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-08-27 — the floor screened on noise: attribution, K-hat ranking, settlements ledger
+
+Per-solve attribution (100 gateway rows, perfect local join) proved
+**realized payout = compositeScore × K, with K batch-constant per settlement
+epoch** — same-batch solves with discover-time estimates {2,4,5} all settled
+at K=44,766; {16,18,26} all at K=132,465. estimatedRewardNook carries ZERO
+per-challenge information. The est≥10 value floor (shipped 07-30 off a
+placeholder-contaminated reading — the "16-21 NOOK floor-passers" figure was
+rewardNook's ~1/1400 pre-paid placeholder, the exact trap our own R memo
+warns about) therefore screened on noise, CAUSED the 08-14..23 submission
+halt and the 08-16 royalty break, and cost ~1.4-2.1M NOOK for the month.
+
+Operator-approved changes:
+1. **Floor retired** (default 0; BOT_MIN_CHALLENGE_REWARD>0 is an emergency
+   brake). est removed from compareChallengePriority. Kinds now rank by
+   **measured EV** — trailing 14d median(realized/comp) × mean(comp) per
+   kind from OUR OWN paid rows (kHatByKind), with the static standard-first
+   tier as fallback below n=3 evidence. The idle-release (08-17..27) is
+   retired with it — attribution showed its "sub-floor" solves paid
+   24.1k-65.1k each, so with the floor gone there is nothing to release.
+2. **Settlements ledger** (src/settlements.ts, 30-min tick): one batch GET
+   reconciles gateway payout truth (realizedNook + compositeScore) into
+   mining-settlements.jsonl and mirrors terminal statuses into
+   mining-verified.jsonl idempotently. Fixes the tracker blindness: the
+   3/tick learnings loop head-of-line blocked on young non-terminal rows and
+   missed every quorum flip after 08-24 (both 08-18 floor-releases were PAID
+   ~55.8k while local state said "deferred"). Learnings candidates now poll
+   gateway-terminal rows first.
+3. **Abort classification fixed**: "operation was aborted" (AbortSignal
+   timeout on long max/xhigh generations) was missing from
+   isTransientGenerationError — 32 aborts, zero failovers, and the 08-26
+   six-of-seven error day. Now fails over; context/refine support calls
+   also raised 180s→300s.
+4. **verifyDailyCount → verifyRollingCount** (semantics settled: rolling 24h;
+   env name kept for compat). verifyThreshold's UTC-day pacing documented as
+   a deliberate approximation, not changed. Luna wire name verified verbatim
+   against the live Venice catalog — the failovers were the abort bug, not a
+   misname.
+
+Tests: 509 pass.
+
 ## 2026-08-20 — runtime 0.5.145→0.5.162, dead surfaces retired, unservable rows filtered
 
 Operator-approved upgrade after a 5-agent read-only sweep (no gateway news

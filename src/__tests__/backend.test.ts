@@ -113,7 +113,8 @@ import {
   enrichSummarySpecificity,
   passesSpecificityGate,
 } from "../specificity-gate.js";
-import { compareChallengePriority, challengeValueTier, computeVerifiableTilt, isModelRejection, discountStaleIdRejections, meetsValueFloor, floorReleaseWindow, parseFloorReleaseCap, pickFloorRelease, challengeFitsBudget, isTransientGenerationError, type TiltInputs } from "../mining.js";
+import { compareChallengePriority, challengeValueTier, challengeKindKey, computeVerifiableTilt, isModelRejection, discountStaleIdRejections, meetsValueFloor, challengeFitsBudget, isTransientGenerationError, type TiltInputs } from "../mining.js";
+import { reconcileSettlements, kHatByKind, latestSettlements, type GatewaySubmissionRow } from "../settlements.js";
 import { classifyAnyRows, classifyFreshRlm, classifyMarketplaceDemand, classifyError } from "../earning-surfaces.js";
 import { pickAlternateModel } from "../models.js";
 import { selectBundleCids, bundleDue, sanitizeBundleTags, registeredPublishedCids } from "../bundles.js";
@@ -1661,10 +1662,10 @@ describe("mining.compareChallengePriority", () => {
     const medium = { ...base, id: "b", submissionCount: 1, difficulty: "medium" };
     assert.ok(compareChallengePriority(expert, medium, []) < 0);
   });
-  it("reward desc as next tiebreak", () => {
+  it("estimatedRewardNook is NOT a tiebreak (retired 08-27 — field carries zero info)", () => {
     const rich = { ...base, id: "a", submissionCount: 1, difficulty: "hard", estimatedRewardNook: 900 };
     const poor = { ...base, id: "b", submissionCount: 1, difficulty: "hard", estimatedRewardNook: 100 };
-    assert.ok(compareChallengePriority(rich, poor, []) < 0);
+    assert.equal(compareChallengePriority(rich, poor, []), 0);
   });
   it("missing submissionCount treated as 0 (best bucket)", () => {
     const unknown = { ...base, id: "a" };
@@ -1805,10 +1806,13 @@ describe("mining.isModelRejection (circuit-breaker attribution)", () => {
 });
 
 describe("mining.isTransientGenerationError", () => {
-  it("matches the three production transient shapes", () => {
+  it("matches the production transient shapes", () => {
     assert.ok(isTransientGenerationError('Venice API 500: {"error":"Inference processing failed"}'));
     assert.ok(isTransientGenerationError('Venice API 429: {"error":"The model is currently overloaded. Please try again later."}'));
     assert.ok(isTransientGenerationError("fetch failed"));
+    // AbortSignal timeout — missing until 08-27 (32 aborts, 0 failovers; the
+    // 08-26 six-of-seven error day). Long max/xhigh generations hit this.
+    assert.ok(isTransientGenerationError("This operation was aborted"));
   });
   it("does not match gateway 4xx or parse failures", () => {
     assert.equal(isTransientGenerationError("Gateway request failed (400): traceSummary specificity score 30/100"), false);
@@ -4162,126 +4166,153 @@ describe("mining.meetsValueFloor (protects the rolling-cap slot)", () => {
   });
 });
 
-describe("mining value-floor idle-release (pool value-collapse regime)", () => {
-  const NOW = Date.UTC(2026, 7, 17, 12, 0, 0);
-  const hoursAgo = (h: number) => new Date(NOW - h * 3600_000).toISOString();
+describe("settlements ledger + kind-EV ranking (est field carries zero info)", () => {
+  const NOW = Date.UTC(2026, 7, 27, 12, 0, 0);
+  const daysAgo = (d: number) => new Date(NOW - d * 86_400_000).toISOString();
 
-  describe("floorReleaseWindow", () => {
-    it("counts tagged attempts in the trailing 24h and re-arms as rows age out", () => {
-      const entries = [
-        { ts: hoursAgo(1), floorRelease: true, outcome: "deferred", challengeId: "c1" },
-        { ts: hoursAgo(12), floorRelease: true, outcome: "error", challengeId: "c2" }, // errors burn Venice spend — they count
-        { ts: hoursAgo(25), floorRelease: true, outcome: "deferred", challengeId: "c3" }, // aged out
+  describe("reconcileSettlements", () => {
+    const local = new Map([["s1", { verifierKind: "standard", model: "grok-4-6" }]]);
+    it("records a terminal gateway row once, with realizedNook only when paid", () => {
+      const gw: GatewaySubmissionRow[] = [
+        { id: "s1", challengeId: "c1", status: "verified", rewardStatus: "paid", rewardNook: "27039.5", compositeScore: "0.6" },
+        { id: "s2", challengeId: "c2", status: "submitted" }, // non-terminal — ignored
       ];
-      const w = floorReleaseWindow(entries, NOW);
-      assert.equal(w.used, 2);
-      assert.deepEqual([...w.challengeIds].sort(), ["c1", "c2"]); // c3 aged out — releasable again
+      const out = reconcileSettlements(gw, local, [], daysAgo(0));
+      assert.equal(out.length, 1);
+      assert.equal(out[0].submissionId, "s1");
+      assert.equal(out[0].realizedNook, 27039.5);
+      assert.equal(out[0].compositeScore, 0.6);
+      assert.equal(out[0].verifierKind, "standard");
     });
-    it("ignores untagged rows, skipped rows, and unparseable timestamps", () => {
-      const entries = [
-        { ts: hoursAgo(1), outcome: "deferred", challengeId: "n1" }, // normal submission — not a release
-        { ts: hoursAgo(2), floorRelease: true, outcome: "skipped", challengeId: "n2" }, // pre-flight skip — no spend
-        { ts: "not-a-date", floorRelease: true, outcome: "deferred", challengeId: "n3" },
-        { floorRelease: true, outcome: "deferred", challengeId: "n4" }, // no ts
+    it("verified-unpaid gets a row WITHOUT realizedNook, then a paid row supersedes it", () => {
+      const gw: GatewaySubmissionRow[] = [{ id: "s1", status: "verified", rewardStatus: "pending", rewardNook: "19.3", compositeScore: "0.6" }];
+      const first = reconcileSettlements(gw, local, [], daysAgo(1));
+      assert.equal(first[0].realizedNook, undefined); // pre-paid rewardNook is a ~1/1400 placeholder
+      const gwPaid: GatewaySubmissionRow[] = [{ id: "s1", status: "verified", rewardStatus: "paid", rewardNook: "27039", compositeScore: "0.6" }];
+      const second = reconcileSettlements(gwPaid, local, first, daysAgo(0));
+      assert.equal(second.length, 1);
+      assert.equal(second[0].realizedNook, 27039);
+    });
+    it("is idempotent and never regresses a paid row", () => {
+      const paidRow = [{ submissionId: "s1", status: "verified", realizedNook: 27039 }];
+      const gwSame: GatewaySubmissionRow[] = [{ id: "s1", status: "verified", rewardStatus: "paid", rewardNook: "27039", compositeScore: "0.6" }];
+      assert.equal(reconcileSettlements(gwSame, local, paidRow, daysAgo(0)).length, 0);
+      const gwRegressed: GatewaySubmissionRow[] = [{ id: "s1", status: "verified", rewardStatus: "pending", rewardNook: "19", compositeScore: "0.6" }];
+      assert.equal(reconcileSettlements(gwRegressed, local, paidRow, daysAgo(0)).length, 0);
+    });
+  });
+
+  describe("kHatByKind", () => {
+    it("median realized/comp per kind from PAID rows in the window", () => {
+      const rows = [
+        { ts: daysAgo(1), verifierKind: "standard", status: "verified", realizedNook: 27039, compositeScore: 0.6 },
+        { ts: daysAgo(2), verifierKind: "standard", status: "verified", realizedNook: 33840, compositeScore: 0.72 },
+        { ts: daysAgo(3), verifierKind: "standard", status: "verified", realizedNook: 65100, compositeScore: 0.7 },
+        { ts: daysAgo(2), verifierKind: "python_tests", status: "verified", realizedNook: 11366, compositeScore: 0.72 },
+        { ts: daysAgo(20), verifierKind: "standard", status: "verified", realizedNook: 419071, compositeScore: 1.0 }, // outside 14d — R swings 9x, window matters
+        { ts: daysAgo(1), verifierKind: "standard", status: "verified", compositeScore: 0.9 }, // unpaid — excluded
+        { ts: daysAgo(1), verifierKind: "standard", status: "expired", realizedNook: 0, compositeScore: 0.5 }, // not verified
       ];
-      const w = floorReleaseWindow(entries, NOW);
-      assert.equal(w.used, 0);
-      assert.equal(w.challengeIds.size, 0);
+      const k = kHatByKind(rows, NOW);
+      assert.equal(k.standard.n, 3);
+      // ratios: 45065.0, 47000, 93000 -> median 47000; three distinct K = 3 batches
+      assert.equal(Math.round(k.standard.kHat), 47000);
+      assert.equal(k.standard.batches, 3);
+      assert.equal(k.python_tests.n, 1);
+      assert.ok(k.standard.ev > k.python_tests.ev);
+    });
+    it("empty ledger yields an empty map (callers fall back to static tiers)", () => {
+      assert.deepEqual(kHatByKind([], NOW), {});
+    });
+    it("windows on verifiedAt, not the reconcile timestamp (backfill stamps old rows 'now')", () => {
+      const rows = [
+        // Backfilled today but VERIFIED 20 days ago in a different R epoch — must be excluded.
+        { ts: daysAgo(0), verifiedAt: daysAgo(20), verifierKind: "standard", status: "verified", realizedNook: 419071, compositeScore: 1.0 },
+        { ts: daysAgo(0), verifiedAt: daysAgo(2), verifierKind: "standard", status: "verified", realizedNook: 28000, compositeScore: 0.6 },
+      ];
+      const k = kHatByKind(rows, NOW);
+      assert.equal(k.standard.n, 1);
+      assert.equal(Math.round(k.standard.kHat), Math.round(28000 / 0.6));
+    });
+    it("counts distinct K values as batches (same-batch rows are one observation)", () => {
+      const rows = [1, 2, 3].map((i) => ({
+        ts: daysAgo(i), verifiedAt: daysAgo(1), verifierKind: "python_tests", status: "verified",
+        realizedNook: 15787 * 0.6, compositeScore: 0.6, // identical K each time
+      }));
+      const k = kHatByKind(rows, NOW);
+      assert.equal(k.python_tests.n, 3);
+      assert.equal(k.python_tests.batches, 1);
     });
   });
 
-  describe("parseFloorReleaseCap (must fail CLOSED on bad input)", () => {
-    it("defaults to 3 when unset or empty", () => {
-      assert.equal(parseFloorReleaseCap(undefined), 3);
-      assert.equal(parseFloorReleaseCap(""), 3);
-      assert.equal(parseFloorReleaseCap("  "), 3);
-    });
-    it("a typo yields the default, never NaN (NaN fails the >= cap check open)", () => {
-      assert.equal(parseFloorReleaseCap("three"), 3);
-      assert.equal(parseFloorReleaseCap("3/day"), 3);
-      assert.equal(parseFloorReleaseCap("-1"), 3);
-    });
-    it("explicit values pass through; 0 disables the release", () => {
-      assert.equal(parseFloorReleaseCap("5"), 5);
-      assert.equal(parseFloorReleaseCap("0"), 0);
+  describe("latestSettlements", () => {
+    it("later rows supersede earlier ones per submissionId", () => {
+      const m = latestSettlements([
+        { ts: daysAgo(2), submissionId: "s1", status: "verified" },
+        { ts: daysAgo(1), submissionId: "s1", status: "verified", realizedNook: 27039 },
+      ] as never);
+      assert.equal(m.get("s1")?.realizedNook, 27039);
     });
   });
 
-  describe("pickFloorRelease", () => {
-    const subFloorStandard = { id: "std-cheap-1", challengeType: "standard", estimatedRewardNook: 8 };
-    const subFloorStandardRicher = { id: "std-cheap-2", challengeType: "standard", estimatedRewardNook: 9 };
-    const subFloorVerifiable = { id: "py-cheap-1", verifierKind: "python_tests", estimatedRewardNook: 9 };
-    const all = [subFloorVerifiable, subFloorStandard, subFloorStandardRicher];
-    const releasableAll = () => true;
-
-    it("releases the best sub-floor candidate when under the cap", () => {
-      const r = pickFloorRelease(all, releasableAll, 0, { enabled: true, maxPerDay: 3 });
-      // Standard tier beats verifiable even sub-floor; higher estimate wins within tier.
-      assert.equal(r.pick?.id, "std-cheap-2");
+  describe("compareChallengePriority with kind-EV (single scalar axis — must be transitive)", () => {
+    const std = { id: "std", challengeType: "standard", submissionCount: 2 };
+    const py = { id: "py", verifierKind: "python_tests", submissionCount: 2 };
+    const js = { id: "js", verifierKind: "javascript_tests", submissionCount: 1 };
+    it("measured EV outranks the tier prior when a kind clears the evidence bar", () => {
+      const kindEv = { standard: { ev: 20000, n: 5, batches: 3 }, python_tests: { ev: 35000, n: 4, batches: 2 } };
+      assert.ok(compareChallengePriority(py, std, [], { kindEv }) < 0); // python measures richer
+      assert.ok(compareChallengePriority(std, py, [], { kindEv }) > 0);
     });
-    it("refuses at the daily cap — a permanently-cheap pool cannot burn the slots", () => {
-      const r = pickFloorRelease(all, releasableAll, 3, { enabled: true, maxPerDay: 3 });
-      assert.equal(r.pick, null);
-      assert.match(r.reason, /cap/);
+    it("below the batch bar, a kind falls back to its tier prior (3 rows from ONE batch = 1 observation)", () => {
+      const kindEv = { standard: { ev: 20000, n: 5, batches: 3 }, python_tests: { ev: 95000, n: 3, batches: 1 } };
+      // python's lucky single-batch 95k is ignored; prior 9.5k < measured std 20k
+      assert.ok(compareChallengePriority(std, py, [], { kindEv }) < 0);
     });
-    it("refuses when disabled", () => {
-      const r = pickFloorRelease(all, releasableAll, 0, { enabled: false, maxPerDay: 3 });
-      assert.equal(r.pick, null);
-      assert.match(r.reason, /disabled/);
+    it("is TRANSITIVE with mixed evidence coverage (the review-caught cycle)", () => {
+      // Old comparator cycled: py<std (EV), std<js (tier), js<py (subs) — an
+      // unspecified sort permutation could hand a slot to unmeasured js.
+      const kindEv = { standard: { ev: 20000, n: 5, batches: 3 }, python_tests: { ev: 35000, n: 4, batches: 2 } };
+      const cmp = (a: Record<string, unknown>, b: Record<string, unknown>) => compareChallengePriority(a as never, b as never, [], { kindEv });
+      assert.ok(cmp(py, std) < 0);  // measured 35k > measured 20k
+      assert.ok(cmp(std, js) < 0);  // measured 20k > js prior 9.5k
+      assert.ok(cmp(py, js) < 0);   // closes the triangle — no cycle
     });
-    it("refuses when the gate stack rejects every candidate (e.g. all farm-titled)", () => {
-      const r = pickFloorRelease(all, () => false, 0, { enabled: true, maxPerDay: 3 });
-      assert.equal(r.pick, null);
-      assert.match(r.reason, /no releasable/);
+    it("the verifiable tilt still overrides measured EV", () => {
+      const kindEv = { standard: { ev: 50000, n: 5, batches: 3 }, python_tests: { ev: 5000, n: 5, batches: 3 } };
+      assert.ok(compareChallengePriority(py, std, [], { preferVerifiable: true, kindEv }) < 0);
     });
-    it("respects the caller's gate stack per-candidate", () => {
-      const r = pickFloorRelease(all, (c) => c.id === "py-cheap-1", 0, { enabled: true, maxPerDay: 3 });
-      assert.equal(r.pick?.id, "py-cheap-1");
+    it("estimatedRewardNook is no longer a ranking key", () => {
+      const rich = { id: "r", challengeType: "standard", submissionCount: 2, estimatedRewardNook: 900 };
+      const poor = { id: "p", challengeType: "standard", submissionCount: 2, estimatedRewardNook: 2 };
+      assert.equal(compareChallengePriority(rich, poor, []), 0);
+    });
+    it("challengeKindKey maps verifiable kinds and defaults to standard", () => {
+      assert.equal(challengeKindKey(py), "python_tests");
+      assert.equal(challengeKindKey(std), "standard");
     });
   });
 
-  describe("challengeFitsBudget ignoreValueFloor", () => {
-    it("keeps the farm-title skip even when the floor is released", () => {
-      // A verified solve of a farm challenge pays the FARM's poster royalty —
-      // the release must never relax this gate.
-      const farm = {
-        id: "farm-1",
-        title: "Marcus blockchain expert analysis a3f9c2",
-        challengeType: "standard",
-        estimatedRewardNook: 8,
-      };
-      assert.equal(challengeFitsBudget(farm, { ignoreValueFloor: true }), false);
+  describe("challengeFitsBudget with the floor retired", () => {
+    it("admits low-estimate work by default (est carries zero info)", () => {
+      assert.equal(challengeFitsBudget({ id: "c1", challengeType: "standard", estimatedRewardNook: 2 }), true);
     });
-    it("admits a sub-floor standard challenge only via ignoreValueFloor", () => {
-      const cheap = { id: "c1", challengeType: "standard", estimatedRewardNook: 8 };
-      assert.equal(challengeFitsBudget(cheap), false);
-      assert.equal(challengeFitsBudget(cheap, { ignoreValueFloor: true }), true);
+    it("keeps the farm-title skip", () => {
+      assert.equal(
+        challengeFitsBudget({ id: "f", title: "Marcus blockchain expert analysis a3f9c2", challengeType: "standard", estimatedRewardNook: 8 }),
+        false,
+      );
     });
-    it("rejects the new unservable source types (SDK 0.5.156+/0.5.161+ rows)", () => {
-      // These hard-reject our submit flow at the gateway — skipping pre-slot
-      // is pure savings. Both wire casings covered.
+    it("rejects the unservable source types (SDK 0.5.156+/0.5.161+ rows)", () => {
       for (const st of ["rlm_trajectory", "distillation_request", "project_improvement"]) {
-        assert.equal(challengeFitsBudget({ id: "x", challengeType: "standard", estimatedRewardNook: 31, sourceType: st }), false);
-        assert.equal(
-          challengeFitsBudget({ id: "x", challengeType: "standard", estimatedRewardNook: 31, source_type: st } as never),
-          false,
-        );
+        assert.equal(challengeFitsBudget({ id: "x", challengeType: "standard", sourceType: st }), false);
+        assert.equal(challengeFitsBudget({ id: "x", challengeType: "standard", source_type: st } as never), false);
       }
-      assert.equal(challengeFitsBudget({ id: "x", challengeType: "standard", estimatedRewardNook: 31, sourceType: "agent_posted" }), true);
-      assert.equal(challengeFitsBudget({ id: "x", challengeType: "standard", estimatedRewardNook: 31 }), true);
+      assert.equal(challengeFitsBudget({ id: "x", challengeType: "standard", sourceType: "agent_posted" }), true);
     });
-    it("still rejects closed and submission-capped challenges under release", () => {
-      assert.equal(
-        challengeFitsBudget({ id: "c2", status: "closed", challengeType: "standard" }, { ignoreValueFloor: true }),
-        false,
-      );
-      assert.equal(
-        challengeFitsBudget(
-          { id: "c3", challengeType: "standard", submissionCount: 20, maxSubmissions: 20 },
-          { ignoreValueFloor: true },
-        ),
-        false,
-      );
+    it("still rejects closed and submission-capped challenges", () => {
+      assert.equal(challengeFitsBudget({ id: "c2", status: "closed", challengeType: "standard" }), false);
+      assert.equal(challengeFitsBudget({ id: "c3", challengeType: "standard", submissionCount: 20, maxSubmissions: 20 }), false);
     });
   });
 });

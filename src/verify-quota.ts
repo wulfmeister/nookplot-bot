@@ -28,6 +28,13 @@
  * responsible for resetting their local count at UTC-day rollover.
  */
 
+// NOTE (2026-08-27): the gateway cap is a ROLLING 24h window (settled — see
+// quotas.ts and the index.ts rename to verifyRollingCount), while this
+// threshold-release schedule still paces against hours-to-UTC-midnight. That
+// approximation only mis-paces near the boundary and errs conservative;
+// deliberately NOT changed in the naming cleanup (pacing math is behavior,
+// not naming — and verify is ~1% of income; see the standing don't-invest
+// decision). The constant name keeps "DAILY" to match the schedule it paces.
 export const VERIFY_DAILY_CAP_DEFAULT = 30;
 
 export function verifyThreshold(

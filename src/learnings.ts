@@ -61,15 +61,46 @@ export function decideNonTerminalCandidate(
 
 /** Persist a terminal verification outcome once per submission (the loop drops
  *  each sub from the candidate set after its terminal branch, so no dupes). */
-function recordMiningOutcome(m: MiningEntry, status: "verified" | "expired" | "rejected"): void {
+/** submissionIds already holding a terminal row — loaded once per process,
+ *  updated on write. Makes outcome recording idempotent across the two
+ *  writers (this loop + the settlements backfill tick). */
+let recordedOutcomeIds: Set<string> | null = null;
+
+function loadRecordedOutcomeIds(): Set<string> {
+  if (!recordedOutcomeIds) {
+    recordedOutcomeIds = new Set(
+      readJsonl<{ submissionId?: string }>(MINING_VERIFIED_LOG)
+        .map((r) => r.submissionId)
+        .filter((s): s is string => Boolean(s)),
+    );
+  }
+  return recordedOutcomeIds;
+}
+
+export function recordMiningOutcomeOnce(
+  m: Pick<MiningEntry, "submissionId" | "challengeId" | "model" | "verifierKind">,
+  status: "verified" | "expired" | "rejected",
+  /** Event time (e.g. gateway verifiedAt) — the backfill passes it so a
+   *  catch-up doesn't stamp days-old outcomes "now" and distort every
+   *  trailing-window reader of this ledger (verifiable tilt, dashboards). */
+  tsOverride?: string,
+): boolean {
+  const ids = loadRecordedOutcomeIds();
+  if (!m.submissionId || ids.has(m.submissionId)) return false;
   appendJsonl(MINING_VERIFIED_LOG, {
-    ts: new Date().toISOString(),
+    ts: tsOverride ?? new Date().toISOString(),
     submissionId: m.submissionId,
     challengeId: m.challengeId,
     model: m.model,
     verifierKind: m.verifierKind,
     status,
   });
+  ids.add(m.submissionId);
+  return true;
+}
+
+function recordMiningOutcome(m: MiningEntry, status: "verified" | "expired" | "rejected"): void {
+  recordMiningOutcomeOnce(m, status);
 }
 
 interface LearningEntry {
@@ -373,6 +404,21 @@ export async function publishPostSolveLearnings(
 
   const candidates = mining.filter((m) => m.submissionId && (m.outcome === "pass" || m.outcome === "deferred") && !posted.has(m.submissionId!));
   if (candidates.length === 0) return;
+
+  // Head-of-line fix (2026-08-27): the 3-per-tick window processed oldest-
+  // first, so three young non-terminal rows starved every actionable row
+  // behind them (the ledger missed every quorum flip after 08-24). The
+  // settlements backfill knows which candidates are ALREADY terminal at the
+  // gateway — poll those first; the still-pending head rows can wait.
+  try {
+    const { readSettlements, latestSettlements } = await import("./settlements.js");
+    const settled = latestSettlements(readSettlements());
+    candidates.sort((a, b) => {
+      const at = a.submissionId && settled.has(a.submissionId) ? 0 : 1;
+      const bt = b.submissionId && settled.has(b.submissionId) ? 0 : 1;
+      return at - bt;
+    });
+  } catch { /* settlements ledger optional — fall back to log order */ }
 
   console.log(`🧠 checking ${candidates.length} mining submissions for verified status`);
 

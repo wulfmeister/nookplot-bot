@@ -67,6 +67,7 @@ import { runManifestTick, runIntentsTick, pendingSubsFromSnapshot } from "./mani
 import { runInboxWatchTick } from "./inbox-watch.js";
 import { runCohortBenchmarkTick } from "./cohort-benchmark.js";
 import { runEarningSurfacesTick } from "./earning-surfaces.js";
+import { runSettlementsTick } from "./settlements.js";
 import { maybeWarnVeniceBalance } from "./venice-balance.js";
 import { runApiMarketplaceTick } from "./api-marketplace-sell.js";
 import { runProjectsReviewTick, runExecScoringTick } from "./projects.js";
@@ -571,17 +572,20 @@ function isComprehensionGateError(msg: string): boolean {
 // of every verify poll — no midnight/boot reset (the gateway's window is rolling,
 // not calendar-day; see quotas.ts). In-poll increments prevent overspend before
 // the next re-sync.
-let verifyDailyCount = 0;
+let verifyRollingCount = 0;
 // Local per-day verify cap. The gateway enforces a *shared* verify+crowd-jury
 // budget (VERIFY_SHARED_CAP, observed at 38) via canVerifyNow(); this local cap
 // historically reserved headroom for crowd-jury. Crowd-jury is currently dormant
 // (0 scores given), so capping pure verifies at 30 leaves ~8 shared slots unused
 // each day. Make it tunable and default to the full shared budget so we don't
 // idle slots; canVerifyNow() still hard-stops us at the gateway shared cap.
-const VERIFY_DAILY_CAP = Number(process.env.BOT_VERIFY_DAILY_CAP ?? 38);
+// Documented env name BOT_VERIFY_DAILY_CAP kept (docs/env-reference.md,
+// AGENTS.md) — a blind rename here was caught in review; the new name is
+// accepted as an alias. The window is ROLLING 24h despite the legacy "DAILY".
+const VERIFY_ROLLING_CAP = Number(process.env.BOT_VERIFY_DAILY_CAP ?? process.env.BOT_VERIFY_ROLLING_CAP ?? 38);
 const VERIFY_POOL_FETCH_LIMIT = Number(process.env.BOT_VERIFY_POOL_FETCH_LIMIT ?? 200);
 
-// (verifyDailyCount is re-synced from the rolling shared count each poll; the
+// (verifyRollingCount is re-synced from the rolling shared count each poll; the
 // old calendar-midnight maybeResetDailyCount was removed — see quotas.ts.)
 const SOLVER_DIVERSITY_WINDOW_MS = 14 * 24 * 3600_000;
 const SOLVER_DIVERSITY_CAP = 3; // gateway gate is "3+ times in 14 days"
@@ -890,7 +894,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
     verifiedSubmissions.add(sub.id);
     return false;
   }
-  if (verifyDailyCount >= VERIFY_DAILY_CAP) return false;
+  if (verifyRollingCount >= VERIFY_ROLLING_CAP) return false;
   // EXPERIMENT (additive): when BOT_VERIFY_ARTIFACTS=1, code-executing verifiable
   // kinds get the rerun-based verify path below instead of being skipped. Every
   // other non-standard kind (crowd_jury/prediction/exact_answer) skips as before.
@@ -1022,7 +1026,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
     });
     verifiedSubmissions.add(sub.id);
     traceFetchStrikes.delete(sub.id); // recovered after transient strikes — free the entry
-    verifyDailyCount += 1;
+    verifyRollingCount += 1;
     recordVerify();
     const sc = [scored.correctnessScore, scored.reasoningScore, scored.efficiencyScore, scored.noveltyScore]
       .map((s) => s.toFixed(2))
@@ -1033,7 +1037,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
       domain: (sub.domain_tags ?? [])[0],
       traceSource: fetchedTrace.source,
     });
-    console.log(`   ✅ verified ${sub.id.slice(0, 8)} scores=${sc} (${verifyDailyCount}/${VERIFY_DAILY_CAP} loc, ${shared}/${VERIFY_SHARED_CAP} shared)`);
+    console.log(`   ✅ verified ${sub.id.slice(0, 8)} scores=${sc} (${verifyRollingCount}/${VERIFY_ROLLING_CAP} loc, ${shared}/${VERIFY_SHARED_CAP} shared)`);
     // Telemetry for variance check — low-variance scoring is also a flag pattern.
     // Also used by the per-solver diversity guard (recentSolverVerifyCount).
     appendJsonl(join(NOOK_DIR, "verification-stats.jsonl"), {
@@ -1224,13 +1228,13 @@ async function verifyArtifactSubmission(runtime: ReturnType<typeof getRuntime>, 
       knowledgeDomainTags: scored.knowledgeDomainTags ?? sub.domain_tags ?? [],
     });
     verifiedSubmissions.add(sub.id);
-    verifyDailyCount += 1;
+    verifyRollingCount += 1;
     recordVerify();
     const sc = [scored.correctnessScore, scored.reasoningScore, scored.efficiencyScore, scored.noveltyScore]
       .map((s) => s.toFixed(2))
       .join("/");
     recordAudit("verify", "submitted", `artifact scores=${sc}`, { submissionId: sub.id, kind: sub.verifier_kind ?? "?" });
-    console.log(`   ✅🔁 verified ARTIFACT ${sub.id.slice(0, 8)} scores=${sc} (${verifyDailyCount}/${VERIFY_DAILY_CAP})`);
+    console.log(`   ✅🔁 verified ARTIFACT ${sub.id.slice(0, 8)} scores=${sc} (${verifyRollingCount}/${VERIFY_ROLLING_CAP})`);
   } catch (err) {
     verifiedSubmissions.add(sub.id);
     const msg = (err as Error).message;
@@ -1326,15 +1330,15 @@ async function pollVerifiableSubmissions(runtime: ReturnType<typeof getRuntime>)
   }
   // Re-sync the local counter to the rolling-24h shared count (matches the
   // gateway's window; frees slots as entries age out instead of a false midnight
-  // reset). In-poll `verifyDailyCount += 1` increments then prevent overspend
+  // reset). In-poll `verifyRollingCount += 1` increments then prevent overspend
   // before the next poll re-syncs.
-  verifyDailyCount = verifySharedCount();
+  verifyRollingCount = verifySharedCount();
   // Shared-cap pre-flight: if we've blown the budget for the day, skip the
   // whole poll (saves the heavy /v1/mining/submissions/verifiable fetch too).
   if (!canVerifyNow()) {
     return;
   }
-  if (verifyDailyCount >= VERIFY_DAILY_CAP) return;
+  if (verifyRollingCount >= VERIFY_ROLLING_CAP) return;
   verifyPollInFlight = true;
   try {
     const res = (await runtime.connection.request(
@@ -1426,7 +1430,7 @@ async function pollVerifiableSubmissions(runtime: ReturnType<typeof getRuntime>)
     const overrideStr = process.env.BOT_VERIFY_THRESHOLD;
     const threshold = overrideStr !== undefined
       ? Number(overrideStr)
-      : verifyThreshold(verifyDailyCount, Date.now());
+      : verifyThreshold(verifyRollingCount, Date.now());
     // Rerun-able artifact subs (experiment) bypass the quota-aware threshold:
     // they're usually v0 and we want them verified to generate exec data, not
     // held back as "low-leverage." Flag-gated; no effect on the standard path.
@@ -1434,10 +1438,10 @@ async function pollVerifiableSubmissions(runtime: ReturnType<typeof getRuntime>)
       (s) => vcountSub(s) >= threshold || (verifyArtifacts && isRerunnableKind(s.verifier_kind)),
     );
     const skipped = standard.length - eligible.length;
-    const remaining = VERIFY_DAILY_CAP - verifyDailyCount;
+    const remaining = VERIFY_ROLLING_CAP - verifyRollingCount;
     const hoursLeftUtc = (24 - new Date().getUTCHours() - new Date().getUTCMinutes() / 60).toFixed(1);
     console.log(
-      `💎 found ${standard.length} verifiable (v2=${tiered.v2} v1=${tiered.v1} v0=${tiered.v0}${tiered.vHigh ? ` v3+=${tiered.vHigh}` : ""}) — threshold=v${threshold} (used ${verifyDailyCount}/${VERIFY_DAILY_CAP}, ${hoursLeftUtc}h left UTC); ${skipped} skipped`,
+      `💎 found ${standard.length} verifiable (v2=${tiered.v2} v1=${tiered.v1} v0=${tiered.v0}${tiered.vHigh ? ` v3+=${tiered.vHigh}` : ""}) — threshold=v${threshold} (used ${verifyRollingCount}/${VERIFY_ROLLING_CAP}, ${hoursLeftUtc}h left UTC); ${skipped} skipped`,
     );
     // Fallback: if the threshold blocked everything AND there are no v2s
     // anywhere, OR we're running out of hours, drop to threshold 0 so we
@@ -1500,15 +1504,15 @@ async function pollVerifiableSubmissions(runtime: ReturnType<typeof getRuntime>)
       maybeWarnDiversityPollSaturation();
     }
     for (const sub of plannedBatch) {
-      if (verifyDailyCount >= VERIFY_DAILY_CAP) break;
+      if (verifyRollingCount >= VERIFY_ROLLING_CAP) break;
       const worked = await verifyOneSubmission(runtime, sub);
       // Pacing sleep only after real gateway work — a no-op skip must not cost
       // 70s (07-31: a batch of own-challenge no-ops burned every poll's budget).
       if (worked) await sleep(70 * 1000);
     }
     // End-of-poll budget telemetry — surfaces under-utilization at a glance.
-    if (Number(hoursLeftUtc) <= 4 && verifyDailyCount < VERIFY_DAILY_CAP - 5) {
-      console.warn(`   ⚠ verify budget under-used: ${verifyDailyCount}/${VERIFY_DAILY_CAP} with ${hoursLeftUtc}h left`);
+    if (Number(hoursLeftUtc) <= 4 && verifyRollingCount < VERIFY_ROLLING_CAP - 5) {
+      console.warn(`   ⚠ verify budget under-used: ${verifyRollingCount}/${VERIFY_ROLLING_CAP} with ${hoursLeftUtc}h left`);
     }
   } catch (err) {
     console.warn(`   ⚠ verification poll error: ${(err as Error).message}`);
@@ -2497,6 +2501,12 @@ async function startWeeklyRewardsLoop(runtime: ReturnType<typeof getRuntime>) {
   // via real MCP dispatch every 6h and shout the moment any flips live.
   setTimeout(() => safe("earningSurfacesTick", () => runEarningSurfacesTick(runtime)), 28 * 60_000);
   setInterval(() => safe("earningSurfacesTick", () => runEarningSurfacesTick(runtime)), 6 * 3600_000);
+  // Settlement backfill — one batch GET reconciles gateway payout truth
+  // (realizedNook + compositeScore) into mining-settlements.jsonl and keeps
+  // mining-verified.jsonl complete (the 3/tick learnings loop head-of-line
+  // blocked and missed every quorum flip after 08-24). Feeds K-hat ranking.
+  setTimeout(() => safe("settlementsTick", () => runSettlementsTick(runtime, myAddress)), 4 * 60_000);
+  setInterval(() => safe("settlementsTick", () => runSettlementsTick(runtime, myAddress)), 30 * 60_000);
   // Venice balance watch — the 08-05 DIEM exhaustion 402'd every inference
   // call for ~5.7h with no signal. Warn-only (no auto-buy; purchases stay
   // manual via npm run buy-credits). 30-min cadence, warn-once per crossing.
