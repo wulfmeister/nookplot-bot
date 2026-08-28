@@ -84,7 +84,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `BOT_SPECIALIZE_DOMAINS` | unset (no specialization) — tune for your agent | Comma-separated domain tags; used as a soft preference in challenge sort and reused by bounty/teaching/clarification/subscription filters (`src/mining.ts` and others). |
 | `BOT_SPECIALIZE_MATCH_MODE` | `any` | `any` = challenge matches one of your domains; `all` = must match every domain (`src/mining.ts`). |
 | `BOT_SPECIALIZE_STRICT` | off (`1` enables) | Make specialization a hard filter — skip non-matching challenges instead of just down-ranking them (`src/mining.ts`). |
-| `BOT_MIN_CHALLENGE_REWARD` | `10` (`0` disables) | Minimum estimated reward (NOOK) worth a rolling-cap slot. Measured settlement: standard ~45,777/solve vs python_tests ~5,559; a 2026-07-28 burst put 9 of 12 slots into 6-NOOK challenges and cost ~288k (`src/mining.ts`). |
+| `BOT_MIN_CHALLENGE_REWARD` | `0` (floor retired 2026-08-27) | Emergency-brake floor on `estimatedRewardNook`. OFF by default: per-solve attribution proved realized payout = compositeScore × K with K batch-constant — the estimate field carries zero per-challenge information, and the old `10` default caused a 9-day submission halt. Kinds now rank by measured trailing EV from our own paid settlements (`src/settlements.ts` kHatByKind + `src/mining.ts` kindEffectiveEv). Set >0 only if the estimate field ever becomes meaningful. |
 | `BOT_MINING_PACING` | on (`0` disables) | Spread solves over the rolling 24h window instead of bursting; prevents cap-boundary collisions with the gateway's rolling 12/24h regular cap (`src/mining.ts`). |
 | `BOT_INSTANCE_LOCK` | on (`0` disables) | Single-instance pidfile lock at `~/.nookplot/bot.pid` — a second daemon refuses to boot instead of silently doubling spend and racing gated code paths (`src/instance-lock.ts`). |
 | `BOT_MINING_REFINE` | on (`0` disables) | Critique-and-revise refinement pass on standard traces before submitting (`src/mining.ts`). |
@@ -122,7 +122,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | Variable | Default | What it does |
 |---|---|---|
 | `BOT_VERIFY_SHARED_CAP` | `38` | Local mirror of the gateway's shared verify+crowd-jury budget (hard 40, rolling 24h) with a safety buffer (`src/quotas.ts`). |
-| `BOT_VERIFY_DAILY_CAP` | `38` | Local per-day cap on pure verifies; defaults to the full shared budget (`src/index.ts`). |
+| `BOT_VERIFY_DAILY_CAP` | `38` | Local cap on pure verifies over the gateway's **rolling 24h** window (the "daily" name is legacy; `BOT_VERIFY_ROLLING_CAP` is accepted as an alias). Defaults to the full shared budget (`src/index.ts`). |
 | `BOT_VERIFY_HOURLY_PACE` | `5` (was `2` until 2026-07-30) | Max verify/crowd actions per trailing hour — burst pacing so a free-fire spree can't trip the gateway 429. Raised because genuine (non-spam) submissions arrive in bursts: 22–109 traces/day clear the anti-farm gate while only 3–11 verifications landed, so the pace gate — not spam avoidance — was capping how much honest work we could verify (`src/quotas.ts`). |
 | `BOT_VERIFY_POOL_FETCH_LIMIT` | `200` | How many verifiable submissions to fetch per poll (`src/index.ts`). |
 | `BOT_VERIFY_FETCH_STRIKE_LIMIT` | `3` | Transient trace-fetch failures allowed per submission before it's retired permanently (dead/unpinned CIDs) (`src/index.ts`). |
