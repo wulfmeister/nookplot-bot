@@ -86,6 +86,10 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
   // exceeds the model's completion limit — on that specific error we halve
   // and retry rather than failing the call.
   let effectiveMaxTokens = Math.max(opts.max_tokens ?? MIN_COMPLETION_TOKENS, MIN_COMPLETION_TOKENS);
+  // Retryable downward like max_tokens: some models (gpt-56-terra, 09-03)
+  // reject ANY explicit temperature — on that specific 400 we drop the field
+  // (server default) and retry rather than failing the call.
+  let effectiveTemperature = opts.temperature;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
       const ctrl = new AbortController();
@@ -100,7 +104,7 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
           body: JSON.stringify({
             model: model,
             messages,
-            temperature: opts.temperature,
+            temperature: effectiveTemperature,
             max_tokens: effectiveMaxTokens,
             venice_parameters: opts.venice_parameters,
             // Auto-apply xhigh thinking when the chosen model supports it
@@ -167,6 +171,20 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
       if (tokenLimit400 && effectiveMaxTokens > 8000) {
         effectiveMaxTokens = Math.max(8000, Math.floor(effectiveMaxTokens / 2));
         console.warn(`   ↩ ${model} rejected max_tokens — retrying at ${effectiveMaxTokens}`);
+        continue;
+      }
+      // "Unsupported value: 'temperature' does not support X with this model"
+      // (terra, all 4 first-hour attempts 2026-09-03). Deterministic per
+      // model — drop the field and retry with the server default. Effort
+      // rejections are deliberately NOT auto-downgraded: effort is an
+      // operator calibration choice, and silently nerfing it would hide a
+      // roster misconfiguration (the luna-max lesson) — those stay loud.
+      const temp400 =
+        lastErr.message.includes("Venice API 400") &&
+        /unsupported value.{0,20}'temperature'/i.test(lastErr.message);
+      if (temp400 && effectiveTemperature !== undefined) {
+        effectiveTemperature = undefined;
+        console.warn(`   ↩ ${model} rejected temperature=${opts.temperature} — retrying with server default`);
         continue;
       }
       // An abort = OUR OWN timeout fired. Re-running the SAME model at the
