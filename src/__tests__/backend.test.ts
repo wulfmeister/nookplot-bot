@@ -157,15 +157,15 @@ describe("models", () => {
     // Non-lean A/B sampling (lean would force the cheap model, pool="lean").
     const savedLean = process.env.BOT_LEAN;
     delete process.env.BOT_LEAN;
-    // Pool as of 2026-09-02 (operator): gpt-56-luna out — Venice's inference
-    // path rejects its reasoning_effort=max since 09-01 (while the catalog
-    // still lists max as supported); gpt-56-sol back in at xhigh (its 08-13
-    // removal for a 40% verified-rate happened at effort=high).
+    // Pool as of 2026-09-03 (operator): terra holds the 5.6 slot (luna's max
+    // died on the live path 09-01; sol's return lasted a day), and
+    // gemini-3-8-flash replaces 3-1-pro-preview. All four (model, effort)
+    // pairs live-probed 09-03 with solve-shaped requests: 200 OK, full output.
     const allowed = new Set([
       "grok-4-6",
       "claude-opus-5",
-      "openai-gpt-56-sol",
-      "gemini-3-1-pro-preview",
+      "openai-gpt-56-terra",
+      "gemini-3-8-flash",
     ]);
     try {
       const seen = new Set<string>();
@@ -199,7 +199,10 @@ describe("models", () => {
       // it (low..max, default medium). Both current claims live-probed
       // 2026-09-02 with solve-shaped requests at xhigh: 200 OK, full output.
       assert.equal(effortFor("claude-opus-5"), "xhigh");
-      assert.equal(effortFor("openai-gpt-56-sol"), "xhigh");
+      assert.equal(effortFor("openai-gpt-56-terra"), "xhigh");
+      // gemini-3-8-flash exposes NO effort options in the catalog; the live
+      // path accepts "high" (probe 09-03) though it may be server-ignored.
+      assert.equal(effortFor("gemini-3-8-flash"), "high");
       // And never send an effort a model doesn't accept: grok-4-5 and gemini
       // top out at "high" — gemini ran at an unsupported "xhigh" from 05-24 to
       // 07-09, plausibly the source of the empty outputs that got it benched.
@@ -3878,7 +3881,7 @@ describe("venice-cost.estimateCallCost (real per-model pricing)", () => {
     // A model missing from the table silently falls back to DEFAULT_PRICING,
     // which corrupts the NOOK-per-dollar comparison that decides A/B pruning.
     // Distinct prices prove each arm has its own entry.
-    const costs = ["grok-4-6", "claude-opus-5", "openai-gpt-56-sol", "gemini-3-1-pro-preview"]
+    const costs = ["grok-4-6", "claude-opus-5", "openai-gpt-56-terra", "gemini-3-8-flash"]
       .map((m) => estimateCallCost(m, 12000, 8000));
     assert.equal(new Set(costs.map((c) => c.toFixed(6))).size, 4, "arms share a price — one is falling back to the default");
     for (const c of costs) assert.ok(c > 0, "cost must never be zero");
@@ -3934,15 +3937,17 @@ describe("venice-cost reasoning-token accounting (no double-count)", () => {
 
 describe("mining circuit breaker — model-id rejection (deterministic evidence)", () => {
   const base = { attempts: 3, failures: 3, rate: 1.0, idRejected: 0, idRejectedWireNames: [] as string[] };
-  const POOL = ["grok-4-6", "claude-opus-5", "openai-gpt-56-sol", "gemini-3-1-pro-preview"];
+  const POOL = ["grok-4-6", "claude-opus-5", "openai-gpt-56-terra", "gemini-3-8-flash"];
 
   it("sidelines on a SINGLE id rejection — no waiting for a rate to build", () => {
     // A modelUsed rejection is deterministic: the gateway will refuse this id
     // every time. GLM burned 52 paid solves and kimi-k3 3 before this existed.
-    const rates = { "gemini-3-1-pro-preview": { ...base, attempts: 1, failures: 1, idRejected: 1, idRejectedWireNames: ["gemini-3-1-pro-preview"] } };
+    // gemini-3-8-flash is the realistic subject: its wire name has zero
+    // historical gateway acceptances, so this breaker is its canary bound.
+    const rates = { "gemini-3-8-flash": { ...base, attempts: 1, failures: 1, idRejected: 1, idRejectedWireNames: ["gemini-3-8-flash"] } };
     const r = filterPoolByParseFailure(POOL, rates);
-    assert.deepEqual(r.sidelined, ["gemini-3-1-pro-preview"]);
-    assert.ok(!r.filtered.includes("gemini-3-1-pro-preview"));
+    assert.deepEqual(r.sidelined, ["gemini-3-8-flash"]);
+    assert.ok(!r.filtered.includes("gemini-3-8-flash"));
   });
 
   it("a rejection of an OLD wire name does not condemn a corrected one", () => {
@@ -3986,17 +3991,20 @@ describe("mining circuit breaker — model-id rejection (deterministic evidence)
       model, promptTokens: 1000, completionTokens: 500, totalTokens: 1500, estCost: 0.01,
       callSite: "mining_solve", outcome, ...(wireName ? { wireName } : {}),
     });
-    const stale = [50, 52, 55, 58, 62].map((d) => entry(d, "gemini-3-1-pro-preview", "parse-fail"));
+    // (Subject switched gemini-3-1-pro-preview → gemini-3-8-flash when the
+    // roster changed 2026-09-03 — the mechanics under test are model-agnostic
+    // but the sideline assertion needs a model that is IN the current pool.)
+    const stale = [50, 52, 55, 58, 62].map((d) => entry(d, "gemini-3-8-flash", "parse-fail"));
     const rates = computeParseFailureRates(stale, 10, NOW);
-    assert.equal(rates["gemini-3-1-pro-preview"], undefined, "stale-only history must not produce rate evidence");
+    assert.equal(rates["gemini-3-8-flash"], undefined, "stale-only history must not produce rate evidence");
     assert.deepEqual(filterPoolByParseFailure(POOL, rates).filtered, POOL);
 
     // Recent failures still count at full weight...
-    const fresh = [1, 2, 3, 4, 5].map((d) => entry(d, "gemini-3-1-pro-preview", "parse-fail"));
+    const fresh = [1, 2, 3, 4, 5].map((d) => entry(d, "gemini-3-8-flash", "parse-fail"));
     const freshRates = computeParseFailureRates(fresh, 10, NOW);
-    assert.equal(freshRates["gemini-3-1-pro-preview"].attempts, 5);
-    assert.equal(freshRates["gemini-3-1-pro-preview"].rate, 1.0);
-    assert.deepEqual(filterPoolByParseFailure(POOL, freshRates).sidelined, ["gemini-3-1-pro-preview"]);
+    assert.equal(freshRates["gemini-3-8-flash"].attempts, 5);
+    assert.equal(freshRates["gemini-3-8-flash"].rate, 1.0);
+    assert.deepEqual(filterPoolByParseFailure(POOL, freshRates).sidelined, ["gemini-3-8-flash"]);
 
     // ...and id rejections are DETERMINISTIC — they never age out. (A wire-name
     // CHANGE discounts them, via discountStaleIdRejections; time does not.)

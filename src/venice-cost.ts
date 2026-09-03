@@ -55,6 +55,9 @@ const MODEL_PRICING: Record<string, { in: number; out: number }> = {
   // flat table can't express — mining calls are uncached, so immaterial.
   "openai-gpt-56-luna": { in: 0.26666667, out: 1.6 },
   "openai-gpt-56-sol": { in: 6.25, out: 37.5 },
+  // Live catalog 2026-09-03 (terra + 3-8-flash joined the roster that day).
+  "openai-gpt-56-terra": { in: 3.125, out: 18.75 },
+  "gemini-3-8-flash": { in: 0.9375, out: 4.6875 },
   "kimi-k3": { in: 4.6875, out: 23.4375 },
   // Fallback / other-task models
   "claude-opus-4-8": { in: 6, out: 30 },

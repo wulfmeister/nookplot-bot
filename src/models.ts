@@ -77,29 +77,36 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   bounty_work: undefined,
   bounty_critique: undefined,
   bounty_revise: undefined,
-  // Mining A/B (4-way, operator-directed refresh 2026-07-09): the prior pool
-  // had collapsed to 2 live arms — gpt-55, gemini-3-1, and deepseek-v4 all
-  // parse-failed and were circuit-broken, leaving only grok-4-3 + opus-4-8. This
-  // rotation swaps in four newer models, all re-probed 200 + non-empty:
-  //   grok-4-5          — xAI's newer grok; 500k ctx (down from 4-3's 1M), pricier
-  //     on output ($2.27/$6.80). reasoning_effort=xhigh.
-  //   claude-opus-5     — Claude 5 Opus, 1M ctx, code-optimized. Replaced
-  //     claude-fable-5 on 2026-07-28 (operator); effort=high.
-  //   gemini-3-1-pro-preview — Google's top model on Venice, 1M ctx, $2.50/$15.
-  //     4th arm 2026-08-05, replacing kimi-k3 (see below); effort=high.
-  //   openai-gpt-56-sol — GPT-5.6 "Sol", 1M ctx, $6.25/$37.50. Back in the
-  //     roster 2026-09-02 (operator), replacing gpt-56-luna: Venice's
-  //     INFERENCE path started rejecting luna's reasoning_effort=max on
-  //     09-01 (3 identical 400s, "does not support 'max' with this model")
-  //     even though the catalog still lists max in reasoningEffortOptions —
-  //     catalog-verified is NOT live-verified. Sol's 08-13 removal (worst
-  //     settled verified-rate, 40% at n≥15) happened at effort=high; the
-  //     operator is retrying it at xhigh. Live-probed 09-02: 200 OK, 11k
-  //     chars of solve-shaped JSON in 132s at xhigh.
+  // Mining A/B (4-way). Current arms (operator roster 2026-09-02/03, every
+  // (model, effort) pair live-probed with a solve-shaped request same day):
+  //   grok-4-6          — xAI, 500k ctx, $2.27/$6.80, effort=xhigh.
+  //     Probe: 200 OK, 13.9k chars in 48s.
+  //   claude-opus-5     — 1M ctx, $6/$30, code-optimized, effort=xhigh
+  //     (dial NEW as of the 09-02 catalog — ran at server-default medium
+  //     before). Also the verifiable-lane + mining fallback default.
+  //     Probe: 200 OK, 12.5k chars in 76s.
+  //   openai-gpt-56-terra — GPT-5.6 "Terra", 1M ctx, $3.125/$18.75,
+  //     effort=xhigh. In 2026-09-03 (operator), replacing gpt-56-sol whose
+  //     second stint lasted a day — operator switched to the mid-priced 5.6
+  //     sibling (half sol's price) before sol accumulated attempts. The 5.6
+  //     wire-name shape has 61+ gateway acceptances (luna/sol), so id-
+  //     rejection risk ≈ zero. Probe: 200 OK, 5.5k chars in 65s.
+  //   gemini-3-8-flash  — 1M ctx, $0.9375/$4.6875, effort=high. In
+  //     2026-09-03 (operator), replacing gemini-3-1-pro-preview. CAVEATS:
+  //     (a) the catalog exposes NO reasoningEffortOptions for it — the live
+  //     path ACCEPTS effort=high (probe 200 OK, 9.7k chars in 30s, fastest
+  //     arm) but may silently ignore it; (b) its wire name has ZERO
+  //     historical gateway acceptances — if the gateway's modelUsed
+  //     validator balks, the id-rejection breaker sidelines it after ONE
+  //     lost solve (the bounded-canary path the GLM postmortem demanded).
   // The parse-fail circuit-breaker (filterPoolByParseFailure) sidelines any arm
-  // that fails ≥30% over ≥5 attempts, and DEFAULTS.mining_solve (opus-4-8) is the
+  // that fails ≥30% over ≥5 attempts, and DEFAULTS.mining_solve (opus-5) is the
   // safe fallback if all four get filtered. At 12/day that's ~3 attempts/arm/day;
   // mining-stats recommends pruning at gap ≥20pp once n ≥ 5 per arm.
+  // SOL POSTSCRIPT (2026-09-03): sol re-entered 09-02 at xhigh (its 08-13
+  // removal for a 40% verified-rate was at effort=high) and left ~a day
+  // later for terra, before any settled evidence accumulated — the xhigh
+  // hypothesis is untested, not refuted.
   // GLM removed 2026-07-28 after 52 attempts / 0 accepted submissions / $12.31
   // burned across 13 days: the gateway's modelUsed validator rejects every
   // dash-mangled form of its id (both "zai-org-glm-5-2" and the stripped
@@ -133,8 +140,8 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   mining_solve: [
     "grok-4-6",
     "claude-opus-5",
-    "openai-gpt-56-sol",
-    "gemini-3-1-pro-preview",
+    "openai-gpt-56-terra",
+    "gemini-3-8-flash",
   ],
   mining_learning: undefined,
   verification_score: undefined,
@@ -171,11 +178,16 @@ const MODEL_EFFORT: Record<string, ReasoningEffort> = {
   // default high) — operator wants it at xhigh, and this time it's supported.
   "grok-4-6": "xhigh",
   "openai-gpt-55": "high",
-  // Sol at "xhigh" per operator (2026-09-02), up from the prophylactic "high"
-  // it ran at during its first roster stint (ended 08-13). The old concern —
-  // gpt-55 empty-tracing at xhigh — did not reproduce on sol: live probe
-  // 09-02 returned 11k chars of solve-shaped JSON in 132s at xhigh.
+  // Sol at "xhigh" (probed OK 09-02) — out of the roster since 09-03 (terra
+  // took the 5.6 slot); entry kept so any residual call site has a sane value.
   "openai-gpt-56-sol": "xhigh",
+  // Terra at "xhigh" per operator (2026-09-03). Catalog lists none..max;
+  // live-probed at xhigh same day: 200 OK, 5.5k chars in 65s.
+  "openai-gpt-56-terra": "xhigh",
+  // gemini-3-8-flash: the catalog exposes NO effort options (like opus-5
+  // pre-09-02), but the live path ACCEPTS "high" (probe 09-03: 200 OK, no
+  // 400) — the value may be server-ignored. Operator asked for high.
+  "gemini-3-8-flash": "high",
   // Luna left the roster 2026-09-02: Venice's inference path REJECTS
   // reasoning_effort=max for it since 09-01 (HTTP 400) while the catalog
   // still lists max as supported. Held at "high" (its catalog default) so
