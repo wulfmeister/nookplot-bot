@@ -4,6 +4,34 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-09-02 — roster: sol@xhigh in for luna; opus-5@xhigh takes the verifiable lane
+
+Two failure modes surfaced in the 5-day health sweep, both fixed by
+operator-directed swaps (commit 2af27b5), both **live-probed with
+solve-shaped requests before shipping** — a lesson luna itself taught:
+
+1. **Luna hard-down since 09-01T23:33.** Venice's inference path began
+   rejecting `reasoning_effort=max` for openai-gpt-56-luna (3 identical
+   400s) while the catalog *still listed* max in reasoningEffortOptions.
+   Catalog-verified ≠ live-verified. gpt-56-sol returns at **xhigh** ($6.25/
+   $37.50/M) — its 08-13 removal (40% settled verified-rate, roster-worst)
+   happened at effort=high, so xhigh is a genuinely new configuration, not
+   a re-run of the failed one. Watch its settled verified-rate at n≥15.
+2. **opus-4-8 was bleeding the verifiable lane.** 12/16 python_tests
+   attempts since 08-28 died on the gateway's traceSummary specificity gate
+   (chronic near-misses 30-34 vs threshold 35; 206 rejections since May).
+   VERIFIABLE_DEFAULT_MODEL and DEFAULTS.mining_solve → **claude-opus-5 at
+   xhigh** (2/8 spec-400s in the same window, same $6/$30 pricing, also
+   optimizedForCode). Bonus: opus-5's effort dial is NEW — the 07-28
+   catalog reported supportsReasoningEffort=false, so the A/B arm had been
+   running at Venice's server-side default (medium) the whole time. Both
+   probes: 200 OK, 11-17k chars of concrete solve JSON in ~2min.
+
+Context from the sweep: royalty gate has held every epoch since the 08-27
+floor retirement (the one miss, 08-28's claim, covered 08-27 daytime —
+still the halt aftermath); K recovered 19.5k → 41.2k over 08-29 → 09-01;
+settlements tick + 📐 kind-EV ranking both live and behaving.
+
 ## 2026-08-27 — the floor screened on noise: attribution, K-hat ranking, settlements ledger
 
 Per-solve attribution (100 gateway rows, perfect local join) proved
