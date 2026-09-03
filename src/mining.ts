@@ -71,7 +71,11 @@ const VERIFIABLE_KINDS = new Set(["python_tests", "javascript_tests", "exact_ans
 // in the pool, so verifiable kinds (about half our attempts) produced zero A/B
 // signal. kimi-k3 and gpt-56-sol stay out pending their own code data.
 const VERIFIABLE_CODE_MODELS = new Set(["claude-opus-4-8", "claude-opus-5", "claude-opus-4-7", "openai-gpt-55"]);
-const VERIFIABLE_DEFAULT_MODEL = "claude-opus-4-8";
+// opus-4-8 → opus-5 (operator, 2026-09-02): opus-4-8 hit the gateway's
+// traceSummary specificity gate on 12/16 python_tests attempts since 08-28
+// (near-misses, 30-34 vs threshold 35); opus-5 hit it 2/8 in the same
+// window. Both are optimizedForCode on Venice at identical pricing.
+const VERIFIABLE_DEFAULT_MODEL = "claude-opus-5";
 // How many times to re-solve + resubmit a verifiable challenge that failed its
 // deterministic tests, feeding the exact failing test back to the solver. The
 // gateway grants up to 20 slots/challenge; we use a few. Tune via env.

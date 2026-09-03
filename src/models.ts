@@ -42,7 +42,11 @@ const DEFAULTS: Record<Task, string> = {
   bounty_work: "claude-opus-4-8",
   bounty_critique: "claude-opus-4-8",
   bounty_revise: "claude-opus-4-8",
-  mining_solve: "claude-opus-4-8",
+  // mining_solve default → claude-opus-5 (operator, 2026-09-02): opus-4-8
+  // failed the gateway's traceSummary specificity gate on 12/16 mining
+  // attempts since 08-28 (chronic near-misses, 30-34 vs threshold 35);
+  // opus-5 failed 2/8 in the same window. Same price ($6/$30), same 1M ctx.
+  mining_solve: "claude-opus-5",
   mining_learning: "grok-4-3",
   // Verification moved to grok-4-5 on 2026-07-30 (operator). NOTE: this is
   // NOT a cost saving — grok-4-5 lists $2.27/$6.80 per M vs grok-4-3's
@@ -83,12 +87,15 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   //     claude-fable-5 on 2026-07-28 (operator); effort=high.
   //   gemini-3-1-pro-preview — Google's top model on Venice, 1M ctx, $2.50/$15.
   //     4th arm 2026-08-05, replacing kimi-k3 (see below); effort=high.
-  //   openai-gpt-56-luna — GPT-5.6 "Luna", 1M ctx, $0.27/$1.60. Replaced
-  //     gpt-56-sol 2026-08-13 (operator): sol had the roster's worst settled
-  //     verified-rate (40%, a 27pp gap to grok/gemini at n≥15) and worst
-  //     NOOK/$. Operator optimizes GROSS NOOK, not cost — luna is the same
-  //     family at effort=max (catalog-verified supported) as the
-  //     highest-effort configuration of the 5.6 line we can buy.
+  //   openai-gpt-56-sol — GPT-5.6 "Sol", 1M ctx, $6.25/$37.50. Back in the
+  //     roster 2026-09-02 (operator), replacing gpt-56-luna: Venice's
+  //     INFERENCE path started rejecting luna's reasoning_effort=max on
+  //     09-01 (3 identical 400s, "does not support 'max' with this model")
+  //     even though the catalog still lists max in reasoningEffortOptions —
+  //     catalog-verified is NOT live-verified. Sol's 08-13 removal (worst
+  //     settled verified-rate, 40% at n≥15) happened at effort=high; the
+  //     operator is retrying it at xhigh. Live-probed 09-02: 200 OK, 11k
+  //     chars of solve-shaped JSON in 132s at xhigh.
   // The parse-fail circuit-breaker (filterPoolByParseFailure) sidelines any arm
   // that fails ≥30% over ≥5 attempts, and DEFAULTS.mining_solve (opus-4-8) is the
   // safe fallback if all four get filtered. At 12/day that's ~3 attempts/arm/day;
@@ -117,15 +124,16 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   // from June under the pre-07-28 breaker/accounting bugs (successes never
   // tagged) AND an unsupported reasoning_effort=xhigh (catalog says
   // low|medium|high) that plausibly caused the empty outputs itself.
-  // BETA WATCH: openai-gpt-56-luna is flagged betaModel=true in the catalog —
-  // Venice may withdraw a beta model without the standard deprecation notice.
-  // A withdrawn arm 404s at generation, which is NOT matched by
-  // isTransientGenerationError, so the attempt is lost rather than rerouted.
-  // Re-probe it first whenever the catalog is re-checked.
+  // LUNA POSTMORTEM (2026-09-02): the 08-13 BETA WATCH note warned Venice may
+  // withdraw a beta model without notice. What actually broke was subtler —
+  // the model stayed up but its 'max' effort tier was dropped from the LIVE
+  // inference path on 09-01 while the catalog kept listing it. Every luna
+  // attempt 400'd from 09-01T23:33 until the 09-02 swap. Lesson kept: probe
+  // the exact (model, effort) pair live; the catalog alone proves nothing.
   mining_solve: [
     "grok-4-6",
     "claude-opus-5",
-    "openai-gpt-56-luna",
+    "openai-gpt-56-sol",
     "gemini-3-1-pro-preview",
   ],
   mining_learning: undefined,
@@ -163,23 +171,23 @@ const MODEL_EFFORT: Record<string, ReasoningEffort> = {
   // default high) — operator wants it at xhigh, and this time it's supported.
   "grok-4-6": "xhigh",
   "openai-gpt-55": "high",
-  // OpenAI reasoning models empty-trace at xhigh (observed on gpt-55) — keep
-  // gpt-56-sol at high. GLM-5.2 at high pending its own calibration.
-  "openai-gpt-56-sol": "high",
-  // Luna at "max" per operator (2026-08-13) — catalog-verified supported
-  // (options none..max, default high). KNOWN RISK: gpt-55 empty-traced at
-  // xhigh, and sol was held at "high" prophylactically; if luna empty-traces
-  // at max the parse-fail breaker sidelines it at ≥30% over 5 attempts and
-  // salvageMarkdownTrace recovers partial output — bounded, so we honor the
-  // operator's max-effort ask rather than pre-nerfing it.
-  "openai-gpt-56-luna": "max",
-  // claude-opus-5 is deliberately ABSENT: the live catalog reports
-  // supportsReasoningEffort=false / no reasoningEffortOptions, so any value
-  // here would be an ignored parameter. It still reasons (
-  // supportsReasoning=true) — it just doesn't expose a depth dial. Probing it
-  // at high vs xhigh on 2026-07-28 produced different-length output, but since
-  // the requests were served identically that was sampling noise, not a
-  // calibration signal. effortFor() returning undefined omits the field.
+  // Sol at "xhigh" per operator (2026-09-02), up from the prophylactic "high"
+  // it ran at during its first roster stint (ended 08-13). The old concern —
+  // gpt-55 empty-tracing at xhigh — did not reproduce on sol: live probe
+  // 09-02 returned 11k chars of solve-shaped JSON in 132s at xhigh.
+  "openai-gpt-56-sol": "xhigh",
+  // Luna left the roster 2026-09-02: Venice's inference path REJECTS
+  // reasoning_effort=max for it since 09-01 (HTTP 400) while the catalog
+  // still lists max as supported. Held at "high" (its catalog default) so
+  // any residual call site doesn't inherit the dead config.
+  "openai-gpt-56-luna": "high",
+  // claude-opus-5 at "xhigh" per operator (2026-09-02). HISTORY: this entry
+  // was deliberately absent 07-28→09-02 because the catalog then reported
+  // supportsReasoningEffort=false — the arm ran at Venice's server-side
+  // default (now listed as "medium"). The 09-02 catalog re-probe shows the
+  // dial exists (low|medium|high|xhigh|max, default medium), and a live
+  // xhigh probe returned 200 with 17k chars in 122s.
+  "claude-opus-5": "xhigh",
   // gemini-3-1-pro-preview accepts ONLY low|medium|high per the live catalog
   // (2026-08-05). It ran at an unsupported "xhigh" from 05-24 → 07-09 — the
   // same class of misconfig grok-4-5 had — which plausibly produced its
