@@ -804,8 +804,12 @@ function computeBlockers(args: {
     });
   }
   // Network trend — has v0% been climbing over last 24h?
-  if (args.networkHistory.length >= 3) {
-    const recent = args.networkHistory.slice(-3);
+  // The watchdog writes pool-less marker rows ({ts, watchdog, consecutivePolls})
+  // into the same file at exit — skip those or the whole snapshot 500s
+  // whenever one lands in the trend window (bit us 09-10 → 09-17).
+  const poolRows = args.networkHistory.filter((h) => h.pool && typeof h.pool.total === "number");
+  if (poolRows.length >= 3) {
+    const recent = poolRows.slice(-3);
     const trend = recent.map((h) => (h.pool.total > 0 ? h.pool.v0 / h.pool.total : 0));
     if (trend[0] < 0.5 && trend[trend.length - 1] >= 0.7) {
       blockers.push({
