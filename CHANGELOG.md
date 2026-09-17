@@ -4,6 +4,48 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-09-17 — 6.3-day lid-close outage; rewards mostly recovered; dashboard was blind exactly when it mattered
+
+The host slept 09-10T19:06Z → 09-17T02:16Z (lid closed; battery was FINE at
+44% — this was not another battery death). Watchdog exit(70) fired
+correctly, but launchd's respawn pended through the sleep: every guard
+lives on the sleeping host. Two findings from the restart:
+
+1. **Outage losses are mostly deferred, not destroyed.** Rewards are
+   pull-based: the restart claim recovered 1.88M NOOK (1.575M solving from
+   the 09-09/10 submissions that settled during the sleep), and the 09-09
+   restart claim before it recovered 2.93M including a BATCHED 500k posting
+   royalty — disproving the earlier "posting never accumulates" model.
+   Refined: royalty is never granted for an epoch without an in-epoch
+   accepted submission (those are lost), but granted-and-unclaimed
+   royalties wait for the next claim.
+2. **Dashboard bug (fixed, a9cd6b1):** the watchdog's pool-less death-marker
+   row in network-status.jsonl crashed /api/snapshot and /api/blockers
+   unguarded (`h.pool.total`) — the dashboard 500'd from 09-10 to 09-17,
+   i.e. it was blank precisely during post-outage triage. The trend blocker
+   now filters marker rows.
+
+Catch-up refilled the rolling cap within hours (as on 09-09, when 12/12
+refilled in 76 min at 12-for-12). Standing gap: no alarm exists off-host;
+an external heartbeat (healthchecks.io) is proposed and undecided.
+
+## 2026-09-03 — pacing off; terra + gemini-3-8-flash; the probe lesson compounds
+
+Operator: "remove the mining cap." The gateway's rolling 12/24h is
+untouchable, but our own pacingGate (108-min spread, calibrated for ~90%
+acceptance) was the binding constraint at the measured 63% — holding us at
+~6-7 accepted/day. `BOT_MINING_PACING=0` (.env): the cap pinned 12/12
+within 40 minutes and refill bursts convert immediately; zero 429s (the
+rolling pre-flight does the real guarding).
+
+Roster (operator, same day): gpt-56-terra@xhigh and gemini-3-8-flash@high
+replace sol (one-day stint, untested not refuted) and 3-1-pro. Terra was
+DOA on a failure mode the pre-ship probe missed — Venice rejects ANY
+explicit temperature for it — because the probe didn't set the field.
+Fixed in venice.ts (drop-and-retry on that 400, mirroring the max_tokens
+pattern; effort rejections deliberately stay loud). Flash's untested wire
+name cleared on first contact. 8h hawk-watch: 17-for-17 accepted post-fix.
+
 ## 2026-09-02 — roster: sol@xhigh in for luna; opus-5@xhigh takes the verifiable lane
 
 Two failure modes surfaced in the 5-day health sweep, both fixed by
