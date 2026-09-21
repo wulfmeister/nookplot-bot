@@ -59,6 +59,14 @@ const MODEL_PRICING: Record<string, { in: number; out: number }> = {
   "openai-gpt-56-terra": { in: 3.125, out: 18.75 },
   "gemini-3-8-flash": { in: 0.9375, out: 4.6875 },
   "kimi-k3": { in: 4.6875, out: 23.4375 },
+  // Live catalog 2026-09-20. deepseek-v4-1-flash is the mining default since
+  // that day; deepseek-v4-flash (0423 build) and claude-sonnet-5 were probed as
+  // alternatives and are priced here so any future arm-comparison reads real
+  // rates rather than DEFAULT_PRICING. (terra's 09-03 entry above keeps the
+  // rate live when it joined; the catalog now lists $2.50/$15.)
+  "deepseek-v4-1-flash": { in: 0.375, out: 1.5 },
+  "deepseek-v4-flash": { in: 0.138, out: 0.275 },
+  "claude-sonnet-5": { in: 3, out: 15 },
   // Fallback / other-task models
   "claude-opus-4-8": { in: 6, out: 30 },
   "claude-opus-4-7": { in: 6, out: 30 },

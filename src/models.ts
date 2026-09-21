@@ -8,8 +8,11 @@
  *   grok-4-3, grok-4-5, grok-4-20, claude-opus-4-8, claude-opus-5,
  *   claude-fable-5, claude-sonnet-5, kimi-k2-5/k2-6/k2-7-code/k3,
  *   openai-gpt-55, openai-gpt-56-sol, gemini-3-1-pro-preview,
- *   deepseek-v4-pro. All four mining arms below probed 200 + non-empty with a
- *   solve-shaped JSON request on 2026-07-28.
+ *   deepseek-v4-pro.
+ * 2026-09-20 re-probe (117 models) added deepseek-v4-1-flash ($0.375/$1.50,
+ * 1M ctx, optimizedForCode) to the mining roster — see mining_solve below.
+ * Every arm currently in the mining_solve pool was live-probed with a
+ * solve-shaped request on the day it joined (dates in the pool comment).
  */
 
 import { isLean } from "./lean.js";
@@ -46,7 +49,35 @@ const DEFAULTS: Record<Task, string> = {
   // failed the gateway's traceSummary specificity gate on 12/16 mining
   // attempts since 08-28 (chronic near-misses, 30-34 vs threshold 35);
   // opus-5 failed 2/8 in the same window. Same price ($6/$30), same 1M ctx.
-  mining_solve: "claude-opus-5",
+  //
+  // mining_solve → deepseek-v4-1-flash (operator, 2026-09-20): the opus-5 era
+  // ended with it the WORST arm on attempt-success — 23 errors / 73 attempts
+  // since 08-20 (31.5%) vs 11-18% for grok-4-6 / terra / gemini-3-8-flash —
+  // while consuming 78% of all Venice spend ($18.47 of $23.70 in the 7d to
+  // 09-20), and 10/35 of its python_tests attempts died at the traceSummary
+  // specificity gate (29%; 0% on every other arm). Swap probed 2026-09-20 with
+  // the real solve shapes, at a 6k-token PROBE budget (production floors every
+  // call at 50k — see venice.ts MIN_COMPLETION_TOKENS — so the per-lane
+  // latency/cost below are probe figures, not production ones):
+  //   • python_tests lane (60% of volume): opus-5 = 76s / $0.235 / hit the 6k
+  //     probe cap with zero extractable output vs deepseek = 13-19s / $0.006 /
+  //     strict-parse OK, summary passes the specificity gate, and passes a
+  //     local correctness+security harness (path traversal rejected, no
+  //     os.system, -1 on missing file).
+  //   • standard lane: 113s / $0.024 / parses via salvageMarkdownTrace, spec OK.
+  //   • effort MUST stay "high": at "max" the probe spent its whole completion
+  //     budget on reasoning and emitted nothing (6000/6000 tokens, empty).
+  //   • Short-JSON side tasks (teaching / clarify / bounty pickers, 600-800
+  //     max_tokens) verified parseable at high effort.
+  // The 29% spec-reject mechanism is the one documented at
+  // mining.ts:SUMMARY_SPECIFICITY_RULE (snake_case-only source gives the
+  // enricher nothing to extract) — NOT truncation; that hypothesis came from
+  // the probe's 6k budget and does not hold at production's 50k floor.
+  // opus-5 stays reachable via MODEL_MINING_SOLVE; it is no longer the default.
+  // Also observed 09-20: opus-5 uniquely trips Venice's content_filter on our
+  // standard-trace system prompt (finish_reason=content_filter, 0 tokens, 1s) —
+  // grok-4-6 / terra / gemini / deepseek / even opus-4-8 did not.
+  mining_solve: "deepseek-v4-1-flash",
   mining_learning: "grok-4-3",
   // Verification moved to grok-4-5 on 2026-07-30 (operator). NOTE: this is
   // NOT a cost saving — grok-4-5 lists $2.27/$6.80 per M vs grok-4-3's
@@ -77,14 +108,15 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   bounty_work: undefined,
   bounty_critique: undefined,
   bounty_revise: undefined,
-  // Mining A/B (4-way). Current arms (operator roster 2026-09-02/03, every
-  // (model, effort) pair live-probed with a solve-shaped request same day):
+  // Mining A/B (4-way). Current arms (operator roster 2026-09-20; every
+  // (model, effort) pair live-probed with a solve-shaped request):
   //   grok-4-6          — xAI, 500k ctx, $2.27/$6.80, effort=xhigh.
   //     Probe: 200 OK, 13.9k chars in 48s.
-  //   claude-opus-5     — 1M ctx, $6/$30, code-optimized, effort=xhigh
-  //     (dial NEW as of the 09-02 catalog — ran at server-default medium
-  //     before). Also the verifiable-lane + mining fallback default.
-  //     Probe: 200 OK, 12.5k chars in 76s.
+  //   deepseek-v4-1-flash — 1M ctx, $0.375/$1.50, code-optimized, effort=high
+  //     (09-20 swap for opus-5; NOT max — at max it returns empty content with
+  //     the budget spent on reasoning). python lane: 200 OK, strict-parse JSON
+  //     in 13-19s, spec gate pass, local security harness clean. standard lane:
+  //     200 OK, 113s, parses via salvageMarkdownTrace, spec gate pass.
   //   openai-gpt-56-terra — GPT-5.6 "Terra", 1M ctx, $3.125/$18.75,
   //     effort=xhigh. In 2026-09-03 (operator), replacing gpt-56-sol whose
   //     second stint lasted a day — operator switched to the mid-priced 5.6
@@ -99,10 +131,13 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   //     historical gateway acceptances — if the gateway's modelUsed
   //     validator balks, the id-rejection breaker sidelines it after ONE
   //     lost solve (the bounded-canary path the GLM postmortem demanded).
+  //     (c) 09-20 python-lane probe: 163s, hit the 6k cap, $0.117 — keep it
+  //     off the verifiable lane (VERIFIABLE_CODE_MODELS in mining.ts).
   // The parse-fail circuit-breaker (filterPoolByParseFailure) sidelines any arm
-  // that fails ≥30% over ≥5 attempts, and DEFAULTS.mining_solve (opus-5) is the
-  // safe fallback if all four get filtered. At 12/day that's ~3 attempts/arm/day;
-  // mining-stats recommends pruning at gap ≥20pp once n ≥ 5 per arm.
+  // that fails ≥30% over ≥5 attempts; if that would empty the pool it falls
+  // back to the UNFILTERED pool (better to burn credits than halt mining). At
+  // 12/day that's ~3 attempts/arm/day; mining-stats recommends pruning at gap
+  // ≥20pp once n ≥ 5 per arm.
   // SOL POSTSCRIPT (2026-09-03): sol re-entered 09-02 at xhigh (its 08-13
   // removal for a 40% verified-rate was at effort=high) and left ~a day
   // later for terra, before any settled evidence accumulated — the xhigh
@@ -137,9 +172,16 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   // inference path on 09-01 while the catalog kept listing it. Every luna
   // attempt 400'd from 09-01T23:33 until the 09-02 swap. Lesson kept: probe
   // the exact (model, effort) pair live; the catalog alone proves nothing.
+  // ROSTER UPDATE 2026-09-20 (operator): claude-opus-5 OUT, deepseek-v4-1-flash
+  // IN. Same evidence as DEFAULTS.mining_solve above: opus-5 was the worst arm
+  // on attempt-success while taking 78% of spend; deepseek clears both lanes'
+  // format gates at ~1/20th the price ($0.006/python solve vs $0.235). It stays
+  // in the pool (not just the verifiable default) so the standard-trace lane
+  // generates real verifier-score data on it — n≥5/arm is what mining-stats
+  // needs to confirm or reject the arm, and at 12 solves/day that is ~4 days.
   mining_solve: [
     "grok-4-6",
-    "claude-opus-5",
+    "deepseek-v4-1-flash",
     "openai-gpt-56-terra",
     "gemini-3-8-flash",
   ],
@@ -199,7 +241,15 @@ const MODEL_EFFORT: Record<string, ReasoningEffort> = {
   // default (now listed as "medium"). The 09-02 catalog re-probe shows the
   // dial exists (low|medium|high|xhigh|max, default medium), and a live
   // xhigh probe returned 200 with 17k chars in 122s.
+  // OUT of the mining roster since 2026-09-20 (see DEFAULTS.mining_solve) —
+  // entry kept so MODEL_MINING_SOLVE=claude-opus-5 still gets the right dial.
   "claude-opus-5": "xhigh",
+  // deepseek-v4-1-flash joined 2026-09-20 at "high" (its catalog default,
+  // options none|low|high|max). NOT max: in the 09-20 probe (6k budget) max
+  // spent the whole completion budget on reasoning and returned empty content
+  // (6000/6000 tokens, zero parseable output, on the python solve shape). At
+  // high the same shape returns clean JSON in 13-19s.
+  "deepseek-v4-1-flash": "high",
   // gemini-3-1-pro-preview accepts ONLY low|medium|high per the live catalog
   // (2026-08-05). It ran at an unsupported "xhigh" from 05-24 → 07-09 — the
   // same class of misconfig grok-4-5 had — which plausibly produced its

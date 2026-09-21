@@ -126,7 +126,7 @@ import {
   descriptionSimilarity, isGateRelaxed, fallbackDomainOrder,
 } from "../challenge-posting.js";
 import { findRepetitiveLearning, findLearningMotifCollision, decideNonTerminalCandidate } from "../learnings.js";
-import { findTemplateFingerprint, isFarmChallengeTitle, findNearDuplicateTrace, nearDupeCorpus, applyOffTopicClamp } from "../trace-fingerprint.js";
+import { findTemplateFingerprint, isFarmChallengeTitle, findNearDuplicateTrace, nearDupeCorpus, applyOffTopicClamp, dupeWindow } from "../trace-fingerprint.js";
 import { scoreIntentFit } from "../manifest-intents.js";
 import { veniceRateLimited429Today, computeParseFailureRates, type CostEntry } from "../venice-cost.js";
 import {
@@ -150,11 +150,12 @@ describe("models", () => {
     const savedLean = process.env.BOT_LEAN;
     delete process.env.BOT_LEAN;
     try {
-      // mining_solve defaults to opus-5 since 2026-09-02 (opus-4-8 before
-      // that — it was failing the gateway specificity gate 12/16 since
-      // 08-28); prose/volume tasks stay on grok-4-3. Verification moved to
-      // grok-4-6 since 2026-08-13 (grok-4-5 before that, from 07-30).
-      assert.equal(pickModel("mining_solve"), process.env.MODEL_MINING_SOLVE ?? "claude-opus-5");
+      // mining_solve defaults to deepseek-v4-1-flash since 2026-09-20 (opus-5
+      // before that from 09-02; opus-4-8 from 08-28 — each change was driven
+      // by the incumbent failing a gate the cheaper model cleared). Prose/
+      // volume tasks stay on grok-4-3. Verification moved to grok-4-6 since
+      // 2026-08-13 (grok-4-5 before that, from 07-30).
+      assert.equal(pickModel("mining_solve"), process.env.MODEL_MINING_SOLVE ?? "deepseek-v4-1-flash");
       assert.equal(pickModel("verification_score"), process.env.MODEL_VERIFICATION_SCORE ?? "grok-4-6");
       assert.equal(pickModel("verification_comprehension"), process.env.MODEL_VERIFICATION_COMPREHENSION ?? "grok-4-6");
       assert.equal(pickModel("knowledge_body"), process.env.MODEL_KNOWLEDGE_BODY ?? "grok-4-3");
@@ -168,13 +169,16 @@ describe("models", () => {
     // Non-lean A/B sampling (lean would force the cheap model, pool="lean").
     const savedLean = process.env.BOT_LEAN;
     delete process.env.BOT_LEAN;
-    // Pool as of 2026-09-03 (operator): terra holds the 5.6 slot (luna's max
-    // died on the live path 09-01; sol's return lasted a day), and
-    // gemini-3-8-flash replaces 3-1-pro-preview. All four (model, effort)
-    // pairs live-probed 09-03 with solve-shaped requests: 200 OK, full output.
+    // Pool as of 2026-09-20 (operator): deepseek-v4-1-flash takes the slot
+    // opus-5 held. It is the only arm whose (model, effort) pair was
+    // live-probed on BOTH solve lanes with the tolerant parser the real
+    // pipeline uses: python 13-19s/$0.006 (strict JSON, spec pass, local
+    // correctness+security harness clean) and standard 113s/$0.024 (parses
+    // via salvageMarkdownTrace, spec pass). Effort is "high" — at "max" it
+    // returns empty content with the whole budget spent on reasoning.
     const allowed = new Set([
       "grok-4-6",
-      "claude-opus-5",
+      "deepseek-v4-1-flash",
       "openai-gpt-56-terra",
       "gemini-3-8-flash",
     ]);
@@ -211,6 +215,10 @@ describe("models", () => {
       // 2026-09-02 with solve-shaped requests at xhigh: 200 OK, full output.
       assert.equal(effortFor("claude-opus-5"), "xhigh");
       assert.equal(effortFor("openai-gpt-56-terra"), "xhigh");
+      // deepseek-v4-1-flash joined 2026-09-20 at "high" (catalog default).
+      // NOT its "max" tier: probed 09-20 the python solve shape at max spent
+      // all 6000 completion tokens on reasoning and returned empty content.
+      assert.equal(effortFor("deepseek-v4-1-flash"), "high");
       // gemini-3-8-flash exposes NO effort options in the catalog; the live
       // path accepts "high" (probe 09-03) though it may be server-ignored.
       assert.equal(effortFor("gemini-3-8-flash"), "high");
@@ -507,6 +515,27 @@ describe("trace-fingerprint (anti-farm verification abstention)", () => {
     assert.equal(findNearDuplicateTrace(distinct, seen), null);
   });
 
+  it("dupeWindow skips the shared generator header on long traces, keeps short ones whole", () => {
+    // Real header shape (2026-09-20 pool): identical wording across DIFFERENT
+    // challenges, and it is what made unrelated submissions look alike.
+    const header = (title: string, id: string) =>
+      `Approach for "${title}" (id=${id}, verifier_kind=standard, domain=[security], difficulty=expert). `;
+    const bodyA = "Body A. " + "subprocess argument lists avoid shell interpolation and reject traversal escapes. ".repeat(9);
+    const bodyB = "Body B. " + "the scheduler admits a variant function over the ready queue so starvation is impossible. ".repeat(9);
+    const a = header("CVE Analysis: CVE-2026-83021", "30f8194a") + bodyA;
+    const b = header("Doc gaps: ollama/ollama", "a34287e9") + bodyB;
+    assert.ok(a.length > 600 && b.length > 600, "fixtures must be long enough for the window to apply");
+    // Shared header + different bodies = NOT a duplicate.
+    assert.equal(findNearDuplicateTrace(a, [b]), null, "a shared generator header must not read as duplication");
+    // A real copy (same body, different header id) still matches.
+    const copy = header("Doc gaps: ollama/ollama", "ffffffff") + bodyB;
+    assert.ok(findNearDuplicateTrace(copy, [b]), "identical body must still match");
+    // Window mechanics: long → header skipped; short → returned whole.
+    assert.ok(!dupeWindow(a).includes("Approach for"), "the header must be skipped on long traces");
+    assert.ok(dupeWindow(a).length > 300, "the window keeps a substantial body");
+    assert.equal(dupeWindow("short text"), "short text");
+  });
+
   it("nearDupeCorpus: a submission never near-dupes ITSELF", () => {
     // The 1bb0a74a incident (2026-07-31): a sub processed twice 25s apart
     // (overlapping polls) matched its own cached snippet at 100% and a
@@ -553,17 +582,20 @@ describe("mining.maybeOverrideModelForVerifiable (route weak-for-code models off
     if (saved.m === undefined) delete process.env.BOT_VERIFIABLE_MODEL; else process.env.BOT_VERIFIABLE_MODEL = saved.m;
   };
 
-  it("routes grok-4-3 → opus on a verifiable (python_tests) challenge", () => {
+  it("routes a weak-code A/B pick → deepseek on a verifiable (python_tests) challenge", () => {
     clean();
-    // Default is opus-5 since 2026-09-02 (opus-4-8 was spec-400ing 12/16).
-    try { assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3")).model, "claude-opus-5"); }
+    // Default is deepseek-v4-1-flash since 2026-09-20 (opus-5 09-02→09-20:
+    // it truncated python solves at the 6k cap, the source of its 29%
+    // spec-reject rate, at $0.235/solve vs deepseek's $0.006).
+    try { assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3")).model, "deepseek-v4-1-flash"); }
     finally { restore(); }
   });
-  it("leaves an already code-strong A/B pick (opus / gpt-55) unchanged on verifiable", () => {
+  it("leaves an already code-strong A/B pick (opus / gpt-55 / deepseek) unchanged on verifiable", () => {
     clean();
     try {
       assert.equal(maybeOverrideModelForVerifiable(py, AB("claude-opus-4-8")).model, "claude-opus-4-8");
       assert.equal(maybeOverrideModelForVerifiable(py, AB("openai-gpt-55")).model, "openai-gpt-55");
+      assert.equal(maybeOverrideModelForVerifiable(py, AB("deepseek-v4-1-flash")).model, "deepseek-v4-1-flash");
     } finally { restore(); }
   });
   it("does NOT touch standard (non-verifiable) challenges — keeps grok in the A/B pool", () => {
@@ -583,7 +615,7 @@ describe("mining.maybeOverrideModelForVerifiable (route weak-for-code models off
   it("won't force a parse-fail-sidelined default model", () => {
     clean();
     try {
-      const rates = { "claude-opus-5": { attempts: 10, failures: 8, rate: 0.8 } };
+      const rates = { "deepseek-v4-1-flash": { attempts: 10, failures: 8, rate: 0.8 } };
       assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates).model, "grok-4-3");
     } finally { restore(); }
   });
@@ -2443,6 +2475,11 @@ describe("rlm-spotcheck normalizeModel", () => {
     assert.equal(normalizeModel("claude-opus-4-8"), "claude-opus-4-8");
     assert.equal(normalizeModel("claude-opus-4-7"), "claude-opus-4-7");
     assert.equal(normalizeModel("deepseek-v4-pro"), "deepseek-v4-pro");
+    // 2026-09-20: our own mining default. Before it was added here, a
+    // trajectory claiming it fell through to the opus-4-8 fallback and was
+    // replayed on the wrong model — a guaranteed cosine outlier.
+    assert.equal(normalizeModel("deepseek-v4-1-flash"), "deepseek-v4-1-flash");
+    assert.equal(normalizeModel("DeepSeek-V4-1-Flash"), "deepseek-v4-1-flash");
   });
 
   it("rewrites display names to api ids", () => {
@@ -3892,7 +3929,7 @@ describe("venice-cost.estimateCallCost (real per-model pricing)", () => {
     // A model missing from the table silently falls back to DEFAULT_PRICING,
     // which corrupts the NOOK-per-dollar comparison that decides A/B pruning.
     // Distinct prices prove each arm has its own entry.
-    const costs = ["grok-4-6", "claude-opus-5", "openai-gpt-56-terra", "gemini-3-8-flash"]
+    const costs = ["grok-4-6", "deepseek-v4-1-flash", "openai-gpt-56-terra", "gemini-3-8-flash"]
       .map((m) => estimateCallCost(m, 12000, 8000));
     assert.equal(new Set(costs.map((c) => c.toFixed(6))).size, 4, "arms share a price — one is falling back to the default");
     for (const c of costs) assert.ok(c > 0, "cost must never be zero");
@@ -3948,7 +3985,7 @@ describe("venice-cost reasoning-token accounting (no double-count)", () => {
 
 describe("mining circuit breaker — model-id rejection (deterministic evidence)", () => {
   const base = { attempts: 3, failures: 3, rate: 1.0, idRejected: 0, idRejectedWireNames: [] as string[] };
-  const POOL = ["grok-4-6", "claude-opus-5", "openai-gpt-56-terra", "gemini-3-8-flash"];
+  const POOL = ["grok-4-6", "deepseek-v4-1-flash", "openai-gpt-56-terra", "gemini-3-8-flash"];
 
   it("sidelines on a SINGLE id rejection — no waiting for a rate to build", () => {
     // A modelUsed rejection is deterministic: the gateway will refuse this id

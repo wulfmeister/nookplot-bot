@@ -97,15 +97,61 @@ export function nearDupeCorpus(
     .filter(Boolean);
 }
 
+/**
+ * The slice of a trace that the near-dupe check compares.
+ *
+ * WHY NOT THE FIRST 1500 CHARS (2026-09-20): solvers on this network emit a
+ * machine-generated header — `Approach for "<title>" (id=<uuid>,
+ * verifier_kind=standard, domain=[...], difficulty=...). Method: decomposed
+ * contract, enumerated edge cases, selected deterministic implementation...` —
+ * whose wording is identical ACROSS DIFFERENT challenges. Comparing from byte 0
+ * lets that boilerplate carry a pair over the 0.5 threshold: two cached pairs
+ * measured 0.93 similarity on a 212-char shared prefix and 0.00 similarity once
+ * the prefix was skipped. Comparing the body keeps the signal where the copying
+ * actually happens.
+ *
+ * MEASURED EFFECT (same day, live 72-submission pool, per-solver attribution):
+ * zero change to the abstain set — 33 of 72 abstain under BOTH bases, and every
+ * one of those matches only a SAME-SOLVER peer (the two accounts that post
+ * nothing but the template). So this is a correctness guard against
+ * cross-challenge false positives, NOT a throughput fix: the current abstains
+ * are genuine templated-sibling matches, and relaxing the gate would only
+ * credit farm content (quorum is a count with no reject field).
+ *
+ * Short texts (< DUPE_SHORT_TEXT_CHARS) are returned whole: there is no
+ * meaningful header to skip. The cache stores the first 1500 chars, which
+ * covers HEADER_SKIP + WINDOW.
+ */
+// Env-overridable, but validated: a bad value (e.g. BOT_VERIFY_DUPE_WINDOW=abc)
+// would make `slice(250, NaN)` return "" and the `!head` guard below would then
+// silently DISABLE the anti-farm gate for every long trace — fail-open on the
+// one check whose job is to withhold credit from farm copies. Fall back to the
+// defaults instead.
+function positiveIntEnv(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+export const DUPE_HEADER_SKIP = positiveIntEnv("BOT_VERIFY_DUPE_HEADER_SKIP", 250);
+export const DUPE_WINDOW_CHARS = positiveIntEnv("BOT_VERIFY_DUPE_WINDOW", 1250);
+export const DUPE_SHORT_TEXT_CHARS = 600;
+
+export function dupeWindow(text: string): string {
+  if (text.length <= DUPE_SHORT_TEXT_CHARS) return text;
+  return text.slice(DUPE_HEADER_SKIP, DUPE_HEADER_SKIP + DUPE_WINDOW_CHARS);
+}
+
 export function findNearDuplicateTrace(
   trace: string,
   priorSnippets: string[],
   threshold = TRACE_NEAR_DUPE_THRESHOLD,
 ): { similarity: number } | null {
-  const head = trace.slice(0, 1500);
+  const head = dupeWindow(trace);
+  if (!head) return null;
   let best = 0;
   for (const p of priorSnippets) {
-    const s = descriptionSimilarity(head, p);
+    const w = dupeWindow(p);
+    if (!w) continue;
+    const s = descriptionSimilarity(head, w);
     if (s > best) best = s;
   }
   return best >= threshold ? { similarity: best } : null;

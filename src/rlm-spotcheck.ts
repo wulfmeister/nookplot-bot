@@ -112,6 +112,11 @@ export function normalizeModel(claimedModel: string | undefined): string {
     "gemini-3-1-pro-preview",
     "gemini-3-5-flash",
     "deepseek-v4-pro",
+    // 2026-09-20: our own mining default — the most likely claimed id on the
+    // network now. Absent from this set, a trajectory claiming it was replayed
+    // on the opus-4-8 fallback and cosine-compared against the wrong model.
+    "deepseek-v4-1-flash",
+    "deepseek-v4-flash",
     "kimi-k2-6",
   ]);
   if (known.has(m)) return m;

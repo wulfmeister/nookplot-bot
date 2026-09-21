@@ -1420,7 +1420,7 @@ function renderCapacity() {
   const d = capacityData;
   if (!d || !d.days || d.days.length === 0) { card.style.display = "none"; return; }
   card.style.display = "";
-  if (meta) meta.textContent = `— wasting ~${d.wasted.miningPerDay} mining + ~${d.wasted.verifyPerDay} verify slots/day (14d avg)`;
+  if (meta) meta.textContent = `— leaving unused: ~${d.wasted.miningPerDay} mining slots/day · ~${d.wasted.verifyPerDay} genuine verify/day (${d.wasted.verifyCoveredDays} days with supply data)`;
   const cellBar = (used, cap, pct) => {
     const col = pct >= 90 ? "var(--green, #3fb950)" : pct >= 70 ? "var(--amber, #d6a132)" : "var(--red, #e5534b)";
     const w = Math.max(2, Math.min(100, pct));
@@ -1438,7 +1438,20 @@ function renderCapacity() {
       </div>
     </div>`).join("");
   const warn = d.underuse ? `<div style="margin-bottom:8px;color:var(--red,#e5534b)">⚠ ${d.underuse}</div>` : "";
-  el.innerHTML = warn + rows;
+  // Plain-words explainers — this panel's numbers are the easiest to misread
+  // (a low verify bar is often CORRECT behavior, not waste), so each lane gets
+  // an ELI5 before the day-by-day bars.
+  const eli5 = `<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+    <div style="background:var(--panel-2);border:1px solid var(--border);border-radius:8px;padding:10px">
+      <div style="font-weight:600;font-size:12px;margin-bottom:4px">🪙 Mining, in plain words</div>
+      <div class="legend" style="text-transform:none;line-height:1.5">We get <b>12 tickets a day</b> to answer other agents' puzzles, plus one guild-only bonus ticket. Every answer the network accepts earns us a slice of that day's NOOK pool. Tickets <b>don't save up</b> — 7 used out of 12 means 5 slices we never had a shot at. A full bar means we took every ticket that day.</div>
+    </div>
+    <div style="background:var(--panel-2);border:1px solid var(--border);border-radius:8px;padding:10px">
+      <div style="font-weight:600;font-size:12px;margin-bottom:4px">✅ Verifying, in plain words</div>
+      <div class="legend" style="text-transform:none;line-height:1.5">We may check up to <b>38 other agents' answers a day</b> (shared with crowd-jury grading). Each honest check earns a small fee and costs a few cents of compute. But we may only check <b>real</b> work: a check-mark on a copy still nudges that copy toward getting paid. So when the same answer shows up again, the right move is to skip it — which means <b>a low verify bar is not automatically waste</b>. The honest target is the fresh work that actually showed up.</div>
+    </div>
+  </div>`;
+  el.innerHTML = warn + eli5 + rows;
 }
 
 function renderOverview() {

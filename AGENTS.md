@@ -2867,3 +2867,201 @@ the rerun log + `artifact_rerun` audit events.
 New surface: `artifact_rerun` audit surface; `npm run bounties` script.
 
 Tests **286 → 299**; `tsc` clean.
+
+## 2026-09-20 — opus-5 → deepseek-v4-1-flash mining swap (nineteenth pass)
+
+Operator ask: "replace opus 5 with deepseek flash 4.1 or something else that is
+almost as smart but way cheaper." The pre-flight probe (per the checklist:
+*choose a model → probe first*) turned into a full evidence sweep, and the
+incumbent lost on both axes at once.
+
+### Why opus-5 had to go
+
+| Signal (7d to 09-20 unless noted) | claude-opus-5 | best alternative |
+|---|---|---|
+| share of TOTAL Venice spend | **78%** ($18.47 of $23.70) | gemini-3-8-flash 1.9% |
+| attempt-failure rate (08-20→, submissions log) | **23/73 = 31.5%** | gemini 11%, grok-4-6 14%, terra 18% |
+| python_tests spec-rejects (7d) | **10/35 = 29%** | 0% on every other arm |
+| cost per python solve (6k-token probe) | $0.235, 76s, **0 chars extractable** | deepseek $0.006, 13s, clean |
+| content filter (probe 09-20) | **finish_reason=content_filter** on our standard-trace system prompt, 0 tokens, 1s | grok-4-6 / terra / gemini / deepseek / opus-4-8: no filter |
+
+Mechanism behind the 29% spec-rejects: the one `mining.ts:SUMMARY_SPECIFICITY_RULE`
+documents — the verifiable lane has only snake_case source to enrich a
+summary from, so when the model's own summary is thin the gateway 400s. (An
+earlier draft of this entry blamed truncation at a "6k cap"; that was an
+artifact of the probe's 6k budget — production floors every call at 50k via
+`venice.ts:MIN_COMPLETION_TOKENS`, so it cannot be the production cause. Caught
+in the pre-commit review.) Not a reasoning-quality problem; a summary-format
+problem the cheaper model does not have.
+
+### Why deepseek-v4-1-flash ($0.375/$1.50, 1M ctx, optimizedForCode)
+
+Probed 2026-09-20 with the two REAL solve shapes (`src/_probe-dsf.ts`,
+`src/_probe-dsf-validate.ts`), scored by the real specificity mirror:
+
+| lane | opus-5 @xhigh | deepseek @high |
+|---|---|---|
+| python_tests (60% of volume) | 76s, $0.235, exhausted the 6k probe budget, spec FAIL | **13-19s, $0.006, strict-parse JSON, spec 4/6 pass** |
+| standard trace | content_filter (0 tokens) | 113s, $0.024, parses via `salvageMarkdownTrace`, spec 3/6 pass |
+| local correctness+security harness | (no code extracted) | **FAILS:none** — traversal rejected, no `os.system`, -1 on missing file, `cat` exit 0 |
+| short-JSON side tasks (600-800 tok) | ok | ok (`json_ok=true`) |
+
+Effort must be **high**, not max: at max it spends the entire completion budget
+on reasoning and returns empty content (6000/6000 tokens, zero parseable
+output). That is the one trap; `MODEL_EFFORT` pins it.
+
+### Changes
+
+- `src/models.ts` — `DEFAULTS.mining_solve` and the `mining_solve` A/B arm:
+  `claude-opus-5` → `deepseek-v4-1-flash`; `MODEL_EFFORT` entry `"high"`.
+  opus-5 stays reachable via `MODEL_MINING_SOLVE` (entry + pricing kept).
+- `src/mining.ts` — `VERIFIABLE_DEFAULT_MODEL` → `deepseek-v4-1-flash`, added to
+  `VERIFIABLE_CODE_MODELS`. gemini-3-8-flash deliberately stays OUT of the
+  verifiable lane (probe: 163s, length-capped, $0.117).
+- `src/venice-cost.ts` — pricing entries for deepseek-v4-1-flash,
+  deepseek-v4-flash, claude-sonnet-5 (cost accounting must not fall back to
+  DEFAULT_PRICING and corrupt the NOOK-per-dollar arm comparison).
+- `src/__tests__/backend.test.ts` — pool pins, default pin, effort pin,
+  verifiable-override pins, cost-table list, circuit-breaker POOL.
+
+Expected effect: mining inference ~$19/wk → ~$2-3/wk, and the 29% python
+spec-reject hole closes (that alone was ~7 wasted attempts/week).
+
+Arm comparison from the same probe batch (standard lane, same challenge):
+deepseek @high 113s / 6,105-char trace / spec 3/6 / $0.024; deepseek @max
+169s / 9,844 chars / spec 4/6 / $0.041; gemini-3-8-flash 24s but only a
+2,011-char trace / spec 2/6 (rescued to pass by enrichment) / $0.016. The
+trace-length gap is the quality signal verifiers actually grade — a 2k trace
+reads thin next to 6-10k, so deepseek in the pool is not just a cost pick.
+
+### Further-down-tier probe: deepseek-v4-flash (0423 build), NOT yet adopted
+
+`deepseek-v4-flash` ($0.138/$0.275, 1M ctx, 32k max completion, April build)
+probed on the same two shapes at high effort:
+
+| lane | result |
+|---|---|
+| python_tests | 70s, strict-parse JSON, spec 4/6 pass, $0.0014; harness **FAILS:none** (traversal rejected, functional + missing-file checks clean) |
+| standard | 171s, 5,444-char trace, spec 3/6 → enrichment rescues, $0.0015 |
+
+That is ~4-15x cheaper than v4.1-flash and ~240x cheaper than opus-5's average
+solve. Held OUT of the roster deliberately: both lanes have n=1-2 samples, it
+runs 4-5x slower (70s/171s), and its 32k completion cap is below the 40k the
+standard lane requests (Venice clamps rather than errors, but it is untested at
+that ceiling). Revisit after the v4.1-flash swap has production n≥5 — at that
+point either promote v4-flash to a pool arm or swap outright if v4.1-flash
+underperforms.
+
+### Watch next (first 72h)
+
+- `npm run mining-stats -- --24h` — deepseek submit-rate per lane. If it fails
+  the circuit-breaker (≥30% over ≥5 attempts) it sidelines automatically; the
+  pool still has three proven arms.
+- `npm run rejection:check` — the verifiable lane now runs on a new model;
+  a security-test rejection wave would be the first sign the swap was wrong.
+- Gateway `modelUsed` validator: `deepseek-v4-1-flash` has no historical
+  acceptances (the family's older `deepseek-v4-pro` name does — 32 accepted
+  submissions). One id-rejection sidelines the arm permanently (bounded
+  canary); if that happens before any accept, revert to opus-5 via
+  `MODEL_MINING_SOLVE=claude-opus-5`.
+- Venice spend: `veniceCost.spentToday` should drop off a cliff; alert
+  threshold unchanged at $50/day.
+
+Tests 299 → 531 (suite has grown since the last pass); `tsc` clean. Count
+verified stable across runs at 531/531 after the restart (a pre-restart run read
+512 — some suites depend on state the live bot writes).
+
+### Ops note
+
+Restarted at 13:21 local (pid 75557, the previous instance had been up 20.5h).
+Mining was idle at the moment of the change (`epoch cap active` until
+2026-09-21T03:33Z), so nothing in flight was lost — the swap first exercises at
+that window. Restart recipe is the tee variant from 2026-06-17.
+
+Boot-race note: the restart logged `✗ another daemon instance appears to be
+running (pid 75557 …)` — that is the instance lock doing its job, not a second
+daemon. It prints when a racing boot loses; the loser exits. Verified
+afterwards that exactly one tree survives (`npm` → tsx CLI → worker) and the
+dashboard's `/api/health` reports the same pid as the pidfile
+(`daemon.identity.pid = 75557`, `lastActivityAgoSec` ticking). If a future
+restart shows that line, check `curl -s localhost:7878/api/health` before
+assuming duplication.
+
+## 2026-09-20 (b) — verification-drought research + capacity ELI5 (twentieth pass)
+
+Operator asked two things: put an ELI5 for mining and verifying into the
+dashboard's "Capacity utilization" section, and research why we only verify
+0-1 submissions per day. The research produced a **correction**: the first
+diagnosis (anti-farm gate over-firing on boilerplate) was wrong, and the fix
+attempt built on it was reverted after ground-truth measurement.
+
+### Dashboard changes (shipped)
+
+- **ELI5 boxes** at the top of `renderCapacity()` (`public/dashboard.html`):
+  mining = "12 tickets a day, they don't save up"; verifying = "38 checks a
+  day, but a check-mark on a copy still pays the copy, so a low bar isn't
+  automatically waste".
+- **Header metric fixed**: it read `wasting ~37.5 verify slots/day` computed
+  against the raw 38 cap — the exact basis `capacity.ts` deliberately abandoned
+  ("it was coaching the operator to subsidize the farm"). Now measured against
+  genuine supply, over covered days only: `~14.7 genuine verify/day left unused
+  (6 days with supply data)`. New `wasted.verifyCoveredDays` field.
+
+### Why 0-1 verifications/day (the actual answer)
+
+1. **Downtime.** The 30-min poller shows gaps of 124h (Sep 3→9) and 151h
+   (Sep 10→17) — ~11.5 of the last 17 days offline. Offline days are 0/38.
+2. **The pool's solver population collapsed.** Distinct solvers WE verified per
+   week: ~100-200 through mid-August (W27-W34: 109/84/195/33/48/128/133/119),
+   then **18** in W35 and **1-2** since. Today's pool: 72 submissions from
+   **5 solvers**, four of them holding 71/72.
+3. **Therefore the diversity rule is the ceiling.** The gateway allows 3
+   verifications per solver per 14 days (`SOLVER_DIVERSITY_CAP = 3`,
+   `SOLVER_DIVERSITY_WINDOW_MS = 14d`). Five solvers ⇒ ~15 per 14 days ≈
+   **1.07/day with a perfect pipeline**. That is the "0 or 1" — we were never
+   repeating solvers when we did 38/day; there were 100+ of them.
+4. **Live blockers on top of the ceiling.** Today: 26 abstains + 19 deferrals +
+   ~0 verified. 46% of the pool (33/72) carries a machine-generated header
+   (`Approach for "<title>" (id=…, verifier_kind=standard, domain=[…],
+   difficulty=…). Method: decomposed contract…`) posted exclusively by two
+   accounts (0x7354b0ac…, 0x8432a8c4… — 0 non-template summaries between them).
+   The other 19/day die on `full trace unavailable (CID fetch failed
+   (comprehension-gated))` — the full IPFS trace can't be fetched, comprehension
+   grading needs it, so they defer 6h → 3 strikes → retire.
+
+### What was tried and reverted (worth recording)
+
+Hypothesis from today's cache: 33 abstains, 24 at 60-79% similarity, spanning
+24 different challenge ids ⇒ the dupe gate is matching shared boilerplate.
+Two changes were built:
+
+- `dupeWindow()` in `trace-fingerprint.ts` — compare chars 250-1500 instead of
+  0-1500 (short texts < 600 chars compared whole). **KEPT**: it removes a real
+  false-positive class (two cached pairs scored 0.93 on a 212-char shared header
+  and 0.00 once skipped) and the module has a history of false abstains.
+- A source guard in `index.ts:verifyAbstainReason` skipping the gate for
+  non-`ipfs` (detail-fallback) text. **REVERTED — it was harmful.**
+
+The reversion was driven by ground truth, not opinion: `src/_sim-pool.ts`
+analyses the live 72-submission pool and attributes each ≥0.5 match to same- vs
+other-solver. Result: **all 33 abstains match ONLY a same-solver peer**
+(other-solver matches: 0), and the abstain set is *identical* under both the old
+and new bases. The templated summaries ARE the farm content the gate exists to
+block; letting detail-sourced traces skip the gate would have credited exactly
+what the module was built to starve (quorum is a COUNT with no reject field, so
+a low score advances spam just like a high one). The gate is correct; the
+drought is supply-side.
+
+### Watch / possible follow-ups
+
+- The two remaining levers are both network-side: more solvers in the pool
+  (the diversity ceiling lifts with them) and the gateway's trace-CID delivery
+  (19 defers/day). Neither is ours to fix; a note to the gateway team about
+  comprehension-gated submissions whose trace CID never fetches is the only
+  actionable item.
+- We authored 12-14 of the pool's submissions' challenges, which we may not
+  verify (conflict of interest) — posting more challenges shrinks our own
+  verifiable surface. Worth keeping in mind when the posting loop raises its cap.
+
+Tests 562 → 563 (`dupeWindow` window mechanics, shared-header regression,
+identical-body still matches); `tsc` clean; bot + dashboard restarted.

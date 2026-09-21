@@ -1487,12 +1487,28 @@ function buildCapacity(): {
   verifyCap: number;
   days: ReturnType<typeof readCapacity>;
   underuse: string | null;
-  wasted: { miningPerDay: number; verifyPerDay: number };
+  wasted: { miningPerDay: number; verifyPerDay: number; verifyCoveredDays: number };
 } {
   const days = readCapacity(14);
   const n = Math.max(1, days.length);
   const miningWaste = days.reduce((s, d) => s + Math.max(0, d.miningCap - d.miningUsed), 0);
-  const verifyWaste = days.reduce((s, d) => s + Math.max(0, d.verifyCap - d.verifyUsed), 0);
+  // Verify waste is measured against GENUINE supply (traces that cleared the
+  // anti-farm gate), mirroring capacityUnderuse — not the raw 38/day cap.
+  // Chasing the cap would mean verifying farm spam, and quorum is a COUNT with
+  // no reject field: every spam verification advances that spam toward payment.
+  // The cap-based number read "~37 slots wasted/day" while the correct behavior
+  // was to abstain on most of the pool.
+  //
+  // Averaged over COVERED days with genuine supply > 0 — the same set
+  // capacityUnderuse averages over, so the header number and the warn line
+  // below it agree. Downtime days fall back to the cap in `verifyDenom`, which
+  // would otherwise dominate the average with a supply figure nobody could
+  // have verified — the mining line already shows the downtime.
+  const covered = days.filter((d) => d.verifyEligible !== undefined && d.verifyEligible > 0);
+  const verifyWaste = covered.reduce(
+    (s, d) => s + Math.max(0, Math.min(d.verifyCap, d.verifyEligible as number) - d.verifyUsed),
+    0,
+  );
   return {
     miningCap: MINING_DAILY_CAP,
     verifyCap: days[0]?.verifyCap ?? 38,
@@ -1500,7 +1516,9 @@ function buildCapacity(): {
     underuse: capacityUnderuse(days),
     wasted: {
       miningPerDay: Math.round((miningWaste / n) * 10) / 10,
-      verifyPerDay: Math.round((verifyWaste / n) * 10) / 10,
+      // Per COVERED day (the honest basis), not per calendar day.
+      verifyPerDay: covered.length ? Math.round((verifyWaste / covered.length) * 10) / 10 : 0,
+      verifyCoveredDays: covered.length,
     },
   };
 }

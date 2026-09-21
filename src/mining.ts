@@ -59,6 +59,19 @@ const REGULAR_ROLLING_CAP = 12;
 const ROLLING_WINDOW_MS = 24 * 3600_000;
 const ERROR_COOLDOWN_MS = 4 * 3600_000;
 const VERIFIABLE_KINDS = new Set(["python_tests", "javascript_tests", "exact_answer"]);
+// Verifiable kinds are HARD-ROUTED (maybeOverrideModelForVerifiable): a weak-
+// for-code A/B pick is replaced by VERIFIABLE_DEFAULT_MODEL, while a pick that
+// is already in VERIFIABLE_CODE_MODELS stays. BOT_VERIFIABLE_MODEL_OVERRIDE=0
+// disables the routing; BOT_VERIFIABLE_MODEL=<model> forces one (both still
+// subject to the parse-fail breaker).
+//
+// History worth keeping next to today's deepseek default: this lane once
+// forced `deepseek-v4-pro` on the strength of Venice's "optimizedForCode"
+// flag, and the data disproved it — 19-24% submit-rate, ~100% parse-fail for
+// stretches, ~20 wasted epoch slots/day — so the breaker kept yanking it back
+// to the A/B pick. The 2026-09-20 deepseek-v4-1-flash default is a DIFFERENT
+// model chosen from probes, not from the flag; the same breaker guards it.
+//
 // Models kept in the verifiable-CODE solve path. grok-4-3 rejected 44% of our
 // python_tests (functional-pass but security-test FAIL — SSRF / insecure
 // deserialization) vs claude-opus-4-8 at 8%, so non-code A/B picks (grok-4-3,
@@ -70,12 +83,31 @@ const VERIFIABLE_KINDS = new Set(["python_tests", "javascript_tests", "exact_ans
 // this filter — every verifiable solve was rerouted to opus-4-8, which is not
 // in the pool, so verifiable kinds (about half our attempts) produced zero A/B
 // signal. kimi-k3 and gpt-56-sol stay out pending their own code data.
-const VERIFIABLE_CODE_MODELS = new Set(["claude-opus-4-8", "claude-opus-5", "claude-opus-4-7", "openai-gpt-55"]);
+// deepseek-v4-1-flash added 2026-09-20: code-optimized on Venice and the swap
+// probe's clear winner on this lane — 13-19s / $0.006 per solve vs opus-5's
+// 76-78s / $0.235 (6k-token probe budget; production floors at 50k), and where
+// opus-5 exhausted the probe budget with zero extractable output the deepseek
+// solution passed a local harness (traversal rejected, no os.system, -1 on
+// missing file, cat exit 0). gemini-3-8-flash stays OUT for this lane: probed
+// 09-20 at 163s / $0.117 and length-capped.
+const VERIFIABLE_CODE_MODELS = new Set([
+  "claude-opus-4-8",
+  "claude-opus-5",
+  "claude-opus-4-7",
+  "openai-gpt-55",
+  "deepseek-v4-1-flash",
+]);
 // opus-4-8 → opus-5 (operator, 2026-09-02): opus-4-8 hit the gateway's
 // traceSummary specificity gate on 12/16 python_tests attempts since 08-28
 // (near-misses, 30-34 vs threshold 35); opus-5 hit it 2/8 in the same
 // window. Both are optimizedForCode on Venice at identical pricing.
-const VERIFIABLE_DEFAULT_MODEL = "claude-opus-5";
+// opus-5 → deepseek-v4-1-flash (operator, 2026-09-20): opus-5 then became the
+// worst arm on attempt-success (31.5% failures since 08-20) at 78% of spend,
+// and 29% of its python_tests attempts died at the specificity gate (the
+// snake_case-only enrichment problem documented above — 0% on other arms).
+// deepseek is 20-40x cheaper on this lane and passes format + correctness
+// probes. See DEFAULTS.mining_solve in models.ts for the full evidence table.
+const VERIFIABLE_DEFAULT_MODEL = "deepseek-v4-1-flash";
 // How many times to re-solve + resubmit a verifiable challenge that failed its
 // deterministic tests, feeding the exact failing test back to the solver. The
 // gateway grants up to 20 slots/challenge; we use a few. Tune via env.
@@ -828,18 +860,6 @@ async function trySolve(
   });
 }
 
-/**
- * Verifiable challenges (python_tests / javascript_tests / exact_answer) default
- * to the A/B picker (the proven mining pool), same as standard traces.
- *
- * History: these used to force `deepseek-v4-pro` ("optimizedForCode"). The data
- * disproved that — deepseek was the WORST submitter (19–24% submit-rate, ~100%
- * parse-fail for stretches, ~20 wasted epoch slots/day), so a parse-fail breaker
- * had to keep yanking it back to the A/B pick anyway. Defaulting to A/B removes
- * the periodic re-test waste. The override is now strictly opt-IN: set
- * BOT_VERIFIABLE_MODEL=<model> to force a specific code model (still subject to
- * the parse-fail breaker below).
- */
 /**
  * Gateway-facing model name for the submission payload. The gateway's
  * modelUsed validator 400s on Venice's org-prefixed catalog ids — observed
