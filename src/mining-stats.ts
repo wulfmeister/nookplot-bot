@@ -9,6 +9,12 @@
  *   npm run mining-stats              # all-time
  *   npm run mining-stats -- --24h     # last 24h only
  *   npm run mining-stats -- --7d      # last 7 days
+ *   npm run mining-stats -- --since=2026-09-17T02:16Z   # rows at/after an ISO instant
+ *
+ * The "By model × kind" section is the per-lane view routing decisions turn on
+ * (e.g. "opus-5 on python_tests"). The per-model line hides that a lane can be
+ * starved (0 rows — the parse-fail breaker benched the arm, 2026-09-01→14) or
+ * gated (spec-reject) while the model's overall numbers look fine.
  */
 import { join } from "node:path";
 import { NOOK_DIR, readJsonl } from "./util.js";
@@ -33,6 +39,7 @@ interface Entry {
   rewardNook?: number;
   model?: string;
   notes?: string;
+  submissionId?: string;
 }
 
 interface Tally {
@@ -76,13 +83,13 @@ function pct(num: number, den: number): string {
   return `${((num / den) * 100).toFixed(0).padStart(3)}%`;
 }
 
-function fmtRow(label: string, t: Tally): string {
+function fmtRow(label: string, t: Tally, pad = 22): string {
   const resolved = t.pass + t.fail; // error/deferred excluded from win-rate denominator
   const passRate = resolved > 0 ? `${((t.pass / resolved) * 100).toFixed(0)}%` : "—";
   const successAttempts = t.pass + t.deferred;
   const successRate = t.total > 0 ? `${((successAttempts / t.total) * 100).toFixed(0)}%` : "—";
   return [
-    label.padEnd(22),
+    label.padEnd(pad),
     `n=${String(t.total).padStart(3)}`,
     `✅${String(t.pass).padStart(2)}`,
     `⏳${String(t.deferred).padStart(2)}`,
@@ -115,6 +122,16 @@ function main() {
   let windowLabel = "all-time";
   if (args.includes("--24h")) { cutoff = Date.now() - 24 * 3600_000; windowLabel = "last 24h"; }
   else if (args.includes("--7d")) { cutoff = Date.now() - 7 * 24 * 3600_000; windowLabel = "last 7d"; }
+  const sinceArg = args.find((a) => a.startsWith("--since="));
+  if (sinceArg) {
+    const t = Date.parse(sinceArg.slice("--since=".length));
+    if (Number.isNaN(t)) {
+      console.error(`Bad --since value (need an ISO instant): ${sinceArg}`);
+      process.exit(2);
+    }
+    cutoff = t;
+    windowLabel = `since ${new Date(t).toISOString()}`;
+  }
 
   const entries = all.filter((e) => new Date(e.ts).getTime() >= cutoff);
 
@@ -125,6 +142,7 @@ function main() {
 
   const byModel = new Map<string, Tally>();
   const byKind = new Map<string, Tally>();
+  const byModelKind = new Map<string, Tally>();
   for (const e of entries) {
     const m = e.model ?? "(unrecorded — pre-instrumentation)";
     const k = e.verifierKind ?? "?";
@@ -132,6 +150,9 @@ function main() {
     add(byModel.get(m)!, e);
     if (!byKind.has(k)) byKind.set(k, emptyTally());
     add(byKind.get(k)!, e);
+    const mk = `${m} / ${k}`;
+    if (!byModelKind.has(mk)) byModelKind.set(mk, emptyTally());
+    add(byModelKind.get(mk)!, e);
   }
 
   console.log(`\nMining performance — ${windowLabel} (${entries.length} attempts)\n`);
@@ -151,10 +172,33 @@ function main() {
     console.log(fmtRow(k, t));
   }
 
+  // Per-lane view. spec-reject is the gateway's traceSummary specificity 400
+  // (pre-submission — never reaches the ledger, so it is invisible to
+  // rejection:check and to the verified-rate join below). Grouped by kind so
+  // the models competing for one lane sit next to each other.
+  console.log("\n== By model × kind (spec-reject = traceSummary gate 400, pre-submission) ==");
+  const mkRows = [...byModelKind.entries()].sort((a, b) => {
+    const ka = a[0].split(" / ")[1] ?? "", kb = b[0].split(" / ")[1] ?? "";
+    return ka.localeCompare(kb) || b[1].total - a[1].total;
+  });
+  for (const [mk, t] of mkRows) {
+    console.log(`${fmtRow(mk, t, 40)}  spec-reject ${String(t.specReject).padStart(2)} (${pct(t.specReject, t.total).trim()})`);
+  }
+
   // Verified-rate — the metric that actually drives NOOK. Joins the terminal
   // outcomes recorded by learnings.ts::publishPostSolveLearnings. A submission
   // pays out only at 3-verifier quorum; "expired" = never reached quorum = zero.
-  const verified = readJsonl<VerifiedEntry>(MINING_VERIFIED_LOG).filter((e) => new Date(e.ts).getTime() >= cutoff);
+  // Window terminal outcomes by SUBMISSION time, not by when the ledger
+  // recorded them: a restart reconciles days of settlements in one tick
+  // (2026-09-17: ten 09-09/10 expiries all stamped 02:20Z), which would read
+  // as a 0% verified-rate "since restart" for work that predates it. Rows
+  // whose submission is not in the local log fall back to their own ts.
+  const submittedAtById = new Map<string, number>();
+  for (const e of all) if (e.submissionId) submittedAtById.set(e.submissionId, new Date(e.ts).getTime());
+  const verified = readJsonl<VerifiedEntry>(MINING_VERIFIED_LOG).filter((e) => {
+    const submitted = e.submissionId ? submittedAtById.get(e.submissionId) : undefined;
+    return (submitted ?? new Date(e.ts).getTime()) >= cutoff;
+  });
   console.log("\n== Verified-rate (terminal outcomes) ==");
   if (verified.length === 0) {
     console.log("  No terminal outcomes recorded yet (accrues going forward; needs subs to reach verified/expired/rejected).");
@@ -168,17 +212,19 @@ function main() {
       }
       return map;
     };
-    const render = (label: string, map: Map<string, { verified: number; expired: number; rejected: number }>) => {
+    const render = (label: string, map: Map<string, { verified: number; expired: number; rejected: number }>, pad = 28) => {
       for (const [k, c] of [...map.entries()].sort((a, b) => (b[1].verified + b[1].expired + b[1].rejected) - (a[1].verified + a[1].expired + a[1].rejected))) {
         const n = c.verified + c.expired + c.rejected;
         console.log(
-          `${(label + k).padEnd(28)} n=${String(n).padStart(3)}  ✓verified ${String(c.verified).padStart(3)}  ⌛expired ${String(c.expired).padStart(3)}  ✗rejected ${String(c.rejected).padStart(3)}  verified-rate ${pct(c.verified, n)}`,
+          `${(label + k).padEnd(pad)} n=${String(n).padStart(3)}  ✓verified ${String(c.verified).padStart(3)}  ⌛expired ${String(c.expired).padStart(3)}  ✗rejected ${String(c.rejected).padStart(3)}  verified-rate ${pct(c.verified, n)}`,
         );
       }
     };
     render("", tally((e) => e.model ?? "(unrecorded)"));
     console.log("  --");
     render("", tally((e) => e.verifierKind ?? "?"));
+    console.log("  -- model × kind --");
+    render("", tally((e) => `${e.model ?? "(unrecorded)"} / ${e.verifierKind ?? "?"}`), 40);
   }
 
   // Recommendation

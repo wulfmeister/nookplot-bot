@@ -33,6 +33,7 @@ import { discoverAndSolveMiningChallenges } from "./mining.js";
 import { ensureGuildMembership } from "./guild.js";
 import { runRlmSpotCheckLoop } from "./rlm-spotcheck.js";
 import { startNetworkStatusLoop } from "./network-status.js";
+import { startContractCanaryLoop } from "./contract-canary.js";
 import { startCitationVelocityLoops } from "./citation-velocity.js";
 import { startPaperReproductionLoop } from "./paper-reproduction.js";
 import { startSocialEngagementLoops } from "./social-engagement.js";
@@ -2688,6 +2689,7 @@ async function main() {
   if (runsInLean("engagement")) await startEngagementLoop(runtime);
   if (runsInLean("observation")) await startObservationLoop(runtime);
   await startNetworkStatusLoop(runtime, myAddress); // networkStatus — read-only (kept)
+  startContractCanaryLoop(runtime); // contract-canary — read-only shape-drift detector (kept)
   startCitationVelocityLoops(runtime, myAddress); // citationVelocity — passive, 0 LLM (kept)
   if (runsInLean("paperReproduction")) startPaperReproductionLoop(runtime);
   if (runsInLean("socialEngagement")) startSocialEngagementLoops(runtime);

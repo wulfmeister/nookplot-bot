@@ -129,6 +129,17 @@ import { findRepetitiveLearning, findLearningMotifCollision, decideNonTerminalCa
 import { findTemplateFingerprint, isFarmChallengeTitle, findNearDuplicateTrace, nearDupeCorpus, applyOffTopicClamp } from "../trace-fingerprint.js";
 import { scoreIntentFit } from "../manifest-intents.js";
 import { veniceRateLimited429Today, computeParseFailureRates, type CostEntry } from "../venice-cost.js";
+import {
+  CONTRACTS,
+  describeShape,
+  diffShape,
+  contractCanarySummary,
+  ContractCanaryEngine,
+  stableProbes,
+  buildLogEntry,
+  type FieldSpec,
+  type Drift,
+} from "../contract-canary.js";
 
 // ── models.ts ──────────────────────────────────────────────────────────
 
@@ -4606,5 +4617,621 @@ describe("capacity.capacityUnderuse (verify floor vs genuine supply)", () => {
     const flag = capacityUnderuse(rows);
     assert.ok(flag && /mining avg/.test(flag));
     assert.ok(!/verify avg/.test(flag));
+  });
+});
+
+describe("contract-canary registry (read-only probe surface)", () => {
+  it("has unique ids and the six endpoints the earning paths depend on", () => {
+    const ids = CONTRACTS.map((c) => c.id);
+    assert.equal(new Set(ids).size, ids.length, "ids must be unique");
+    for (const required of [
+      "epoch",
+      "verifiable-pool",
+      "rlm-pending",
+      "credit-packs",
+      "credit-balance",
+      "agent-stats",
+    ]) {
+      assert.ok(ids.includes(required), `registry must declare ${required}`);
+    }
+  });
+
+  it("is GET-only and only ever hits /v1/ paths", () => {
+    for (const c of CONTRACTS) {
+      assert.equal(c.method, "GET", `${c.id} must be a read-only GET`);
+      assert.ok(c.path.startsWith("/v1/"), `${c.id} path must start with /v1/`);
+      assert.ok(c.description.length > 0, `${c.id} needs a description`);
+    }
+  });
+
+  it("declares an object-shaped top level for every spec", () => {
+    // A non-object root would make the canary report one unhelpful drift per
+    // run instead of naming fields.
+    for (const c of CONTRACTS) {
+      assert.equal(c.spec.type, "object", `${c.id} spec must be an object`);
+      assert.ok(c.spec.fields && Object.keys(c.spec.fields).length > 0, `${c.id} needs declared fields`);
+    }
+  });
+
+  it("the {addr} placeholder is used by exactly one contract", () => {
+    const templated = CONTRACTS.filter((c) => c.path.includes("{addr}"));
+    assert.equal(templated.length, 1);
+    assert.equal(templated[0].id, "agent-stats");
+  });
+
+  it("keeps the confirmed string-typed integer column as a union", () => {
+    // Regression pin: gateway returns submissions[].verification_count as a
+    // JSON string (see src/network-status.ts). Declaring it `number` would
+    // flag a known-benign quirk on every run until someone muted the canary.
+    const pool = CONTRACTS.find((c) => c.id === "verifiable-pool");
+    const item = pool?.spec.fields?.submissions?.item;
+    assert.deepEqual(item?.fields?.verification_count?.type, ["number", "string"]);
+  });
+});
+
+describe("contract-canary.describeShape (observed-shape rendering)", () => {
+  it("names primitives and null directly", () => {
+    assert.equal(describeShape("x", { type: "string" }), "string");
+    assert.equal(describeShape(1, { type: "number" }), "number");
+    assert.equal(describeShape(true, { type: "boolean" }), "boolean");
+    assert.equal(describeShape(null, { type: "null" }), "null");
+  });
+
+  it("falls back to unknown for values with no JSON type", () => {
+    assert.equal(describeShape(() => 0, { type: "unknown" }), "unknown");
+    assert.equal(describeShape(undefined, { type: "unknown" }), "unknown");
+  });
+
+  it("summarizes arrays, using the declared item for an empty one", () => {
+    assert.equal(describeShape([1, 2, 3], { type: "array" }), "array<number>");
+    assert.equal(
+      describeShape([], { type: "array", item: { type: "object" } }),
+      "array<object>",
+      "an empty array tells us nothing — fall back to the declared item",
+    );
+    assert.match(
+      describeShape([{ id: "a", n: 1 }], { type: "array", item: { type: "object" } }),
+      /^array<object\(2 keys: id,n\)>$/,
+    );
+  });
+
+  it("lists object keys with their observed types", () => {
+    assert.equal(
+      describeShape({ balance: 12, budgetStatus: "normal" }, { type: "object" }),
+      "{balance: number, budgetStatus: string}",
+    );
+    assert.equal(describeShape({}, { type: "object" }), "{}");
+  });
+});
+
+describe("contract-canary.diffShape (naive Phase-1 diff)", () => {
+  const spec: FieldSpec = {
+    type: "object",
+    fields: {
+      balance: { type: "number", required: true },
+      lifetimeEarned: { type: "number" },
+    },
+  };
+
+  it("reports nothing when every declared field matches", () => {
+    assert.deepEqual(diffShape({ balance: 10, lifetimeEarned: 20 }, spec, "credit-balance"), []);
+  });
+
+  it("flags a missing REQUIRED field as field_removed", () => {
+    const drift = diffShape({ lifetimeEarned: 20 }, spec, "credit-balance");
+    assert.equal(drift.length, 1);
+    assert.equal(drift[0].kind, "field_removed");
+    assert.equal(drift[0].path, "balance");
+    assert.equal(drift[0].endpointId, "credit-balance");
+    assert.equal(drift[0].observed, "missing");
+  });
+
+  it("stays silent on a missing optional field", () => {
+    assert.deepEqual(diffShape({ balance: 10 }, spec, "credit-balance"), []);
+  });
+
+  it("flags a wrong field type with expected/observed shape names", () => {
+    const drift = diffShape({ balance: "10", lifetimeEarned: 20 }, spec, "credit-balance");
+    assert.equal(drift.length, 1);
+    assert.equal(drift[0].kind, "type_changed");
+    assert.equal(drift[0].path, "balance");
+    assert.equal(drift[0].expected, "number");
+    assert.equal(drift[0].observed, "string");
+  });
+
+  it("flags a root-level type change once, at $, and stops", () => {
+    const drift = diffShape("nope", spec, "credit-balance");
+    assert.equal(drift.length, 1);
+    assert.equal(drift[0].kind, "type_changed");
+    assert.equal(drift[0].path, "$");
+    assert.equal(drift[0].expected, "object");
+    assert.equal(drift[0].observed, "string");
+  });
+
+  it("does NOT flag the documented number|string union", () => {
+    const unionSpec: FieldSpec = {
+      type: "object",
+      fields: { verification_count: { type: ["number", "string"] } },
+    };
+    assert.deepEqual(diffShape({ verification_count: "0" }, unionSpec, "verifiable-pool"), []);
+    assert.deepEqual(diffShape({ verification_count: 0 }, unionSpec, "verifiable-pool"), []);
+    // …and still catches a value outside the union.
+    const drift = diffShape({ verification_count: true }, unionSpec, "verifiable-pool");
+    assert.equal(drift.length, 1);
+    assert.equal(drift[0].kind, "type_changed");
+    assert.equal(drift[0].expected, "number|string");
+  });
+
+  it("reports an undeclared top-level field as field_added", () => {
+    const drift = diffShape({ balance: 10, bonus: 5 }, spec, "credit-balance");
+    assert.equal(drift.length, 1);
+    assert.equal(drift[0].kind, "field_added");
+    assert.equal(drift[0].path, "bonus");
+    assert.equal(drift[0].expected, "(undeclared)");
+  });
+
+  it("flags null against a non-null field as nullability_changed", () => {
+    const drift = diffShape({ balance: null }, spec, "credit-balance");
+    assert.equal(drift.length, 1);
+    assert.equal(drift[0].kind, "nullability_changed");
+    assert.equal(drift[0].observed, "null");
+  });
+
+  it("DESCENDS into nested objects and flags a missing nested required field", () => {
+    // Replaces the Phase-1 "does NOT descend" pin: recursion is now the point.
+    const nested: FieldSpec = {
+      type: "object",
+      fields: { inner: { type: "object", fields: { deep: { type: "number", required: true } } } },
+    };
+    const drift = diffShape({ inner: { other: "x" } }, nested, "epoch");
+    assert.equal(drift.length, 1);
+    assert.equal(drift[0].kind, "field_removed");
+    assert.equal(drift[0].path, "inner.deep");
+    assert.equal(drift[0].endpointId, "epoch");
+  });
+});
+
+describe("contract-canary.contractCanarySummary", () => {
+  it("returns the declared summary shape without throwing", () => {
+    const s = contractCanarySummary();
+    assert.ok(s.lastRunAt === null || typeof s.lastRunAt === "string");
+    assert.equal(typeof s.activeConfirmed, "number");
+    assert.equal(typeof s.totalConfirmedEver, "number");
+    assert.equal(typeof s.resolvedCount, "number");
+    assert.equal(typeof s.byKind, "object");
+    assert.ok(Array.isArray(s.recent));
+    assert.ok(s.recent.length <= 20);
+    // active confirmed can never exceed total confirmed ever
+    assert.ok(s.activeConfirmed <= s.totalConfirmedEver);
+  });
+});
+
+// ── contract-canary.recursive diffShape (Phase 2 engine) ─────────────────
+
+describe("contract-canary.diffShape recursion", () => {
+  it("deep nesting (3+ levels) produces the full dotted path", () => {
+    const spec: FieldSpec = {
+      type: "object",
+      fields: {
+        a: { type: "object", fields: { b: { type: "object", fields: { c: { type: "number", required: true } } } } },
+      },
+    };
+    const missing = diffShape({ a: { b: {} } }, spec, "e");
+    assert.equal(missing.length, 1);
+    assert.equal(missing[0].kind, "field_removed");
+    assert.equal(missing[0].path, "a.b.c");
+
+    const wrongType = diffShape({ a: { b: { c: "x" } } }, spec, "e");
+    assert.equal(wrongType.length, 1);
+    assert.equal(wrongType[0].kind, "type_changed");
+    assert.equal(wrongType[0].path, "a.b.c");
+    assert.equal(wrongType[0].expected, "number");
+    assert.equal(wrongType[0].observed, "string");
+  });
+
+  it("flags a nested object where an object is NOT (non-object at a declared object path)", () => {
+    const spec: FieldSpec = { type: "object", fields: { inner: { type: "object", fields: { id: { type: "string" } } } } };
+    const drift = diffShape({ inner: "surprise" }, spec, "e");
+    assert.equal(drift.length, 1);
+    assert.equal(drift[0].kind, "type_changed");
+    assert.equal(drift[0].path, "inner");
+    assert.equal(drift[0].expected, "object");
+    assert.equal(drift[0].observed, "string");
+  });
+
+  it("nested object inside an array reports drift with the [] element path", () => {
+    const spec: FieldSpec = {
+      type: "object",
+      fields: {
+        submissions: {
+          type: "array",
+          item: { type: "object", fields: { id: { type: "string", required: true } } },
+        },
+      },
+    };
+    // Both elements are homogeneous (both {}), so no array_item_shape_changed;
+    // both are missing required id → a single field_removed at the [] path.
+    const drift = diffShape({ submissions: [{}, {}] }, spec, "pool");
+    assert.equal(drift.length, 1);
+    assert.equal(drift[0].kind, "field_removed");
+    assert.equal(drift[0].path, "submissions[].id");
+  });
+
+  it("heterogeneous array (differing types) emits array_item_shape_changed + nested type_changed", () => {
+    const spec: FieldSpec = {
+      type: "object",
+      fields: {
+        submissions: {
+          type: "array",
+          item: { type: "object", fields: { id: { type: "string" } } },
+        },
+      },
+    };
+    const drift = diffShape({ submissions: [{ id: "a" }, { id: 1 }] }, spec, "pool");
+    const kinds = new Set(drift.map((d) => d.kind));
+    assert.ok(kinds.has("array_item_shape_changed"), `expected array_item_shape_changed, got ${JSON.stringify(drift)}`);
+    assert.ok(kinds.has("type_changed"));
+    const hetero = drift.find((d) => d.kind === "array_item_shape_changed")!;
+    assert.equal(hetero.path, "submissions[]");
+    const tc = drift.find((d) => d.kind === "type_changed")!;
+    assert.equal(tc.path, "submissions[].id");
+  });
+
+  it("heterogeneous array (differing key sets, NOT types) emits array_item_shape_changed alone", () => {
+    const spec: FieldSpec = {
+      type: "object",
+      fields: {
+        submissions: { type: "array", item: { type: "object", fields: { id: { type: "string" } } } },
+      },
+    };
+    const drift = diffShape({ submissions: [{ id: "a" }, { id: "a", extra: 1 }] }, spec, "pool");
+    assert.equal(drift.length, 1, `expected only array_item_shape_changed, got ${JSON.stringify(drift)}`);
+    assert.equal(drift[0].kind, "array_item_shape_changed");
+    assert.equal(drift[0].path, "submissions[]");
+  });
+
+  it("homogeneous array (all elements identical) produces NO drift", () => {
+    const spec: FieldSpec = {
+      type: "object",
+      fields: {
+        submissions: { type: "array", item: { type: "object", fields: { id: { type: "string" } } } },
+      },
+    };
+    assert.deepEqual(diffShape({ submissions: [{ id: "a" }, { id: "b" }, { id: "c" }] }, spec, "pool"), []);
+  });
+
+  it("does NOT emit array_item_shape_changed for a primitive array whose item is declared object", () => {
+    const spec: FieldSpec = {
+      type: "object",
+      fields: { subs: { type: "array", item: { type: "object", fields: { id: { type: "string" } } } } },
+    };
+    // ["a","b"] is homogeneous; the item-vs-contract mismatch is a type_changed at subs[].
+    const drift = diffShape({ subs: ["a", "b"] }, spec, "e");
+    assert.equal(drift.length, 1);
+    assert.equal(drift[0].kind, "type_changed");
+    assert.equal(drift[0].path, "subs[]");
+  });
+
+  it("field_added fires for the top level only, never for nested sibling keys", () => {
+    const spec: FieldSpec = {
+      type: "object",
+      fields: { inner: { type: "object", fields: { id: { type: "string" } } } },
+    };
+    const drift = diffShape({ inner: { id: "x", surprise: 9 }, topSurprise: 1 }, spec, "e");
+    assert.equal(drift.length, 1);
+    assert.equal(drift[0].kind, "field_added");
+    assert.equal(drift[0].path, "topSurprise");
+  });
+
+  it("bounds the array scan: a 1000-element homogeneous array is silent and cheap", () => {
+    const spec: FieldSpec = {
+      type: "object",
+      fields: { submissions: { type: "array", item: { type: "object", fields: { id: { type: "string" } } } } },
+    };
+    const big = Array.from({ length: 1000 }, (_, i) => ({ id: `s${i}` }));
+    assert.deepEqual(diffShape({ submissions: big }, spec, "pool"), []);
+  });
+
+  it("reports a heterogeneous array ONCE even when many elements differ", () => {
+    const spec: FieldSpec = {
+      type: "object",
+      fields: { submissions: { type: "array", item: { type: "object", fields: { id: { type: "string" } } } } },
+    };
+    const items = Array.from({ length: 20 }, (_, i) => (i % 2 === 0 ? { id: "a" } : { id: 1 }));
+    const drift = diffShape({ submissions: items }, spec, "pool");
+    const hetero = drift.filter((d) => d.kind === "array_item_shape_changed");
+    assert.equal(hetero.length, 1, `expected exactly one array_item_shape_changed, got ${JSON.stringify(drift)}`);
+  });
+});
+
+describe("contract-canary.diffShape union + missing/null", () => {
+  it("honors a declared nested union at depth", () => {
+    const spec: FieldSpec = {
+      type: "object",
+      fields: { inner: { type: "object", fields: { v: { type: ["number", "string"] } } } },
+    };
+    assert.deepEqual(diffShape({ inner: { v: "42" } }, spec, "e"), []);
+    assert.deepEqual(diffShape({ inner: { v: 42 } }, spec, "e"), []);
+    const drift = diffShape({ inner: { v: true } }, spec, "e");
+    assert.equal(drift.length, 1);
+    assert.equal(drift[0].kind, "type_changed");
+    assert.equal(drift[0].expected, "number|string");
+    assert.equal(drift[0].path, "inner.v");
+  });
+
+  it("honors a nested union-with-null (verifier_kind style)", () => {
+    const spec: FieldSpec = {
+      type: "object",
+      fields: { submissions: { type: "array", item: { type: "object", fields: { verifier_kind: { type: ["string", "null"] } } } } },
+    };
+    assert.deepEqual(diffShape({ submissions: [{ verifier_kind: null }] }, spec, "pool"), []);
+    assert.deepEqual(diffShape({ submissions: [{ verifier_kind: "standard" }] }, spec, "pool"), []);
+  });
+
+  it("verification_count string vs number emit NO drift against the real contract", () => {
+    const pool = CONTRACTS.find((c) => c.id === "verifiable-pool")!;
+    const asString = diffShape({ submissions: [{ verification_count: "0" }] }, pool.spec, pool.id);
+    const asNumber = diffShape({ submissions: [{ verification_count: 0 }] }, pool.spec, pool.id);
+    assert.deepEqual(asString, []);
+    assert.deepEqual(asNumber, []);
+    // …and a boolean outside the union still flags, at the nested path.
+    const bad = diffShape({ submissions: [{ verification_count: true }] }, pool.spec, pool.id);
+    assert.equal(bad.length, 1);
+    assert.equal(bad[0].kind, "type_changed");
+    assert.equal(bad[0].path, "submissions[].verification_count");
+    assert.equal(bad[0].expected, "number|string");
+  });
+
+  it("required-absent is field_removed; optional-absent is silent", () => {
+    const spec: FieldSpec = { type: "object", fields: { req: { type: "number", required: true }, opt: { type: "string" } } };
+    const drift = diffShape({}, spec, "e");
+    assert.equal(drift.length, 1);
+    assert.equal(drift[0].kind, "field_removed");
+    assert.equal(drift[0].path, "req");
+  });
+
+  it("present null against a non-null field is nullability_changed", () => {
+    const spec: FieldSpec = { type: "object", fields: { req: { type: "number", required: true } } };
+    const drift = diffShape({ req: null }, spec, "e");
+    assert.equal(drift.length, 1);
+    assert.equal(drift[0].kind, "nullability_changed");
+    assert.equal(drift[0].observed, "null");
+  });
+
+  it("numeric-string tolerance is OFF by default and ON under the env gate", () => {
+    const saved = process.env.BOT_CONTRACT_CANARY_NUMERIC_TOLERANCE;
+    const spec: FieldSpec = { type: "object", fields: { credits: { type: "number" } } };
+    delete process.env.BOT_CONTRACT_CANARY_NUMERIC_TOLERANCE;
+    try {
+      assert.equal(diffShape({ credits: "42" }, spec, "e").length, 1, "numeric string must flag by default");
+    } finally {
+      if (saved === undefined) delete process.env.BOT_CONTRACT_CANARY_NUMERIC_TOLERANCE;
+      else process.env.BOT_CONTRACT_CANARY_NUMERIC_TOLERANCE = saved;
+    }
+    process.env.BOT_CONTRACT_CANARY_NUMERIC_TOLERANCE = "1";
+    try {
+      assert.deepEqual(diffShape({ credits: "42" }, spec, "e"), [], "numeric string tolerated under the gate");
+      assert.deepEqual(diffShape({ credits: "-3.14" }, spec, "e"), []);
+      assert.equal(diffShape({ credits: "not-a-number" }, spec, "e").length, 1, "non-numeric string still flags");
+    } finally {
+      if (saved === undefined) delete process.env.BOT_CONTRACT_CANARY_NUMERIC_TOLERANCE;
+      else process.env.BOT_CONTRACT_CANARY_NUMERIC_TOLERANCE = saved;
+    }
+  });
+});
+
+// ── contract-canary.stability gating (engine, in-memory) ─────────────────
+
+const driftF = (endpointId: string, path: string, kind: Drift["kind"], expected = "x", observed = "y"): Drift => ({
+  endpointId,
+  path,
+  kind,
+  expected,
+  observed,
+});
+
+describe("contract-canary stability gating", () => {
+  it("suppresses a drift on run 1 and reports it on run 2 (default N=2)", () => {
+    const eng = new ContractCanaryEngine();
+    const d = driftF("credit-balance", "bonus", "field_added", "(undeclared)", "number");
+    const r1 = eng.processRun([d], "t1", 2);
+    assert.deepEqual(r1.active, []);
+    assert.deepEqual(r1.confirmed, []);
+    const r2 = eng.processRun([d], "t2", 2);
+    assert.equal(r2.confirmed.length, 1);
+    assert.equal(r2.active.length, 1);
+    assert.equal(r2.active[0].path, "bonus");
+    assert.equal(r2.active[0].kind, "field_added");
+  });
+
+  it("N=1 reports immediately", () => {
+    const eng = new ContractCanaryEngine();
+    const r = eng.processRun([driftF("e", "p", "type_changed")], "t1", 1);
+    assert.equal(r.confirmed.length, 1);
+    assert.equal(r.active.length, 1);
+  });
+
+  it("a previously-reported drift RESOLVES after N consecutive absent runs", () => {
+    const eng = new ContractCanaryEngine();
+    const d = driftF("e", "bonus", "field_added");
+    eng.processRun([d], "t1", 2);
+    eng.processRun([d], "t2", 2); // confirmed
+    const r3 = eng.processRun([], "t3", 2); // absent run 1
+    assert.equal(r3.active.length, 1, "still active after one absent run");
+    assert.equal(r3.resolved.length, 0);
+    const r4 = eng.processRun([], "t4", 2); // absent run 2 → resolve
+    assert.equal(r4.active.length, 0);
+    assert.equal(r4.resolved.length, 1);
+    assert.equal(r4.resolved[0].path, "bonus");
+    assert.equal(r4.resolved[0].kind, "field_added");
+    assert.ok(!eng.summary().recent.some((d) => d.path === "bonus"), "resolved drift leaves recent");
+  });
+
+  it("a gap resets the consecutive streak (presence, absence, presence → still unconfirmed)", () => {
+    const eng = new ContractCanaryEngine();
+    const d = driftF("e", "p", "field_added");
+    eng.processRun([d], "t1", 2);  // seenRuns = 1
+    eng.processRun([], "t2", 2);   // absent → streak dropped
+    const r3 = eng.processRun([d], "t3", 2); // fresh seenRuns = 1
+    assert.deepEqual(r3.confirmed, []);
+    assert.deepEqual(r3.active, []);
+  });
+
+  it("a field flipping absent↔null is reported ONCE as nullability_changed (not oscillating)", () => {
+    const spec: FieldSpec = { type: "object", fields: { x: { type: "number", required: true } } };
+    const eng = new ContractCanaryEngine();
+    eng.processRun(diffShape({}, spec, "e"), "t1", 2);          // field_removed
+    const r2 = eng.processRun(diffShape({ x: null }, spec, "e"), "t2", 2); // nullability_changed
+    assert.equal(r2.confirmed.length, 1);
+    assert.equal(r2.confirmed[0].kind, "nullability_changed");
+    assert.equal(r2.confirmed[0].path, "x");
+    assert.equal(r2.active.length, 1, "collapsed to a single active drift");
+  });
+
+  it("consistently-absent (never null) stays field_removed", () => {
+    const spec: FieldSpec = { type: "object", fields: { x: { type: "number", required: true } } };
+    const eng = new ContractCanaryEngine();
+    const f = diffShape({}, spec, "e"); // field_removed every time
+    eng.processRun(f, "t1", 2);
+    const r2 = eng.processRun(f, "t2", 2);
+    assert.equal(r2.confirmed[0].kind, "field_removed");
+  });
+
+  it("dedupes to a stable active set — repeat observations do not re-confirm", () => {
+    const eng = new ContractCanaryEngine();
+    const d = driftF("e", "p", "type_changed");
+    eng.processRun([d], "t1", 2);
+    const r2 = eng.processRun([d], "t2", 2); // confirm
+    const r3 = eng.processRun([d], "t3", 2); // already active
+    assert.equal(r2.confirmed.length, 1);
+    assert.deepEqual(r3.confirmed, []);
+    assert.equal(r3.active.length, 1, "active set stays at one, not growing");
+  });
+
+  it("stableProbes reads the env, defaults to 2, and treats <1 as default", () => {
+    const saved = process.env.BOT_CONTRACT_CANARY_STABLE_PROBES;
+    delete process.env.BOT_CONTRACT_CANARY_STABLE_PROBES;
+    try {
+      assert.equal(stableProbes(), 2);
+      process.env.BOT_CONTRACT_CANARY_STABLE_PROBES = "1";
+      assert.equal(stableProbes(), 1);
+      process.env.BOT_CONTRACT_CANARY_STABLE_PROBES = "3";
+      assert.equal(stableProbes(), 3);
+      process.env.BOT_CONTRACT_CANARY_STABLE_PROBES = "0";
+      assert.equal(stableProbes(), 2);
+      process.env.BOT_CONTRACT_CANARY_STABLE_PROBES = "nope";
+      assert.equal(stableProbes(), 2);
+    } finally {
+      if (saved === undefined) delete process.env.BOT_CONTRACT_CANARY_STABLE_PROBES;
+      else process.env.BOT_CONTRACT_CANARY_STABLE_PROBES = saved;
+    }
+  });
+});
+
+// ── contract-canary.persistence (temp dir — never touches ~/.nookplot) ────
+
+describe("contract-canary persistent state", () => {
+  let tmp: string;
+  beforeEach(() => {
+    tmp = mkdtempSync(joinPath(tmpdir(), "contract-canary-test-"));
+  });
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const statePath = () => joinPath(tmp, "state.json");
+
+  it("round-trips the full state across a save/load cycle", () => {
+    const a = new ContractCanaryEngine(statePath());
+    a.load();
+    const d1 = driftF("e1", "a.b", "type_changed", "object", "string");
+    const d2 = driftF("e2", "c", "field_added", "(undeclared)", "number");
+    a.processRun([d1, d2], "t1", 2); // pending both
+    a.processRun([d1, d2], "t2", 2); // confirm both
+    a.save();
+
+    const b = new ContractCanaryEngine(statePath());
+    b.load();
+    const s = b.summary();
+    assert.equal(s.activeConfirmed, 2);
+    assert.equal(s.totalConfirmedEver, 2);
+    assert.equal(s.byKind["type_changed"], 1);
+    assert.equal(s.byKind["field_added"], 1);
+    assert.equal(s.recent.length, 2);
+  });
+
+  it("does NOT double-count totalConfirmedEver when a fresh engine hydrates from state", () => {
+    const a = new ContractCanaryEngine(statePath());
+    a.load();
+    a.processRun([driftF("e", "p", "field_added")], "t1", 1);
+    a.save();
+    const b = new ContractCanaryEngine(statePath());
+    b.load();
+    const s = b.summary();
+    assert.equal(s.totalConfirmedEver, 1, "hydration must not multiply the count");
+    assert.equal(s.activeConfirmed, 1);
+  });
+
+  it("treats a corrupt state file as empty and never throws", () => {
+    const path = statePath();
+    writeFileSync(path, "this is { not json", "utf8");
+    const eng = new ContractCanaryEngine(path);
+    eng.load();
+    const s = eng.summary();
+    assert.equal(s.activeConfirmed, 0);
+    assert.equal(s.totalConfirmedEver, 0);
+    assert.deepEqual(s.byKind, {});
+    assert.deepEqual(s.recent, []);
+    // and it can still be driven + saved without throwing
+    eng.processRun([driftF("e", "p", "field_added")], "t1", 1);
+    assert.equal(eng.summary().activeConfirmed, 1);
+    eng.save();
+  });
+
+  it("treats an unknown schema version as empty", () => {
+    const path = statePath();
+    writeFileSync(path, JSON.stringify({ version: 99, totalConfirmedEver: 999, active: { a: { path: "p", kind: "field_added" } } }), "utf8");
+    const eng = new ContractCanaryEngine(path);
+    eng.load();
+    const s = eng.summary();
+    assert.equal(s.totalConfirmedEver, 0);
+    assert.equal(s.activeConfirmed, 0);
+  });
+
+  it("survives a restart: pending state resumes across processes", () => {
+    const a = new ContractCanaryEngine(statePath());
+    a.load();
+    const d = driftF("e", "p", "type_changed");
+    a.processRun([d], "t1", 2); // seenRuns = 1 (still pending)
+    a.save();
+    const b = new ContractCanaryEngine(statePath());
+    b.load();
+    const r2 = b.processRun([d], "t2", 2); // should CONFIRM on top of persisted streak
+    assert.equal(r2.confirmed.length, 1);
+    assert.equal(r2.active.length, 1);
+  });
+});
+
+// ── contract-canary.JSONL line shape ─────────────────────────────────────
+
+describe("contract-canary.buildLogEntry", () => {
+  it("emits the documented keys with drift = active set", () => {
+    const active = driftF("e1", "a.b", "type_changed", "object", "string");
+    const confirmed = driftF("e1", "a.b", "type_changed", "object", "string");
+    const resolved = driftF("e2", "c", "field_added");
+    const entry = buildLogEntry("ts-1", 6, 1, 2, { active: [active], confirmed: [confirmed], resolved: [resolved] });
+    assert.equal(entry.ts, "ts-1");
+    assert.equal(entry.endpointId, "*");
+    assert.equal(entry.probed, 6);
+    assert.equal(entry.failed, 1);
+    assert.equal(entry.skipped, 2);
+    assert.deepEqual(entry.drift, [active]);
+    assert.deepEqual(entry.confirmed, [confirmed]);
+    assert.deepEqual(entry.resolved, [resolved]);
+  });
+
+  it("keeps legacy keys {ts, endpointId, probed, drift} working", () => {
+    const entry = buildLogEntry("ts-2", 6, 0, 0, { active: [], confirmed: [], resolved: [] });
+    assert.ok("ts" in entry && "endpointId" in entry && "probed" in entry && "drift" in entry);
   });
 });

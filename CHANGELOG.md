@@ -4,6 +4,42 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-09-17 — the 09-02 opus-5 swap never ran: the parse-fail breaker benched it for 13 days
+
+Found while setting up a watch on opus-5's python_tests spec-gate rate: the
+A/B tallies since the 09-02 swap read grok-4-6 16, terra 15, flash 13,
+**opus-5 3** — and all three opus-5 rows are post-restart. The verifiable
+override (`🎯 verifiable kind python_tests → claude-opus-5`) fired 3 times in
+the whole log; the line `⚠ models sidelined for parse-fail: claude-opus-5=30%`
+fired 56 times. Mechanism: `filterPoolByParseFailure` benches an arm at
+≥30% parse-fail over its last 10 `mining_solve` calls (14-day window). Opus-5
+hit exactly 3/10 at 09-01T15:42Z — all three fails were `completionTokens: 0`
+(Venice returned nothing), not malformed output. A benched arm is excluded
+from rotation AND from the verifiable override, so it makes no new calls and
+the window can only roll by time: the documented "next 24h" bench actually
+lasted 09-01T15:42 → ~09-14T19:33. Opus-5 re-entered at the 09-17 restart only
+because the sleep aged the entire window out.
+
+So the 09-02 entry below ("opus-5@xhigh takes the verifiable lane") describes
+a change that was committed but never executed — between 09-02T20Z and the
+09-10 lid-close opus-5 made zero attempts of any kind, and python_tests went
+to the raw A/B pick. Neither the 09-03 hawk-watch nor the 09-17 brief caught
+it; the evidence was in the log the whole time. Kept the 09-02 entry as
+written and recorded the correction here (preserve, don't overwrite).
+
+Counter-evidence to the routing premise, n small: with opus-5 absent, the
+non-code arms went 0 spec-400s in 11 python_tests attempts and settled 5/7
+verified (flash 2/2, terra 2/2, grok 1/2, gemini-3-1-pro 0/1). Opus-5 is
+6/6 verified once past the gate but 3/10 spec-400 (opus-4-8 was 11/15).
+
+Not changed: rotation policy. Proposed for the operator: expire the bench
+24h after the arm's last mining_solve call (one probe call per day for a
+benched arm instead of none for 14 days), so a bench cannot silently outlast
+the change it was meant to protect. Watch: opus-5 python_tests post-restart,
+decide at n≥8 (spec-400 ≥50% → take python_tests off the opus lane).
+`npm run mining-stats` gains a "By model × kind" section so the watch is one
+command; the dashboard's per-model table is 24h-only and not per kind.
+
 ## 2026-09-17 — 6.3-day lid-close outage; rewards mostly recovered; dashboard was blind exactly when it mattered
 
 The host slept 09-10T19:06Z → 09-17T02:16Z (lid closed; battery was FINE at
