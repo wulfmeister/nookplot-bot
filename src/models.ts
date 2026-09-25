@@ -299,9 +299,12 @@ export function abPool(task: Task): readonly string[] {
 
 /**
  * Cost-circuit-breaker (#16): if a model's recent mining parse-failure rate
- * exceeds this threshold, exclude it from the A/B pool for the next 24h.
- * This prevents repeated 3-5 cr burns on a model that's reliably producing
- * unparseable output.
+ * exceeds this threshold, bench it. The bench expires 24h after that arm's
+ * last mining_solve call (`lastCallMs`), so a benched arm gets one probe
+ * attempt per day. The 14-day evidence window still supplies the rate, but
+ * a benched arm writes no new rows — waiting for that window to age out is
+ * how opus-5 sat unused for ~13 days (CHANGELOG 2026-09-17). Id rejections
+ * are not on this clock: one rejection sidelines until the wire name changes.
  *
  * Pure function — receives the parse-failure rate map from the caller.
  * Returns the filtered pool (or the unfiltered pool if filtering would
@@ -310,10 +313,35 @@ export function abPool(task: Task): readonly string[] {
  */
 export const PARSE_FAIL_RATE_THRESHOLD = Number(process.env.BOT_MODEL_PARSE_FAIL_THRESHOLD ?? 0.30);
 export const PARSE_FAIL_MIN_ATTEMPTS = Number(process.env.BOT_MODEL_PARSE_FAIL_MIN_ATTEMPTS ?? 5);
+/** Rate-bench length measured from the arm's last mining_solve call. */
+export const PARSE_FAIL_BENCH_MS = 24 * 60 * 60 * 1000;
+
+export interface ParseFailRateSample {
+  attempts: number;
+  failures: number;
+  rate: number;
+  idRejected?: number;
+  /** Newest mining_solve call. Absent → rate bench stays (fail closed). */
+  lastCallMs?: number;
+}
+
+/**
+ * True when a rate bench is still in force. Id rejection is a separate,
+ * non-expiring sideline — this predicate is the rate path only.
+ * No `lastCallMs` means we cannot prove the bench has expired, so it holds.
+ */
+export function isParseFailRateBenched(r: ParseFailRateSample | undefined, nowMs = Date.now()): boolean {
+  if (!r) return false;
+  if (r.attempts < PARSE_FAIL_MIN_ATTEMPTS) return false;
+  if (r.rate < PARSE_FAIL_RATE_THRESHOLD) return false;
+  if (r.lastCallMs == null || !Number.isFinite(r.lastCallMs)) return true;
+  return nowMs - r.lastCallMs < PARSE_FAIL_BENCH_MS;
+}
 
 export function filterPoolByParseFailure(
   pool: string[],
-  failureRates: Record<string, { attempts: number; failures: number; rate: number; idRejected?: number }>,
+  failureRates: Record<string, ParseFailRateSample>,
+  nowMs = Date.now(),
 ): { filtered: string[]; sidelined: string[] } {
   const sidelined: string[] = [];
   const filtered = pool.filter((m) => {
@@ -322,13 +350,12 @@ export function filterPoolByParseFailure(
     // A rejection of the model ID itself is deterministic — the gateway will
     // refuse this id on every future submission, so waiting for a rate to
     // accumulate just burns more paid solves (GLM burned 52, kimi-k3 3 before
-    // this rule existed). One is enough.
+    // this rule existed). One is enough. This does not expire with the bench.
     if ((r.idRejected ?? 0) > 0) {
       sidelined.push(m);
       return false;
     }
-    if (r.attempts < PARSE_FAIL_MIN_ATTEMPTS) return true;
-    if (r.rate >= PARSE_FAIL_RATE_THRESHOLD) {
+    if (isParseFailRateBenched(r, nowMs)) {
       sidelined.push(m);
       return false;
     }
@@ -355,7 +382,7 @@ export function pickAlternateModel(task: Task, exclude: string): ModelPick | nul
 
 export function pickModelAB(
   task: Task,
-  failureRates?: Record<string, { attempts: number; failures: number; rate: number }>,
+  failureRates?: Record<string, ParseFailRateSample>,
 ): ModelPick {
   const pool = A_B_POOL[task];
   if (!pool || pool.length === 0) {

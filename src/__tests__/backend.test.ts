@@ -619,6 +619,21 @@ describe("mining.maybeOverrideModelForVerifiable (route weak-for-code models off
       assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates).model, "grok-4-3");
     } finally { restore(); }
   });
+  it("re-admits the default 24h after its last mining_solve call (daily probe)", () => {
+    // The override used the same rate check as the A/B pool and never expired
+    // it, so a benched verifiable default stayed off the lane until the
+    // 14-day window aged out (opus-5, CHANGELOG 2026-09-17).
+    clean();
+    const now = Date.parse("2026-09-17T19:33:00Z");
+    const H = 3_600_000;
+    const rates = (ageMs: number) => ({
+      "deepseek-v4-1-flash": { attempts: 10, failures: 8, rate: 0.8, lastCallMs: now - ageMs },
+    });
+    try {
+      assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates(H), now).model, "grok-4-3");
+      assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates(25 * H), now).model, "deepseek-v4-1-flash");
+    } finally { restore(); }
+  });
 });
 
 describe("mining.verifiableFailHint (feed the exact failing test back to the solver)", () => {
@@ -3406,7 +3421,7 @@ describe("util.readJsonlTail", () => {
 
 import { before, after } from "node:test";
 
-import { filterPoolByParseFailure } from "../models.js";
+import { filterPoolByParseFailure, PARSE_FAIL_BENCH_MS } from "../models.js";
 import { findRenames } from "../specialization-drift.js";
 
 describe("venice-cost.estimateCallCost", () => {
@@ -3451,6 +3466,48 @@ describe("models.filterPoolByParseFailure", () => {
       "only-model": { attempts: 10, failures: 10, rate: 1.0 },
     });
     assert.equal(r.filtered.length, 1);
+  });
+  it("expires a rate bench 24h after the arm's last call so it can be probed", () => {
+    // CHANGELOG 2026-09-17: opus-5 hit 3/10 and then made zero calls, because
+    // the bench had no clock of its own — the 14-day lookback could not roll.
+    const now = Date.parse("2026-09-17T19:33:00Z");
+    const arm = { attempts: 10, failures: 3, rate: 0.3 };
+    const rates = (ageMs: number) => ({
+      keep: { attempts: 10, failures: 0, rate: 0, lastCallMs: now },
+      arm: { ...arm, lastCallMs: now - ageMs },
+    });
+    const held = filterPoolByParseFailure(["keep", "arm"], rates(PARSE_FAIL_BENCH_MS - 1), now);
+    assert.deepEqual(held.sidelined, ["arm"]);
+    assert.deepEqual(held.filtered, ["keep"]);
+    const open = filterPoolByParseFailure(["keep", "arm"], rates(PARSE_FAIL_BENCH_MS), now);
+    assert.deepEqual(open.sidelined, []);
+    assert.deepEqual(open.filtered, ["keep", "arm"]);
+  });
+  it("keeps the rate bench when lastCallMs is missing (fail closed)", () => {
+    const r = filterPoolByParseFailure(["keep", "arm"], {
+      keep: { attempts: 10, failures: 0, rate: 0 },
+      arm: { attempts: 10, failures: 6, rate: 0.6 },
+    });
+    assert.deepEqual(r.sidelined, ["arm"]);
+  });
+  it("does not expire an id rejection when the 24h bench would have", () => {
+    const now = Date.parse("2026-09-17T19:33:00Z");
+    const r = filterPoolByParseFailure(["keep", "arm"], {
+      keep: { attempts: 10, failures: 0, rate: 0, lastCallMs: now },
+      arm: {
+        attempts: 10, failures: 10, rate: 1, idRejected: 1,
+        lastCallMs: now - 13 * 24 * 3_600_000,
+      },
+    }, now);
+    assert.deepEqual(r.sidelined, ["arm"]);
+    assert.deepEqual(r.filtered, ["keep"]);
+  });
+  it("fail-safe still returns the unfiltered pool when every arm is inside its bench", () => {
+    const now = Date.parse("2026-09-17T19:33:00Z");
+    const hot = { attempts: 10, failures: 10, rate: 1, lastCallMs: now - 60_000 };
+    const r = filterPoolByParseFailure(["a", "b"], { a: hot, b: hot }, now);
+    assert.deepEqual(r.filtered, ["a", "b"]);
+    assert.deepEqual(r.sidelined, []);
   });
 });
 
@@ -4047,12 +4104,20 @@ describe("mining circuit breaker — model-id rejection (deterministic evidence)
     assert.equal(rates["gemini-3-8-flash"], undefined, "stale-only history must not produce rate evidence");
     assert.deepEqual(filterPoolByParseFailure(POOL, rates).filtered, POOL);
 
-    // Recent failures still count at full weight...
+    // Recent failures still count at full weight. The newest call here is 1 day
+    // old, so the RATE is 1.0 but the bench has already expired — the arm is
+    // probed instead of held until these rows leave the 14-day window.
     const fresh = [1, 2, 3, 4, 5].map((d) => entry(d, "gemini-3-8-flash", "parse-fail"));
     const freshRates = computeParseFailureRates(fresh, 10, NOW);
     assert.equal(freshRates["gemini-3-8-flash"].attempts, 5);
     assert.equal(freshRates["gemini-3-8-flash"].rate, 1.0);
-    assert.deepEqual(filterPoolByParseFailure(POOL, freshRates).sidelined, ["gemini-3-8-flash"]);
+    assert.equal(freshRates["gemini-3-8-flash"].lastCallMs, NOW - 1 * DAY);
+    assert.deepEqual(filterPoolByParseFailure(POOL, freshRates, NOW).sidelined, []);
+    // One hour after that newest failure the bench is still in force.
+    assert.deepEqual(
+      filterPoolByParseFailure(POOL, freshRates, NOW - 1 * DAY + 3_600_000).sidelined,
+      ["gemini-3-8-flash"],
+    );
 
     // ...and id rejections are DETERMINISTIC — they never age out. (A wire-name
     // CHANGE discounts them, via discountStaleIdRejections; time does not.)
@@ -4060,6 +4125,36 @@ describe("mining circuit breaker — model-id rejection (deterministic evidence)
     const rejectRates = computeParseFailureRates(oldReject, 10, NOW);
     assert.equal(rejectRates["kimi-k3"].idRejected, 1);
     assert.deepEqual(rejectRates["kimi-k3"].idRejectedWireNames, ["kimi-k3"]);
+  });
+
+  it("a failed probe starts a new 24h bench — one probe per day, not none for 14", () => {
+    const now = Date.parse("2026-09-17T19:33:00Z");
+    const H = 3_600_000;
+    const row = (ageMs: number, outcome: CostEntry["outcome"]): CostEntry => ({
+      ts: new Date(now - ageMs).toISOString(),
+      model: "claude-opus-5",
+      promptTokens: 100, completionTokens: outcome === "parse-fail" ? 0 : 500,
+      totalTokens: 600, estCost: 0.01,
+      callSite: "mining_solve", outcome,
+    });
+    // 3/10 at the threshold, newest call 25h ago: the frozen opus-5 shape.
+    const frozen = [
+      ...[25, 30, 40].map((h) => row(h * H, "parse-fail")),
+      ...[26, 27, 28, 32, 35, 36, 38].map((h) => row(h * H, "parse-ok")),
+    ];
+    const pool = ["grok-4-6", "claude-opus-5"];
+    const open = computeParseFailureRates(frozen, 10, now);
+    assert.equal(open["claude-opus-5"].rate, 0.3);
+    assert.equal(open["claude-opus-5"].lastCallMs, now - 25 * H);
+    assert.ok(filterPoolByParseFailure(pool, open, now).filtered.includes("claude-opus-5"));
+
+    const afterProbe = computeParseFailureRates([row(0, "parse-fail"), ...frozen], 10, now);
+    assert.equal(afterProbe["claude-opus-5"].lastCallMs, now);
+    assert.ok(afterProbe["claude-opus-5"].rate >= 0.3);
+    assert.deepEqual(filterPoolByParseFailure(pool, afterProbe, now).sidelined, ["claude-opus-5"]);
+    assert.ok(
+      filterPoolByParseFailure(pool, afterProbe, now + PARSE_FAIL_BENCH_MS).filtered.includes("claude-opus-5"),
+    );
   });
 
   it("a healthy arm is untouched", () => {

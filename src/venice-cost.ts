@@ -221,15 +221,31 @@ export function veniceRateLimited429Today(): Record<string, number> {
  * parse-fail" from June and could never re-enter the pool, because a sidelined
  * arm generates no new rows to age the old ones out. Id rejections are exempt
  * (deterministic evidence — see below).
+ *
+ * This window is the evidence horizon, not the bench clock. A rate that is
+ * still over threshold keeps its rows for the whole window; the bench that
+ * acts on that rate expires 24h after `lastCallMs` (newest in-window call
+ * here). Without that separate clock the 14-day horizon is the only way back
+ * in, which is how opus-5 stayed benched ~13 days (2026-09-17).
  */
 export const PARSE_FAIL_WINDOW_DAYS = Number(process.env.BOT_MODEL_PARSE_FAIL_WINDOW_DAYS ?? 14);
+
+export interface ParseFailureRate {
+  attempts: number;
+  failures: number;
+  rate: number;
+  idRejected: number;
+  idRejectedWireNames: string[];
+  /** ms timestamp of the newest in-window call. Absent when the only evidence is an id rejection outside the window. */
+  lastCallMs?: number;
+}
 
 /** Pure aggregation core of {@link parseFailureRateByModel} — testable. */
 export function computeParseFailureRates(
   calls: CostEntry[],
   lookback = 10,
   nowMs = Date.now(),
-): Record<string, { attempts: number; failures: number; rate: number; idRejected: number; idRejectedWireNames: string[] }> {
+): Record<string, ParseFailureRate> {
   // Most-recent first
   const sorted = [...calls].sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime());
   const cutoff = nowMs - PARSE_FAIL_WINDOW_DAYS * 86_400_000;
@@ -247,7 +263,7 @@ export function computeParseFailureRates(
     if (byModel[e.model].length < lookback) byModel[e.model].push(e);
   }
   const models = new Set([...Object.keys(byModel), ...Object.keys(rejectsByModel)]);
-  const result: Record<string, { attempts: number; failures: number; rate: number; idRejected: number; idRejectedWireNames: string[] }> = {};
+  const result: Record<string, ParseFailureRate> = {};
   for (const model of models) {
     const recent = byModel[model] ?? [];
     // "submit-reject" counts as a failure alongside "parse-fail": a model whose
@@ -258,6 +274,8 @@ export function computeParseFailureRates(
     // days (52 solves, $12.31, zero accepted).
     const failures = recent.filter((e) => e.outcome === "parse-fail" || e.outcome === "submit-reject").length;
     const rejects = rejectsByModel[model] ?? [];
+    // recent[] is most-recent-first (see sort above), so [0] is the last call.
+    const lastCallMs = recent.length > 0 ? Date.parse(recent[0].ts) : NaN;
     result[model] = {
       attempts: recent.length,
       failures,
@@ -268,15 +286,13 @@ export function computeParseFailureRates(
       idRejectedWireNames: [
         ...new Set(rejects.map((e) => e.wireName).filter((w): w is string => Boolean(w))),
       ],
+      ...(Number.isFinite(lastCallMs) ? { lastCallMs } : {}),
     };
   }
   return result;
 }
 
-export function parseFailureRateByModel(lookback = 10): Record<
-  string,
-  { attempts: number; failures: number; rate: number; idRejected: number; idRejectedWireNames: string[] }
-> {
+export function parseFailureRateByModel(lookback = 10): Record<string, ParseFailureRate> {
   return computeParseFailureRates(
     readJsonl<CostEntry>(LOG).filter((e) => e.callSite === "mining_solve"),
     lookback,
