@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import type { NookplotRuntime } from "@nookplot/runtime";
 import { chat, VENICE_WEB_SEARCH } from "./venice.js";
-import { pickModel, pickModelAB, pickAlternateModel, effortFor, abPool, PARSE_FAIL_RATE_THRESHOLD, PARSE_FAIL_MIN_ATTEMPTS } from "./models.js";
+import { pickModel, pickModelAB, pickAlternateModel, effortFor, abPool, isParseFailRateBenched } from "./models.js";
 import { isFarmChallengeTitle } from "./trace-fingerprint.js";
 import { writeNote } from "./vault.js";
 import { NOOK_DIR, readJsonl, readJsonlTail, appendJsonl, extractJsonObj, sleep } from "./util.js";
@@ -974,15 +974,16 @@ export async function regenerateVerifiableSummary(
 export function maybeOverrideModelForVerifiable(
   ch: Challenge,
   abPick: { model: string; reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" },
-  failureRates?: Record<string, { attempts: number; failures: number; rate: number }>,
+  failureRates?: Record<string, { attempts: number; failures: number; rate: number; lastCallMs?: number }>,
+  nowMs = Date.now(),
 ): { model: string; reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" } {
   if (process.env.BOT_VERIFIABLE_MODEL_OVERRIDE === "0") return abPick;
   if (!ch.verifierKind || !VERIFIABLE_KINDS.has(ch.verifierKind)) return abPick;
-  // A model sat at high parse-fail burns scarce epoch slots — never force it.
-  const sidelined = (m: string): boolean => {
-    const r = failureRates?.[m];
-    return !!(r && r.attempts >= PARSE_FAIL_MIN_ATTEMPTS && r.rate >= PARSE_FAIL_RATE_THRESHOLD);
-  };
+  // A model sat at high parse-fail burns scarce epoch slots — never force it
+  // while the bench holds. The bench expires 24h after the last mining_solve
+  // call, same clock as the A/B pool, so the override can't freeze an arm
+  // until the 14-day window ages out.
+  const sidelined = (m: string): boolean => isParseFailRateBenched(failureRates?.[m], nowMs);
   // Explicit env override wins (unless parse-fail-sidelined).
   const override = process.env.BOT_VERIFIABLE_MODEL;
   if (override && !sidelined(override)) {
@@ -1744,18 +1745,18 @@ async function discoverAndSolveMiningChallengesInner(
     console.log(`⛏ attempt ${idShort} (${kind}, est ${reward} NOOK): ${(ch.title ?? "").slice(0, 80)}`);
 
     // Cost circuit-breaker: pass recent per-model parse-failure rates to
-    // pickModelAB. Models with >= BOT_MODEL_PARSE_FAIL_THRESHOLD failure rate
-    // in their last N calls are sidelined from rotation for the day.
+    // pickModelAB. A rate at/above the threshold benches the arm until 24h
+    // after its last mining_solve call, then it is eligible for one probe.
     const { parseFailureRateByModel } = await import("./venice-cost.js");
     const failureRates = discountStaleIdRejections(parseFailureRateByModel(10));
     const abRaw = pickModelAB("mining_solve", failureRates);
     // Only report models actually in rotation: the failure-rate history keeps
     // stats for retired pool members forever (their last N calls never change
     // once they stop being called), and logging those every tick reads as a
-    // live problem when it's just history.
+    // live problem when it's just history. An expired bench is not sidelined.
     const activePool = abPool("mining_solve");
     const sidelined = Object.entries(failureRates)
-      .filter(([m, r]) => activePool.includes(m) && r.attempts >= 5 && r.rate >= 0.30)
+      .filter(([m, r]) => activePool.includes(m) && isParseFailRateBenched(r))
       .map(([m, r]) => `${m}=${(r.rate * 100).toFixed(0)}%`);
     if (sidelined.length > 0) {
       console.log(`   ⚠ models sidelined for parse-fail: ${sidelined.join(", ")}`);
