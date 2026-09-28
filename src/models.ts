@@ -244,6 +244,12 @@ const MODEL_EFFORT: Record<string, ReasoningEffort> = {
   // OUT of the mining roster since 2026-09-20 (see DEFAULTS.mining_solve) —
   // entry kept so MODEL_MINING_SOLVE=claude-opus-5 still gets the right dial.
   "claude-opus-5": "xhigh",
+  // claude-opus-5-5 takes the python_tests lane 2026-09-24 (operator) at
+  // "xhigh", mirroring opus-5. Live catalog 09-24: options low|medium|high|
+  // xhigh|max, default medium, $4.80/$24, 1M ctx, optimizedForCode. Probed at
+  // xhigh with the production python_tests shape (temperature 0.15, web
+  // search on) before the restart — see CHANGELOG 2026-09-24.
+  "claude-opus-5-5": "xhigh",
   // deepseek-v4-1-flash joined 2026-09-20 at "high" (its catalog default,
   // options none|low|high|max). NOT max: in the 09-20 probe (6k budget) max
   // spent the whole completion budget on reasoning and returned empty content

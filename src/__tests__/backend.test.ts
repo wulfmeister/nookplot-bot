@@ -214,6 +214,7 @@ describe("models", () => {
       // it (low..max, default medium). Both current claims live-probed
       // 2026-09-02 with solve-shaped requests at xhigh: 200 OK, full output.
       assert.equal(effortFor("claude-opus-5"), "xhigh");
+      assert.equal(effortFor("claude-opus-5-5"), "xhigh"); // python_tests lane since 2026-09-24
       assert.equal(effortFor("openai-gpt-56-terra"), "xhigh");
       // deepseek-v4-1-flash joined 2026-09-20 at "high" (catalog default).
       // NOT its "max" tier: probed 09-20 the python solve shape at max spent
@@ -584,18 +585,21 @@ describe("mining.maybeOverrideModelForVerifiable (route weak-for-code models off
 
   it("routes a weak-code A/B pick → deepseek on a verifiable (python_tests) challenge", () => {
     clean();
-    // Default is deepseek-v4-1-flash since 2026-09-20 (opus-5 09-02→09-20:
-    // it truncated python solves at the 6k cap, the source of its 29%
-    // spec-reject rate, at $0.235/solve vs deepseek's $0.006).
-    try { assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3")).model, "deepseek-v4-1-flash"); }
+    // Default is claude-opus-5-5 since 2026-09-24 (deepseek-v4-1-flash held
+    // it 09-20→09-24 and was worse on the lane than the opus-5 it replaced:
+    // 12/24 attempt errors, 9/12 verified vs 23/25; opus-5 09-02→09-20).
+    try { assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3")).model, "claude-opus-5-5"); }
     finally { restore(); }
   });
-  it("leaves an already code-strong A/B pick (opus / gpt-55 / deepseek) unchanged on verifiable", () => {
+  it("leaves an already code-strong A/B pick (opus / gpt-55) unchanged on verifiable; deepseek is rerouted", () => {
     clean();
     try {
       assert.equal(maybeOverrideModelForVerifiable(py, AB("claude-opus-4-8")).model, "claude-opus-4-8");
       assert.equal(maybeOverrideModelForVerifiable(py, AB("openai-gpt-55")).model, "openai-gpt-55");
-      assert.equal(maybeOverrideModelForVerifiable(py, AB("deepseek-v4-1-flash")).model, "deepseek-v4-1-flash");
+      assert.equal(maybeOverrideModelForVerifiable(py, AB("claude-opus-5-5")).model, "claude-opus-5-5");
+      // deepseek-v4-1-flash left VERIFIABLE_CODE_MODELS on 2026-09-24 — as an
+      // A/B pick it no longer keeps python_tests; every attempt routes to the default.
+      assert.equal(maybeOverrideModelForVerifiable(py, AB("deepseek-v4-1-flash")).model, "claude-opus-5-5");
     } finally { restore(); }
   });
   it("does NOT touch standard (non-verifiable) challenges — keeps grok in the A/B pool", () => {
@@ -615,7 +619,7 @@ describe("mining.maybeOverrideModelForVerifiable (route weak-for-code models off
   it("won't force a parse-fail-sidelined default model", () => {
     clean();
     try {
-      const rates = { "deepseek-v4-1-flash": { attempts: 10, failures: 8, rate: 0.8 } };
+      const rates = { "claude-opus-5-5": { attempts: 10, failures: 8, rate: 0.8 } };
       assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates).model, "grok-4-3");
     } finally { restore(); }
   });
@@ -626,12 +630,13 @@ describe("mining.maybeOverrideModelForVerifiable (route weak-for-code models off
     clean();
     const now = Date.parse("2026-09-17T19:33:00Z");
     const H = 3_600_000;
+    // Default is claude-opus-5-5 since 2026-09-24 (this test predates that swap).
     const rates = (ageMs: number) => ({
-      "deepseek-v4-1-flash": { attempts: 10, failures: 8, rate: 0.8, lastCallMs: now - ageMs },
+      "claude-opus-5-5": { attempts: 10, failures: 8, rate: 0.8, lastCallMs: now - ageMs },
     });
     try {
       assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates(H), now).model, "grok-4-3");
-      assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates(25 * H), now).model, "deepseek-v4-1-flash");
+      assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates(25 * H), now).model, "claude-opus-5-5");
     } finally { restore(); }
   });
 });
@@ -3959,9 +3964,15 @@ describe("specificity-gate techniques matcher (post-2026-07-28 tightening)", () 
     assert.equal(specificityCategories('Uses the "fast" path when possible.').techniques, false);
   });
   it("still credits real method names", () => {
-    assert.equal(specificityCategories("Uses bisect_right to find the insertion point.").techniques, true);
-    assert.equal(specificityCategories("Calls urlsplit() on the raw input first.").techniques, true);
-    assert.equal(specificityCategories("Delegates to Map.get for O(1) lookup.").techniques, true);
+    // 2026-09-24: these three used to be TRUE. The gateway's own rejection text
+    // says "technique names (no camelCase/quoted method names)" and "function
+    // names ... don't increase specificity" — and 9/24 deepseek summaries that
+    // passed on bare snake_case / calls / dotted members scored techniques +0.
+    assert.equal(specificityCategories("Uses bisect_right to find the insertion point.").techniques, false);
+    assert.equal(specificityCategories("Calls urlsplit() on the raw input first.").techniques, false);
+    assert.equal(specificityCategories("Delegates to Map.get for O(1) lookup.").techniques, false);
+    // Backticked, the same identifiers score — as `code`, the category the gateway credits.
+    assert.equal(specificityCategories("Uses `bisect_right` to find the insertion point.").code, true);
     assert.equal(specificityCategories('Wraps "json.loads" instead of pickle.').techniques, true);
     assert.equal(specificityCategories("The parseHeader helper normalizes casing.").techniques, true);
   });
@@ -5365,5 +5376,36 @@ describe("contract-canary.buildLogEntry", () => {
   it("keeps legacy keys {ts, endpointId, probed, drift} working", () => {
     const entry = buildLogEntry("ts-2", 6, 0, 0, { active: [], confirmed: [], resolved: [] });
     assert.ok("ts" in entry && "endpointId" in entry && "probed" in entry && "drift" in entry);
+  });
+});
+
+describe("2026-09-24 regressions: empty-summary length floor + snake_case/filename false passes", () => {
+  it("padTraceSummary grounds an EMPTY model summary in the challenge instead of shipping pure template", () => {
+    // 09-21: deepseek returned "" and only the ~150-char template tail shipped; the
+    // gateway rejects that as "Generic summaries are rejected" under its min-100 message.
+    const ch = { id: "abc", title: "Random file runner", difficulty: "medium", domainTags: ["security"], description: "Implement pick_and_run(dir_path, filenames, command) in solution.py." };
+    const out = padTraceSummary("", ch);
+    assert.ok(out.length >= 100, `expected ≥100, got ${out.length}: ${out}`);
+    assert.ok(out.length <= 500);
+    assert.ok(out.includes("Random file runner"), "grounded in the challenge title, not filler");
+    assert.ok(out.includes("pick_and_run"), "grounded in the description too");
+  });
+  it("padTraceSummary leaves a real (≥40 char) summary ungrounded and still ≥100", () => {
+    const real = "Resolves the target with `os.path.realpath` and rejects '..' escapes before spawning.";
+    const out = padTraceSummary(real, { id: "x", title: "T", domainTags: ["a"] } as any);
+    assert.ok(out.startsWith(real));
+    assert.ok(!out.includes("Challenge: T"), "no challenge grounding when the model wrote a real summary");
+    assert.ok(out.length >= 100);
+  });
+  it("passesSpecificityGate rejects the deepseek-style summary that used to false-pass", () => {
+    // snake_case function name + bare filename + the word "error": local gate said pass, gateway scored all six +0.
+    const s = "Implemented pick_and_run in solution.py with error handling and path checks using os.path.realpath before running the command.";
+    assert.equal(specificityCategories(s).techniques, false);
+    assert.equal(specificityCategories(s).code, false);
+    assert.equal(passesSpecificityGate(s), false);
+    // The gateway-credited forms do pass: a backticked identifier + a failure mode.
+    assert.equal(passesSpecificityGate("Resolves the target with `os.path.realpath` and rejects '..' escapes, which fails closed on traversal."), true);
+    // A quoted method name counts as a technique (gateway: "camelCase/quoted method names").
+    assert.equal(specificityCategories('Uses "json.loads" for untrusted input.').techniques, true);
   });
 });

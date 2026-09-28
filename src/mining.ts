@@ -40,11 +40,16 @@ import {
   enrichSummarySpecificity,
   passesSpecificityGate,
   countSpecificity,
+  isSummaryLengthError,
+  specificityCategories,
 } from "./specificity-gate.js";
 
 type RuntimeLike = Pick<NookplotRuntime, "connection" | "tools">;
 
 const MINING_LOG = join(NOOK_DIR, "mining-submissions.jsonl");
+// Gateway-rejected traceSummaries (specificity / min-length 400s) with the local
+// mirror's verdict — the calibration set for specificity-gate.ts. Added 2026-09-24.
+const SUMMARY_REJECTIONS_LOG = join(NOOK_DIR, "summary-rejections.jsonl");
 
 // Gateway epoch cap is 12 regular + 1 guild-exclusive per 24h (per skill.md +
 // nookplot_submit_reasoning_trace docs). The cap is the intended per-agent
@@ -90,12 +95,21 @@ const VERIFIABLE_KINDS = new Set(["python_tests", "javascript_tests", "exact_ans
 // solution passed a local harness (traversal rejected, no os.system, -1 on
 // missing file, cat exit 0). gemini-3-8-flash stays OUT for this lane: probed
 // 09-20 at 163s / $0.117 and length-capped.
+// deepseek-v4-1-flash REMOVED 2026-09-24 (operator: "put python_tests on
+// opus-5-5"): in its first 36h on the lane it was worse than the opus-5 it
+// replaced — 12/24 attempt errors (9 spec-gate 400s with every sub-score +0,
+// 3 "minimum 100 characters"), 9/12 settled verified (75%) vs opus-5's 23/25
+// (92%). Leaving it in this set would keep ~25% of python_tests on it (an A/B
+// pick already "code-strong" is never rerouted); it stays in the A/B pool for
+// standard traces. claude-opus-5-5 added the same day (live catalog: $4.80/$24,
+// 1M ctx, optimizedForCode, effort low..max; probed at xhigh with the real
+// python_tests shape before shipping).
 const VERIFIABLE_CODE_MODELS = new Set([
   "claude-opus-4-8",
   "claude-opus-5",
+  "claude-opus-5-5",
   "claude-opus-4-7",
   "openai-gpt-55",
-  "deepseek-v4-1-flash",
 ]);
 // opus-4-8 → opus-5 (operator, 2026-09-02): opus-4-8 hit the gateway's
 // traceSummary specificity gate on 12/16 python_tests attempts since 08-28
@@ -107,7 +121,10 @@ const VERIFIABLE_CODE_MODELS = new Set([
 // snake_case-only enrichment problem documented above — 0% on other arms).
 // deepseek is 20-40x cheaper on this lane and passes format + correctness
 // probes. See DEFAULTS.mining_solve in models.ts for the full evidence table.
-const VERIFIABLE_DEFAULT_MODEL = "deepseek-v4-1-flash";
+// deepseek-v4-1-flash → claude-opus-5-5 (operator, 2026-09-24): see the
+// VERIFIABLE_CODE_MODELS note above for the 36h numbers behind the reversal.
+// Standard traces are untouched (DEFAULTS.mining_solve / the A/B pool).
+const VERIFIABLE_DEFAULT_MODEL = "claude-opus-5-5";
 // How many times to re-solve + resubmit a verifiable challenge that failed its
 // deterministic tests, feeding the exact failing test back to the solver. The
 // gateway grants up to 20 slots/challenge; we use a few. Tune via env.
@@ -480,7 +497,10 @@ ${SUMMARY_SPECIFICITY_RULE}
     artifact: { files: { "solution.py": parsed.value } },
     artifactType: "code",
     reasoning,
-    traceSummary: padTraceSummary(parsed.summary ?? reasoning, ch, parsed.value),
+    // `||` not `??`: deepseek-v4-1-flash returns "summary": "" on some solves
+    // (3 gateway 400s "minimum 100 characters" on 2026-09-21) and an empty
+    // string is not nullish, so the reasoning fallback never engaged.
+    traceSummary: padTraceSummary(parsed.summary || reasoning, ch, parsed.value),
   };
 }
 
@@ -529,7 +549,7 @@ ${SUMMARY_SPECIFICITY_RULE}
     artifact: { files: { "solution.js": parsed.value } },
     artifactType: "code",
     reasoning,
-    traceSummary: padTraceSummary(parsed.summary ?? reasoning, ch, parsed.value),
+    traceSummary: padTraceSummary(parsed.summary || reasoning, ch, parsed.value),
   };
 }
 
@@ -570,7 +590,7 @@ Constraints:
     artifact: { text: String(parsed.value).trim() },
     artifactType: "static_text",
     reasoning,
-    traceSummary: padTraceSummary(parsed.summary ?? reasoning, ch, parsed.value),
+    traceSummary: padTraceSummary(parsed.summary || reasoning, ch, parsed.value),
   };
 }
 
@@ -744,7 +764,7 @@ function logParseFail(kind: string, model: string, content: string, missing: str
 
 // Moved to specificity-gate.ts (pure, no deps) to avoid an import cycle —
 // re-exported here for existing importers (_probe-quality, tests).
-export { specificityCategories } from "./specificity-gate.js";
+export { specificityCategories };
 export { countSpecificity };
 
 /**
@@ -799,10 +819,24 @@ const BOOST_TRIGGER_THRESHOLD = 2; // boost only when fewer than 2 categories pr
  * rate (no real citations placed → no follows → no comments).
  */
 export function padTraceSummary(s: string, ch: Challenge, context?: string): string {
-  let summary = s.trim();
+  const original = s.trim();
+  let summary = original;
   if (summary.length < 100) {
     const tail = ` Domain: ${(ch.domainTags ?? []).join(", ") || "general"}. Difficulty: ${ch.difficulty ?? "?"}. Approach derived from challenge spec + related learnings, with concrete examples and citations in the trace body.`;
     summary = (summary + tail).slice(0, 500);
+  }
+  // An ALL-template summary is what the gateway rejects with "traceSummary is
+  // required (minimum 100 characters) ... Generic summaries are rejected" —
+  // 3× on 2026-09-21, when deepseek returned "summary": "" and the callers'
+  // `??` fallback never engaged, so only the tail above shipped. Length was
+  // never the problem (that tail is ~150 chars). Ground a near-empty summary
+  // in the challenge itself — title, then a slice of the description — never
+  // more filler.
+  if (original.length < 40) {
+    const grounding = [ch.title ?? "", (ch.description ?? "").slice(0, 200)]
+      .map((t) => t.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+    if (grounding.length > 0) summary = `${summary} Challenge: ${grounding.join(": ")}`.slice(0, 500);
   }
   // Conditional specificity boost — only kicks in for genuinely sparse
   // summaries. Most LLM-generated summaries already pass 3+ categories.
@@ -1993,6 +2027,24 @@ async function discoverAndSolveMiningChallengesInner(
         sub = await doSubmit();
       } catch (subErr) {
         const smsg = (subErr as Error).message;
+        // Keep the REJECTED summary text (nothing else stores it — the error
+        // row in mining-submissions.jsonl carries only the gateway message).
+        // The 2026-09-21 deepseek rejections could only be diagnosed by
+        // inference because of that gap; this file is the calibration set
+        // for the local specificity mirror.
+        if (isSpecificityError(smsg) || isSummaryLengthError(smsg)) {
+          const text = submitSummary ?? "";
+          console.warn(`   📝 rejected summary (${text.length} chars, ${modelUsed}): ${text.slice(0, 220)}`);
+          appendJsonl(SUMMARY_REJECTIONS_LOG, {
+            ts: new Date().toISOString(),
+            challengeId: ch.id,
+            verifierKind: kind,
+            model: modelUsed,
+            gateway: smsg.slice(0, 400),
+            summary: text.slice(0, 600),
+            local: specificityCategories(text),
+          });
+        }
         if (!isSpecificityError(smsg)) throw subErr;
         // The gateway enumerates exactly which categories scored zero —
         // enrich those from the trace and retry ONCE. (Operator playbooks

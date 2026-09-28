@@ -4,6 +4,68 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-09-24 — python_tests → claude-opus-5-5; two summary bugs the deepseek swap exposed
+
+Operator: "fix the two bugs and put python_tests on opus-5-5." The model name
+was checked against the live Venice catalog before anything else — it is a real
+entry (Claude Opus 5.5, $4.80/$24 per M, 1M ctx, optimizedForCode, effort
+low..max), not a typo for opus-5.
+
+**Why the lane moved.** deepseek-v4-1-flash's first 36h on python_tests
+(09-21→22, n=24): 12 attempt errors — 9 specificity-gate 400s scored 30-33 with
+EVERY gateway sub-score +0, and 3 "traceSummary is required (minimum 100
+characters)" — against 9/12 settled verified (75%). The opus-5 it replaced ran
+10/35 spec-400s (29%) and 23/25 verified (92%) at the same K. Venice spend did
+fall as promised ($6-7/day → $0.60/day). deepseek stays in the 4-arm A/B pool
+for standard traces; it leaves VERIFIABLE_CODE_MODELS so that an A/B pick of
+deepseek no longer keeps python_tests (an already-"code-strong" pick is never
+rerouted).
+
+**Probe before shipping** (production shape via `chat()`: temperature 0.15,
+web search on, 6k requested / 50k floored, xhigh): 200 OK in 35s, 3,963
+completion tokens (~$0.11), strict JSON, `def pick_and_run` present, no
+`os.system`, 157-char reasoning, 557-char summary with backticked identifiers,
+an O(n) claim and an "instead of" comparison. Under the recalibrated local
+gate below that summary is code-only (no camelCase, no failure wording) — so in
+production it would take the regeneration path rather than 400 at the gateway,
+which is the point of the second fix.
+
+**Bug 1 — empty summaries shipped as pure template.** `solvePythonTests` (and
+the js/exact builders) used `parsed.summary ?? reasoning`; deepseek returns
+`"summary": ""`, which is not nullish, so the reasoning fallback never engaged
+and only `padTraceSummary`'s boilerplate tail went out. The gateway rejects
+that under its "minimum 100 characters ... Generic summaries are rejected"
+message. (My first reading blamed the tail's LENGTH — "92-93 chars" — from a
+line my terminal had truncated; the full tail is ~150 chars, and the failing
+regression test caught it. Length was never the problem; genericness was.)
+Fixed both ends: `||` at the three call sites so the model's reasoning (a real
+approach description) is the fallback, and the pad grounds a near-empty
+summary in the challenge title + description instead of more template.
+
+**Bug 2 — the local specificity mirror false-passed deepseek's style.** All 24
+deepseek summaries passed `passesSpecificityGate` pre-submit (0 "summary
+enriched" lines, 0 regenerations), yet the gateway zeroed 9 of them. The
+gateway's own rejection text names the rule: "technique names (no
+camelCase/quoted method names)" and "Avoid adding METADATA (reward amounts,
+function names, learning IDs) — those don't increase specificity". Our
+`techniques` arm credited bare snake_case, `call()` and `Map.get` forms — i.e.
+function names — and `code` credited a bare ".py" mention. Recalibrated to what
+the gateway names: techniques = camelCase or a quoted METHOD-shaped name
+("json.loads", not "http"); code = backticks only. Enrichment still turns a
+filename into a backticked ref, which is the form that scores. Consequence:
+summaries that would have 400'd now go enrich → regenerate → (if still short)
+skip with the same 24h cooldown the 400 path uses. Pre-existing test pins for
+the three loosened forms were flipped with the evidence noted inline.
+
+Also: rejected summary TEXT is now recorded — `~/.nookplot/summary-rejections.jsonl`
+(gateway message + our local category verdict) plus one `📝 rejected summary`
+log line. Nothing stored it before; this week's diagnosis had to be inferred.
+
+Watch: `npm run mining-stats -- --since=<restart>` for opus-5-5's spec-reject
+and verified rates at n≥8; the gateway's `modelUsed` validator has never seen
+"claude-opus-5-5" (one id-rejection sidelines the arm and python_tests fall
+back to the raw A/B pick — the bounded canary from 09-20 applies).
+
 ## 2026-09-17 — the 09-02 opus-5 swap never ran: the parse-fail breaker benched it for 13 days
 
 Found while setting up a watch on opus-5's python_tests spec-gate rate: the
