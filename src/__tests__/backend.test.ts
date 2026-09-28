@@ -113,7 +113,7 @@ import {
   enrichSummarySpecificity,
   passesSpecificityGate,
 } from "../specificity-gate.js";
-import { compareChallengePriority, challengeValueTier, challengeKindKey, computeVerifiableTilt, isModelRejection, discountStaleIdRejections, meetsValueFloor, challengeFitsBudget, isTransientGenerationError, type TiltInputs } from "../mining.js";
+import { compareChallengePriority, challengeValueTier, challengeKindKey, computeVerifiableTilt, tallyTiltOutcomes, measuredStandardRewardMultiple, isModelRejection, discountStaleIdRejections, meetsValueFloor, challengeFitsBudget, isTransientGenerationError, type TiltInputs } from "../mining.js";
 import { reconcileSettlements, kHatByKind, latestSettlements, type GatewaySubmissionRow } from "../settlements.js";
 import { classifyAnyRows, classifyFreshRlm, classifyMarketplaceDemand, classifyError } from "../earning-surfaces.js";
 import { pickAlternateModel } from "../models.js";
@@ -1792,7 +1792,7 @@ describe("mining.computeVerifiableTilt", () => {
     standardRewardMultiple: 5.3,
     minResolved: 10,
     standardResolved: 75,
-    standardExpiredShare: 0.45,
+    standardLossShare: 0.45,
     verifiableSurvival: 0.88,
     todaySubmitted: 0,
     todayVerifiable: 0,
@@ -1808,51 +1808,51 @@ describe("mining.computeVerifiableTilt", () => {
   });
 
   it("does not tilt at 46% expiry either (the number that triggered the bad version)", () => {
-    assert.equal(computeVerifiableTilt({ ...measured, standardResolved: 120, standardExpiredShare: 0.46 }).active, false);
+    assert.equal(computeVerifiableTilt({ ...measured, standardResolved: 120, standardLossShare: 0.46 }).active, false);
   });
 
   it("tilts only when standard EV actually falls below verifiable EV", () => {
     // Break-even: (1-e) * 5.3 < 0.88  →  e > ~83.4%.
-    const justUnder = computeVerifiableTilt({ ...measured, standardExpiredShare: 0.82 });
+    const justUnder = computeVerifiableTilt({ ...measured, standardLossShare: 0.82 });
     assert.equal(justUnder.active, false, "82% expiry still favors standard");
-    const justOver = computeVerifiableTilt({ ...measured, standardExpiredShare: 0.85 });
+    const justOver = computeVerifiableTilt({ ...measured, standardLossShare: 0.85 });
     assert.equal(justOver.active, true, "85% expiry finally favors verifiable");
     assert.equal(justOver.preferVerifiable, true);
   });
 
   it("a catastrophic stall (95% expiry) tilts", () => {
-    const t = computeVerifiableTilt({ ...measured, standardExpiredShare: 0.95 });
+    const t = computeVerifiableTilt({ ...measured, standardLossShare: 0.95 });
     assert.equal(t.active, true);
     assert.equal(t.preferVerifiable, true);
   });
 
   it("ratio 0 disables the tilt entirely, even at total standard collapse", () => {
-    const t = computeVerifiableTilt({ ...measured, ratio: 0, standardExpiredShare: 1 });
+    const t = computeVerifiableTilt({ ...measured, ratio: 0, standardLossShare: 1 });
     assert.equal(t.active, false);
     assert.match(t.reason, /disabled/);
   });
 
   it("small sample never tilts (3 expiries of 4 resolved is noise, not a signal)", () => {
-    const t = computeVerifiableTilt({ ...measured, standardResolved: 4, standardExpiredShare: 0.75 });
+    const t = computeVerifiableTilt({ ...measured, standardResolved: 4, standardLossShare: 0.75 });
     assert.equal(t.active, false);
     assert.match(t.reason, /too few/);
   });
 
   it("a lower reward multiple lowers the bar for tilting", () => {
     // If standard ever pays only 1.2x, 30% expiry is already enough.
-    const t = computeVerifiableTilt({ ...measured, standardRewardMultiple: 1.2, standardExpiredShare: 0.3 });
+    const t = computeVerifiableTilt({ ...measured, standardRewardMultiple: 1.2, standardLossShare: 0.3 });
     assert.equal(t.active, true);
   });
 
   it("weak verifiable survival raises the bar for tilting", () => {
     // Verifiable that only survives 30% of the time is a worse destination.
-    const base = { ...measured, standardExpiredShare: 0.9 };
+    const base = { ...measured, standardLossShare: 0.9 };
     assert.equal(computeVerifiableTilt(base).active, true);
     assert.equal(computeVerifiableTilt({ ...base, verifiableSurvival: 0.3 }).active, false);
   });
 
   it("stops preferring verifiable once the rolling day hits the target share", () => {
-    const tilted = { ...measured, standardExpiredShare: 0.9 };
+    const tilted = { ...measured, standardLossShare: 0.9 };
     const t = computeVerifiableTilt({ ...tilted, todaySubmitted: 10, todayVerifiable: 6 });
     assert.equal(t.active, true);
     assert.equal(t.preferVerifiable, false);
@@ -5407,5 +5407,75 @@ describe("2026-09-24 regressions: empty-summary length floor + snake_case/filena
     assert.equal(passesSpecificityGate("Resolves the target with `os.path.realpath` and rejects '..' escapes, which fails closed on traversal."), true);
     // A quoted method name counts as a technique (gateway: "camelCase/quoted method names").
     assert.equal(specificityCategories('Uses "json.loads" for untrusted input.').techniques, true);
+  });
+});
+
+describe("2026-09-27 tilt: rejected standards are losses; reward multiple measured from the ledger", () => {
+  const now = Date.parse("2026-09-27T18:00:00Z");
+  const day = 86_400_000;
+  const row = (kind: string, status: string, daysAgo = 1) => ({ ts: new Date(now - daysAgo * day).toISOString(), verifierKind: kind, status });
+
+  it("tallyTiltOutcomes counts a rejected standard as resolved AND lost (it pays the same as expired)", () => {
+    const t = tallyTiltOutcomes([row("standard", "verified"), row("standard", "rejected"), row("standard", "expired")], now, 10 * day);
+    assert.equal(t.standardResolved, 3);
+    assert.equal(t.standardLost, 2);
+  });
+  it("tallyTiltOutcomes keeps verifiable counting and the window unchanged", () => {
+    const t = tallyTiltOutcomes(
+      [row("python_tests", "verified"), row("python_tests", "rejected"), row("python_tests", "verified", 11), row("standard", "rejected", 11)],
+      now,
+      10 * day,
+    );
+    assert.deepEqual(t, { standardResolved: 0, standardLost: 0, verifiableResolved: 2, verifiableVerified: 1 });
+  });
+  it("measuredStandardRewardMultiple is null until both sides clear the evidence bar", () => {
+    assert.equal(measuredStandardRewardMultiple(undefined), null);
+    assert.equal(measuredStandardRewardMultiple({ standard: { ev: 205_000, n: 14, batches: 5 } }), null, "no verifiable kind");
+    assert.equal(
+      measuredStandardRewardMultiple({ standard: { ev: 205_000, n: 2, batches: 2 }, python_tests: { ev: 157_000, n: 46, batches: 6 } }),
+      null,
+      "standard below n=3",
+    );
+    assert.equal(
+      measuredStandardRewardMultiple({ standard: { ev: 205_000, n: 14, batches: 1 }, python_tests: { ev: 157_000, n: 46, batches: 6 } }),
+      null,
+      "one batch is one observation",
+    );
+  });
+  it("measuredStandardRewardMultiple = standard EV / n-weighted verifiable EV", () => {
+    const m = measuredStandardRewardMultiple({ standard: { ev: 205_000, n: 14, batches: 5 }, python_tests: { ev: 157_000, n: 46, batches: 6 } });
+    assert.ok(m !== null && Math.abs(m - 205_000 / 157_000) < 1e-9);
+    const w = measuredStandardRewardMultiple({
+      standard: { ev: 200_000, n: 10, batches: 4 },
+      python_tests: { ev: 100_000, n: 30, batches: 5 },
+      javascript_tests: { ev: 200_000, n: 10, batches: 3 },
+      exact_answer: { ev: 1, n: 1, batches: 1 }, // below the bar → ignored
+    });
+    assert.ok(w !== null && Math.abs(w - 200_000 / 125_000) < 1e-9, `got ${w}`);
+  });
+  it("at the 09-27 live shape the tilt activates and prefers python_tests", () => {
+    // 7 verified / 17 rejected / 14 expired standards; measured multiple ~1.31; python survival 34/39.
+    const t = computeVerifiableTilt({
+      ratio: 0.6,
+      standardRewardMultiple: 205_000 / 157_000,
+      standardRewardMultipleSource: "measured",
+      minResolved: 10,
+      standardResolved: 38,
+      standardLossShare: 31 / 38,
+      verifiableSurvival: 34 / 39,
+      todaySubmitted: 0,
+      todayVerifiable: 0,
+    });
+    assert.equal(t.active, true);
+    assert.equal(t.preferVerifiable, true);
+    assert.match(t.reason, /measured reward/);
+  });
+  it("the same shape stayed 'standard first' under the old inputs (expired-only, 5.3x) — the bug", () => {
+    // Old: rejected rows skipped → 7 verified + 14 expired = 21 resolved, 67% loss, × 5.3.
+    const t = computeVerifiableTilt({
+      ratio: 0.6, standardRewardMultiple: 5.3, minResolved: 10, standardResolved: 21,
+      standardLossShare: 14 / 21, verifiableSurvival: 34 / 39, todaySubmitted: 0, todayVerifiable: 0,
+    });
+    assert.equal(t.active, false);
   });
 });

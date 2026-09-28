@@ -1193,23 +1193,35 @@ export function challengeValueTier(c: Challenge): number {
  * gate rejects most of them).
  *
  * The trigger is now the comparison that actually decides it: tilt only when
- * standard's expected value per slot drops BELOW verifiable's, using the
- * measured reward multiple (BOT_STANDARD_REWARD_MULTIPLE, re-measurable with
- * `npm run mining:stats`). Same soft mechanism as before — it is a sort, not
- * a filter, so a slot never idles.
+ * standard's expected value per slot drops BELOW verifiable's. The reward
+ * multiple is MEASURED from the settlements ledger (kHatByKind: paid standard
+ * EV ÷ paid verifiable EV) once both kinds clear the kind-EV evidence bar;
+ * BOT_STANDARD_REWARD_MULTIPLE overrides it, and the 07-28 constant (5.3) is
+ * only the no-evidence fallback. Same soft mechanism as before — it is a
+ * sort, not a filter, so a slot never idles.
  *
  * The standalone quorum-stall trigger was also dropped: a stall depresses
- * standard survival, which this EV test already sees through the expiry
+ * standard survival, which this EV test already sees through the loss
  * share, and even the worst measured stall week still resolved 43% of
  * standards — far above the ~16% break-even.
+ *
+ * 2026-09-27: the loss share now counts REJECTED standards, not just expired
+ * ones. Both pay nothing. From 09-23 a Sybil scoring farm (one real verifier
+ * + two one-shot addresses at a flat ~0.15) pushed most standard traces under
+ * the composite floor — 17 rejected / 7 verified / 14 expired — while the
+ * tilt, blind to rejections and still multiplying by July's 5.3, kept
+ * ranking standards first at roughly a quarter of a python_tests slot's value.
  */
 export interface TiltInputs {
   ratio: number; // target verifiable share of the rolling day's slots; 0 disables
   /** How many times more a PAID standard solve pays than a paid verifiable one. */
   standardRewardMultiple: number;
+  /** Where standardRewardMultiple came from — surfaced in the tilt reason. */
+  standardRewardMultipleSource?: "env" | "measured" | "default";
   minResolved: number; // minimum resolved standards before survival is trusted
-  standardResolved: number; // verified+expired standard rows in the window
-  standardExpiredShare: number;
+  standardResolved: number; // verified+expired+rejected standard rows in the window
+  /** Share of resolved standards that paid nothing: expired (no quorum) or rejected (quorum under the floor). */
+  standardLossShare: number;
   /** Verifiable survival (verified / resolved). Defaults to 1 — they grade in a sandbox. */
   verifiableSurvival: number;
   todaySubmitted: number; // slots consumed in the rolling 24h (rows with submissionId)
@@ -1236,9 +1248,10 @@ export function computeVerifiableTilt(i: TiltInputs): TiltState {
     };
   }
   // EV per slot, in units of "one paid verifiable solve".
-  const standardEv = (1 - i.standardExpiredShare) * i.standardRewardMultiple;
+  const standardEv = (1 - i.standardLossShare) * i.standardRewardMultiple;
   const verifiableEv = i.verifiableSurvival;
-  const ev = `standard EV ${standardEv.toFixed(2)} (${((1 - i.standardExpiredShare) * 100).toFixed(0)}% survival × ${i.standardRewardMultiple.toFixed(1)}x reward) vs verifiable ${verifiableEv.toFixed(2)}`;
+  const src = i.standardRewardMultipleSource ? ` ${i.standardRewardMultipleSource}` : "";
+  const ev = `standard EV ${standardEv.toFixed(2)} (${((1 - i.standardLossShare) * 100).toFixed(0)}% survival × ${i.standardRewardMultiple.toFixed(2)}x${src} reward) vs verifiable ${verifiableEv.toFixed(2)}`;
   if (standardEv >= verifiableEv) {
     return { active: false, preferVerifiable: false, reason: `${ev} → standard first` };
   }
@@ -1253,33 +1266,86 @@ export function computeVerifiableTilt(i: TiltInputs): TiltState {
 
 const MINING_VERIFIED_LOG = join(NOOK_DIR, "mining-verified.jsonl");
 
+export interface TiltOutcomeTally {
+  standardResolved: number;
+  standardLost: number;
+  verifiableResolved: number;
+  verifiableVerified: number;
+}
+
+/**
+ * Pure: count terminal outcomes in the window. Rejected and expired are both
+ * losses for EITHER kind — they pay the same (nothing). Standard rejections
+ * used to be skipped entirely, which hid the 2026-09-23 scoring-farm wave.
+ */
+export function tallyTiltOutcomes(
+  rows: Array<{ ts?: string; verifierKind?: string; status?: string }>,
+  nowMs: number,
+  windowMs: number,
+): TiltOutcomeTally {
+  const t: TiltOutcomeTally = { standardResolved: 0, standardLost: 0, verifiableResolved: 0, verifiableVerified: 0 };
+  for (const r of rows) {
+    if (!r.ts || nowMs - Date.parse(r.ts) > windowMs) continue;
+    const lost = r.status === "expired" || r.status === "rejected";
+    if (r.verifierKind === "standard") {
+      if (r.status === "verified") t.standardResolved++;
+      else if (lost) { t.standardResolved++; t.standardLost++; }
+    } else if (r.verifierKind && VERIFIABLE_KINDS.has(r.verifierKind)) {
+      if (r.status === "verified") { t.verifiableResolved++; t.verifiableVerified++; }
+      else if (lost) t.verifiableResolved++;
+    }
+  }
+  return t;
+}
+
+/**
+ * Pure: paid-standard EV ÷ paid-verifiable EV from our own settlements
+ * (kHatByKind rows), or null until standard AND at least one verifiable kind
+ * clear the same evidence bar the kind ranking uses. Verifiable kinds are
+ * n-weighted so a thin second kind can't swing the ratio.
+ */
+export function measuredStandardRewardMultiple(kindEv?: Record<string, KindEvEntry>): number | null {
+  const evidenced = (e?: KindEvEntry): e is KindEvEntry =>
+    !!e && e.n >= KIND_EV_MIN_N && e.batches >= KIND_EV_MIN_BATCHES && e.ev > 0;
+  const std = kindEv?.standard;
+  if (!evidenced(std)) return null;
+  let weight = 0;
+  let weightedEv = 0;
+  for (const [kind, e] of Object.entries(kindEv ?? {})) {
+    if (!VERIFIABLE_KINDS.has(kind) || !evidenced(e)) continue;
+    weight += e.n;
+    weightedEv += e.ev * e.n;
+  }
+  return weight > 0 ? std.ev / (weightedEv / weight) : null;
+}
+
 /** Gather tilt inputs from local JSONL state (impure shell around computeVerifiableTilt). */
-export function loadTiltInputs(nowMs: number): TiltInputs {
+export function loadTiltInputs(nowMs: number, kindEv?: Record<string, KindEvEntry>): TiltInputs {
   const num = (v: string | undefined, dflt: number) => {
     const n = Number(v);
     return Number.isFinite(n) ? n : dflt;
   };
   const ratio = Math.min(1, Math.max(0, num(process.env.BOT_VERIFIABLE_TILT, 0.6)));
-  // Measured 2026-07-28 from gateway per-submission attribution: a paid
-  // standard solve returned 54,308 NOOK vs 10,181 for a paid verifiable one.
-  // Re-measure with `npm run mining:stats` and update if the network reprices.
-  const standardRewardMultiple = num(process.env.BOT_STANDARD_REWARD_MULTIPLE, 5.3);
-  const windowMs = num(process.env.BOT_VERIFIABLE_TILT_WINDOW_DAYS, 10) * 86_400_000;
-  let standardResolved = 0;
-  let standardExpired = 0;
-  let verifiableResolved = 0;
-  let verifiableVerified = 0;
-  for (const r of readJsonlTail<{ ts?: string; verifierKind?: string; status?: string }>(MINING_VERIFIED_LOG, 600)) {
-    if (!r.ts || nowMs - Date.parse(r.ts) > windowMs) continue;
-    const verifiable = r.verifierKind ? VERIFIABLE_KINDS.has(r.verifierKind) : false;
-    if (r.verifierKind === "standard") {
-      if (r.status === "verified") standardResolved++;
-      else if (r.status === "expired") { standardResolved++; standardExpired++; }
-    } else if (verifiable) {
-      if (r.status === "verified") { verifiableResolved++; verifiableVerified++; }
-      else if (r.status === "expired" || r.status === "rejected") verifiableResolved++;
-    }
+  // Reward multiple: explicit env override > measured from the settlements
+  // ledger > the 2026-07-28 attribution constant (54,308 vs 10,181 NOOK per
+  // paid solve = 5.3), kept only for a ledger too young to measure.
+  const envMultiple = Number(process.env.BOT_STANDARD_REWARD_MULTIPLE);
+  const measured = measuredStandardRewardMultiple(kindEv);
+  let standardRewardMultiple = 5.3;
+  let standardRewardMultipleSource: TiltInputs["standardRewardMultipleSource"] = "default";
+  if (process.env.BOT_STANDARD_REWARD_MULTIPLE && Number.isFinite(envMultiple) && envMultiple > 0) {
+    standardRewardMultiple = envMultiple;
+    standardRewardMultipleSource = "env";
+  } else if (measured !== null) {
+    standardRewardMultiple = measured;
+    standardRewardMultipleSource = "measured";
   }
+  const windowMs = num(process.env.BOT_VERIFIABLE_TILT_WINDOW_DAYS, 10) * 86_400_000;
+  const { standardResolved, standardLost, verifiableResolved, verifiableVerified } = tallyTiltOutcomes(
+    readJsonlTail<{ ts?: string; verifierKind?: string; status?: string }>(MINING_VERIFIED_LOG, 600),
+    nowMs,
+    windowMs,
+  );
   let todaySubmitted = 0;
   let todayVerifiable = 0;
   for (const r of readJsonlTail<{ ts?: string; verifierKind?: string; submissionId?: string }>(MINING_LOG, 300)) {
@@ -1291,9 +1357,10 @@ export function loadTiltInputs(nowMs: number): TiltInputs {
   return {
     ratio,
     standardRewardMultiple,
+    standardRewardMultipleSource,
     minResolved: 10,
     standardResolved,
-    standardExpiredShare: standardResolved ? standardExpired / standardResolved : 0,
+    standardLossShare: standardResolved ? standardLost / standardResolved : 0,
     // Sandbox-graded kinds essentially always resolve; fall back to 1.0 until
     // we have enough resolved rows to say otherwise.
     verifiableSurvival: verifiableResolved >= 5 ? verifiableVerified / verifiableResolved : 1,
@@ -1704,23 +1771,26 @@ async function discoverAndSolveMiningChallengesInner(
   }
 
   const targets = specializeDomains();
-  let tilt: TiltState = { active: false, preferVerifiable: false, reason: "" };
-  try {
-    tilt = computeVerifiableTilt(loadTiltInputs(Date.now()));
-  } catch (err) {
-    // Tilt is best-effort — on any state-read failure fall back to the
-    // healthy-network ordering rather than blocking the poll.
-    console.warn(`   ⚠ tilt state unavailable (${(err as Error).message}) — using default ordering`);
-  }
   // Kind-EV from our own paid settlements (trailing 14d). Best-effort — an
-  // empty/young ledger just means the static tier order ranks kinds.
+  // empty/young ledger just means the static tier order ranks kinds. Read
+  // BEFORE the tilt: the tilt's reward multiple is measured from it.
   let kindEv: Record<string, { kHat: number; compHat: number; ev: number; n: number; batches: number }> | undefined;
   try {
     const { readSettlements, kHatByKind } = await import("./settlements.js");
     kindEv = kHatByKind(readSettlements(), Date.now());
   } catch { /* ledger optional */ }
+  let tilt: TiltState = { active: false, preferVerifiable: false, reason: "" };
+  try {
+    tilt = computeVerifiableTilt(loadTiltInputs(Date.now(), kindEv));
+  } catch (err) {
+    // Tilt is best-effort — on any state-read failure fall back to the
+    // healthy-network ordering rather than blocking the poll.
+    console.warn(`   ⚠ tilt state unavailable (${(err as Error).message}) — using default ordering`);
+  }
   eligible.sort((a, b) => compareChallengePriority(a, b, targets, { ...tilt, kindEv }));
-  if (tilt.active) console.log(`   ⚖ verifiable tilt: ${tilt.reason}`);
+  // Logged either way: the 09-23→27 misranking was invisible because only an
+  // ACTIVE tilt printed anything.
+  if (tilt.reason) console.log(`   ⚖ verifiable tilt${tilt.active ? "" : " (off)"}: ${tilt.reason}`);
   if (kindEv && Object.keys(kindEv).length > 0) {
     const parts = Object.entries(kindEv).map(([k, v]) => `${k}=${Math.round(v.ev / 1000)}k(n${v.n})`);
     console.log(`   📐 kind-EV: ${parts.join(" ")}`);

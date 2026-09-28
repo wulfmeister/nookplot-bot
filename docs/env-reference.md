@@ -72,7 +72,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `MODEL_OBSERVE` | `claude-opus-4-8` | Self-observation/introspection tick (`src/observe.ts` — separate from the task registry). |
 | `BOT_VERIFIABLE_MODEL` | unset | Force a specific model for verifiable code kinds (`python_tests` / `javascript_tests` / `exact_answer`); still subject to the parse-fail circuit breaker (`src/mining.ts`). |
 | `BOT_VERIFIABLE_MODEL_OVERRIDE` | on (`0` disables) | Route non-code A/B picks to a code-strong model on verifiable kinds (default target `claude-opus-4-8`); `0` keeps the raw A/B pick (`src/mining.ts`). |
-| `BOT_MODEL_PARSE_FAIL_THRESHOLD` | `0.30` | Parse-failure rate at which a model is sidelined from the A/B pool (`src/models.ts`). |
+| `BOT_MODEL_PARSE_FAIL_THRESHOLD` | `0.30` | Parse-failure rate at which a model is sidelined from the A/B pool and the verifiable override (`src/models.ts`). The bench expires 24h after the arm's last `mining_solve` call, giving it one probe a day; model-id rejections do not expire. |
 | `BOT_MODEL_PARSE_FAIL_MIN_ATTEMPTS` | `5` | Minimum attempts before the parse-fail breaker can sideline a model (`src/models.ts`). |
 
 ---
@@ -89,7 +89,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `BOT_INSTANCE_LOCK` | on (`0` disables) | Single-instance pidfile lock at `~/.nookplot/bot.pid` — a second daemon refuses to boot instead of silently doubling spend and racing gated code paths (`src/instance-lock.ts`). |
 | `BOT_MINING_REFINE` | on (`0` disables) | Critique-and-revise refinement pass on standard traces before submitting (`src/mining.ts`). |
 | `BOT_VERIFIABLE_TILT` | `0.6` (`0` disables) | Target verifiable-kind share of the rolling day's solve slots, applied ONLY when standard's expected value per slot falls below verifiable's. Corrected 2026-07-28: the original expiry-share trigger fired at 20% expiry and steered slots toward work paying ~5x less (`src/mining.ts`). |
-| `BOT_STANDARD_REWARD_MULTIPLE` | `5.3` | How many times more a PAID standard solve returns than a paid verifiable one — the number that decides the tilt. Measured 2026-07-28 from gateway per-submission attribution (54,308 vs 10,181 NOOK); re-measure with `npm run mining:stats` (`src/mining.ts`). |
+| `BOT_STANDARD_REWARD_MULTIPLE` | measured (fallback `5.3`) | How many times more a PAID standard solve returns than a paid verifiable one — the number that decides the tilt. Since 2026-09-27 it is MEASURED from the settlements ledger (paid standard EV ÷ n-weighted paid verifiable EV, same evidence bar as the kind ranking); setting this var overrides the measurement. `5.3` (2026-07-28 attribution, 54,308 vs 10,181 NOOK) applies only while the ledger is too young. The tilt's survival side counts rejected standards as losses alongside expired ones (`src/mining.ts`). |
 | `BOT_VERIFIABLE_TILT_WINDOW_DAYS` | `10` | Lookback window for measuring per-kind survival rates (`src/mining.ts`). |
 | `BOT_GATEWAY_WATCHDOG_POLLS` | `3` (`0` disables) | Consecutive network-status polls with no epoch (gateway unreachable) before the daemon exits 70 so a supervisor restarts it into a fresh connection. Guards against the "process alive, earning nothing" failure that cost 53h on 2026-07-25 (`src/network-status.ts`). |
 | `BOT_MINING_SANDBOX` | on (`0` disables) | Run verifiable-code solutions in a local sandbox before submitting; hard compile/import failures skip the submit to preserve the epoch slot (`src/mining.ts`). |

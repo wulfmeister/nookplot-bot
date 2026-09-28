@@ -4,6 +4,52 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-09-27 — the tilt ignored rejected standards; penalty-box fix merged from upstream
+
+**What the tilt got wrong.** From 09-23 every standard trace we submitted
+was scored by one real verifier (0.5-0.8) plus two one-shot addresses at a
+flat ~0.15 on all four dimensions, pulling the average under the composite
+floor. Tally from `/v1/mining/submissions/:id/verifications`: 22 distinct
+low-score addresses, none seen twice; the three accounts that verify each
+other's python_tests at 0.63-0.89 score other solvers' standards ~0.1. Since
+09-17: 7 verified, 17 rejected, 14 expired. python_tests are machine-graded
+(comp fixed 0.72) and unaffected, 34/39 verified.
+
+The picker still put standards first. `loadTiltInputs` counted standard
+`verified` + `expired` as resolved and skipped `rejected` entirely — while
+the verifiable side DID count its rejections — and multiplied survival by
+the 07-28 constant 5.3. On the live 10-day window that read 28 resolved,
+64% loss, EV 1.89 vs 0.85 → "standard first", with 28 rejections unseen.
+
+Fixed, both halves:
+- `tallyTiltOutcomes` (pure) counts a rejected standard as resolved AND lost.
+  `standardExpiredShare` is renamed `standardLossShare` to say what it is.
+- `measuredStandardRewardMultiple` (pure) derives the multiple from the
+  settlements ledger: paid standard EV ÷ n-weighted paid verifiable EV, using
+  the kind ranking's own evidence bar. `BOT_STANDARD_REWARD_MULTIPLE` still
+  overrides; 5.3 is now only the young-ledger fallback. The kind-EV read moved
+  ahead of the tilt so the tilt can use it.
+- The tilt reason now logs every poll, active or not, with the multiple's
+  source. Only an ACTIVE tilt printed before, which is why this was invisible.
+
+Live result at the restart: 56 resolved, 82% loss, multiple 1.49 measured →
+standard EV 0.27 vs verifiable 0.85 → tilt active, python_tests first until
+they fill 60% of the rolling day (`BOT_VERIFIABLE_TILT`). The 40% standard
+remainder is deliberate: it keeps the ledger sampling standards, so the tilt
+turns itself off if the farm leaves.
+
+**Penalty box.** The parse-fail bench expiry (24h after the arm's last
+`mining_solve` call) already existed upstream as 5557377, committed 09-24
+21:01 and never pulled into this checkout, so the running bot lacked it.
+Merged rather than rewritten; its override test pinned the old deepseek
+default and was repointed to claude-opus-5-5. Known property, not changed:
+a successful probe does not lift the bench while the last-10 rate stays at
+or over 30%. Simulated with the real functions on the 09-01 shape (7 ok then
+3 empty responses): the arm is re-benched after every passing daily probe
+and is fully back only after the 8th, on day 8. Bounded, but slow.
+
+Tests 572 → 578; tsc clean.
+
 ## 2026-09-24 — python_tests → claude-opus-5-5; two summary bugs the deepseek swap exposed
 
 Operator: "fix the two bugs and put python_tests on opus-5-5." The model name

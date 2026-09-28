@@ -18,6 +18,11 @@ items graduate out of this file when they ship (see CHANGELOG / git history).
   EV comparison itself (`BOT_STANDARD_REWARD_MULTIPLE`, measured 5.3x), which
   correctly reports "standard first" on current data. Lesson: rank by NOOK
   per slot, never by a survival rate alone.
+  *2026-09-27 counter-evidence:* the same EV test then mis-ranked in the other
+  direction — it ignored REJECTED standards and kept multiplying by July's
+  5.3 while a Sybil scoring farm rejected most standards (18% survival,
+  measured multiple 1.49). Fixed by counting rejections as losses and
+  measuring the multiple from the settlements ledger; see CHANGELOG.
 - [x] **Don't solve into starvation.** RESOLVED — as "no action needed",
   which the numbers above make explicit. Both proposed responses lose money
   at any starvation level yet observed: idling a slot earns 0, and switching
