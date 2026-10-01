@@ -18,6 +18,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import {
   parseJevAnswers, jevDecide, _resetJevForTests, jevPausedUntil, triageFromAnswers, compareTriage, checkFromAnswers, aucOf, jevCheckReport, JEV_PAUSE_MS,
+  jevPauseMs, JEV_PAUSE_CAP_MS, REPLIED_TRIAGE,
 } from "../jev.js";
 import assert from "node:assert/strict";
 
@@ -83,7 +84,7 @@ import {
 } from "../onboarding.js";
 import { normalizeWorkspaceContent, statusForRegion, REGION_DEFAULT_STATUS } from "../workspace-solve.js";
 import { traceTextFromIpfsPayload, isWellFormedCid, cidRejectReason, isPermanentCidError, isTransientIpfsGatewayError, extractTraceCid, cidBearingKeys } from "../trace-payload.js";
-import { traceTextFromGatewayBody, fallbackGateways, fetchTraceViaPublicGateways } from "../ipfs-fetch.js";
+import { traceTextFromGatewayBody, fallbackGateways, fetchTraceViaPublicGateways, publicGatewaysAllBlocked, _resetGatewayBlocksForTests } from "../ipfs-fetch.js";
 import {
   SkipCache,
   isDiversityBlockError,
@@ -3968,13 +3969,13 @@ describe("specificity-gate techniques matcher (post-2026-07-28 tightening)", () 
     assert.equal(specificityCategories('Uses the "fast" path when possible.').techniques, false);
   });
   it("still credits real method names", () => {
-    // 2026-09-24: these three used to be TRUE. The gateway's own rejection text
-    // says "technique names (no camelCase/quoted method names)" and "function
-    // names ... don't increase specificity" — and 9/24 deepseek summaries that
-    // passed on bare snake_case / calls / dotted members scored techniques +0.
-    assert.equal(specificityCategories("Uses bisect_right to find the insertion point.").techniques, false);
-    assert.equal(specificityCategories("Calls urlsplit() on the raw input first.").techniques, false);
-    assert.equal(specificityCategories("Delegates to Map.get for O(1) lookup.").techniques, false);
+    // 2026-09-24 flipped these three to false; 2026-10-01 restored them — that
+    // evidence came from python summaries the gateway never scored (it scores
+    // `reasoning` on code kinds). On accepted STANDARD summaries the narrow
+    // mirror failed 9 more of 49 than this one.
+    assert.equal(specificityCategories("Uses bisect_right to find the insertion point.").techniques, true);
+    assert.equal(specificityCategories("Calls urlsplit() on the raw input first.").techniques, true);
+    assert.equal(specificityCategories("Delegates to Map.get for O(1) lookup.").techniques, true);
     // Backticked, the same identifiers score — as `code`, the category the gateway credits.
     assert.equal(specificityCategories("Uses `bisect_right` to find the insertion point.").code, true);
     assert.equal(specificityCategories('Wraps "json.loads" instead of pickle.').techniques, true);
@@ -5401,12 +5402,13 @@ describe("2026-09-24 regressions: empty-summary length floor + snake_case/filena
     assert.ok(!out.includes("Challenge: T"), "no challenge grounding when the model wrote a real summary");
     assert.ok(out.length >= 100);
   });
-  it("passesSpecificityGate rejects the deepseek-style summary that used to false-pass", () => {
-    // snake_case function name + bare filename + the word "error": local gate said pass, gateway scored all six +0.
+  it("the 09-24 'false pass' example passes again — it was judged on a field the gateway does not score for code kinds", () => {
+    // Kept as a record of the reversal (2026-10-01): this python summary was never
+    // what the gateway scored; on code kinds it scores `reasoning`.
     const s = "Implemented pick_and_run in solution.py with error handling and path checks using os.path.realpath before running the command.";
-    assert.equal(specificityCategories(s).techniques, false);
-    assert.equal(specificityCategories(s).code, false);
-    assert.equal(passesSpecificityGate(s), false);
+    assert.equal(specificityCategories(s).techniques, true);
+    assert.equal(specificityCategories(s).code, true);
+    assert.equal(passesSpecificityGate(s), true);
     // The gateway-credited forms do pass: a backticked identifier + a failure mode.
     assert.equal(passesSpecificityGate("Resolves the target with `os.path.realpath` and rejects '..' escapes, which fails closed on traversal."), true);
     // A quoted method name counts as a technique (gateway: "camelCase/quoted method names").
@@ -5660,5 +5662,177 @@ describe("2026-10-01 SUMMARY_SPECIFICITY_RULE is pinned to the local gate (they 
       "`subprocess.run` gets an argv list (no shell), and the missing-file edge case returns -1 after 2 checks per path.";
     assert.ok(followed.length < 450);
     assert.equal(passesSpecificityGate(followed), true);
+  });
+});
+
+describe("2026-10-01 pool trace format + public-gateway rate-limit handling", () => {
+  // Exact shape of a production pool trace pinned on IPFS.
+  const POOL_BODY = '{"format":"reasoning_v1","reasoning":"## Approach\\nUse a bounded queue instead of an unbounded list; the edge case of an empty input returns []."}';
+  it("traceTextFromIpfsPayload reads the reasoning field (primary-gateway path)", () => {
+    const out = traceTextFromIpfsPayload(JSON.parse(POOL_BODY));
+    assert.ok(out && out.startsWith("## Approach"), `got ${out}`);
+  });
+  it("traceTextFromGatewayBody returns the markdown, not raw JSON (public-gateway path)", () => {
+    const out = traceTextFromGatewayBody(POOL_BODY);
+    assert.ok(out && out.startsWith("## Approach") && !out.startsWith("{"), `got ${out}`);
+  });
+  it("a 429 blocks that gateway for 20 min and publicGatewaysAllBlocked reports it; no second request goes out", async () => {
+    const prev = process.env.BOT_IPFS_FALLBACK_GATEWAYS;
+    process.env.BOT_IPFS_FALLBACK_GATEWAYS = "https://gw1/ipfs/";
+    _resetGatewayBlocksForTests();
+    let calls = 0;
+    const f = (async () => { calls++; return new Response("<html>challenge</html>", { status: 429, headers: { "cf-mitigated": "challenge" } }); }) as unknown as typeof fetch;
+    try {
+      assert.equal(publicGatewaysAllBlocked(), false);
+      assert.equal(await fetchTraceViaPublicGateways("QmWhatever", 1000, f), null);
+      assert.equal(publicGatewaysAllBlocked(), true);
+      assert.equal(await fetchTraceViaPublicGateways("QmOther", 1000, f), null);
+      assert.equal(calls, 1, "a blocked gateway must not be re-hit");
+    } finally {
+      _resetGatewayBlocksForTests();
+      if (prev === undefined) delete process.env.BOT_IPFS_FALLBACK_GATEWAYS; else process.env.BOT_IPFS_FALLBACK_GATEWAYS = prev;
+    }
+  });
+});
+
+describe("test isolation (2026-10-01): the suite must never hold the production Venice key", () => {
+  it("VENICE_API_KEY is blank or a short test value under npm test", () => {
+    const k = process.env.VENICE_API_KEY ?? "";
+    assert.ok(k.length < 20, "a real-looking Venice key is loaded in the test process — run via `npm test`, which blanks it");
+  });
+});
+
+describe("2026-10-01 review fixes: jev breaker escalation, replied threads, transport-timeout causes", () => {
+  it("jevPauseMs doubles per consecutive trip and caps at 24h", () => {
+    assert.equal(jevPauseMs(1), JEV_PAUSE_MS);
+    assert.equal(jevPauseMs(2), 2 * JEV_PAUSE_MS);
+    assert.equal(jevPauseMs(3), 4 * JEV_PAUSE_MS);
+    assert.equal(jevPauseMs(50), JEV_PAUSE_CAP_MS);
+  });
+  it("a 404 latches Jev off for the process — no further network calls", async () => {
+    _resetJevForTests();
+    const saved = process.env.VENICE_API_KEY;
+    const savedJev = process.env.BOT_JEV;
+    process.env.VENICE_API_KEY = "test-key";
+    delete process.env.BOT_JEV; // npm test sets BOT_JEV=0
+    let calls = 0;
+    const f = (async () => { calls++; return new Response("{}", { status: 404 }); }) as unknown as typeof fetch;
+    try {
+      assert.equal(await jevDecide({}, {}, { fetchImpl: f, onCost: () => {}, nowMs: 1 }), null);
+      assert.equal(await jevDecide({}, {}, { fetchImpl: f, onCost: () => {}, nowMs: 10 * 24 * 3600_000 }), null);
+      assert.equal(calls, 1, "latched: even days later no call goes out");
+    } finally {
+      _resetJevForTests();
+      if (saved === undefined) delete process.env.VENICE_API_KEY; else process.env.VENICE_API_KEY = saved;
+      if (savedJev === undefined) delete process.env.BOT_JEV; else process.env.BOT_JEV = savedJev;
+    }
+  });
+  it("a thread whose latest message is OURS ranks below 'read' and above 'low'", () => {
+    const mk = (label: any, priority: number) => ({ label, priority, category: "x", categoryConfidence: 1 });
+    const sorted = [mk("low", 1.0), REPLIED_TRIAGE, mk("read", 1.6), mk("act", 2.6)].sort(compareTriage).map((x) => x.label);
+    assert.deepEqual(sorted, ["act", "read", "replied", "low"]);
+  });
+  it("undici header/body timeouts classify like our own abort (one retry max)", async () => {
+    const { isTransportTimeoutCause } = await import("../venice.js");
+    assert.equal(isTransportTimeoutCause("UND_ERR_HEADERS_TIMEOUT"), true);
+    assert.equal(isTransportTimeoutCause("UND_ERR_BODY_TIMEOUT"), true);
+    assert.equal(isTransportTimeoutCause("UND_ERR_SOCKET"), false);
+    assert.equal(isTransportTimeoutCause(undefined), false);
+  });
+});
+
+describe("2026-10-01 follow-ups from the fix review", () => {
+  const fetchFailed = (code: string) => Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("x"), { code }) });
+
+  it("classifyChatError: transport timeouts are abort-class; the cause code is surfaced; the original prefix is kept", async () => {
+    const { classifyChatError } = await import("../venice.js");
+    const h = classifyChatError(fetchFailed("UND_ERR_HEADERS_TIMEOUT"), 301_000);
+    assert.equal(h.isAbort, true);
+    assert.equal(h.transient, true);
+    assert.equal(h.error.message, "fetch failed (UND_ERR_HEADERS_TIMEOUT)");
+    assert.match(h.error.message, /^fetch failed/, "mining's isTransientGenerationError matches on this prefix");
+    const ab = classifyChatError(Object.assign(new Error("This operation was aborted"), { name: "AbortError" }), 600_000);
+    assert.equal(ab.isAbort, true);
+    assert.equal(ab.error.message, "This operation was aborted", "aborts carry no cause and are not wrapped");
+  });
+  it("classifyChatError: a socket loss is a normal transient when fast, abort-class (one retry) when late in a long call", async () => {
+    const { classifyChatError, LATE_SOCKET_LOSS_MS } = await import("../venice.js");
+    const fast = classifyChatError(fetchFailed("UND_ERR_SOCKET"), 200);
+    assert.deepEqual([fast.isAbort, fast.transient], [false, true]);
+    const late = classifyChatError(fetchFailed("ECONNRESET"), LATE_SOCKET_LOSS_MS + 1);
+    assert.deepEqual([late.isAbort, late.transient], [true, true]);
+  });
+  it("classifyChatError: 402s and 400s are not transient (never retried into a spend limit)", async () => {
+    const { classifyChatError } = await import("../venice.js");
+    const e = classifyChatError(new Error('Venice API 402: {"error":"API key DIEM spend limit exceeded."}'), 50);
+    assert.deepEqual([e.isAbort, e.transient], [false, false]);
+    const b = classifyChatError(new Error("Venice API 503: busy"), 50);
+    assert.equal(b.transient, true);
+  });
+
+  it("tick guard: skips a same-label run while one is pending, releases on resolve, reject and sync throw", async () => {
+    const { safe, _ticksInFlightForTests } = await import("../tick-guard.js");
+    let release!: () => void;
+    let runs = 0;
+    const slow = () => new Promise<void>((r) => { runs++; release = r; });
+    const p1 = safe("t-guard-a", slow);
+    const p2 = await safe("t-guard-a", slow);
+    assert.equal(p2, undefined);
+    assert.equal(runs, 1, "the second run must not start");
+    release(); await p1;
+    assert.equal(_ticksInFlightForTests().has("t-guard-a"), false, "released after resolve");
+    await safe("t-guard-b", async () => { throw new Error("boom"); });
+    assert.equal(_ticksInFlightForTests().has("t-guard-b"), false, "released after reject");
+    await safe("t-guard-c", (() => { throw new Error("sync"); }) as unknown as () => Promise<void>);
+    assert.equal(_ticksInFlightForTests().has("t-guard-c"), false, "released after a synchronous throw");
+  });
+  it("tick guard: allowOverlap lets an idempotent, time-critical tick run concurrently", async () => {
+    const { safe } = await import("../tick-guard.js");
+    let concurrent = 0, peak = 0;
+    const hb = async () => { concurrent++; peak = Math.max(peak, concurrent); await new Promise((r) => setTimeout(r, 20)); concurrent--; };
+    await Promise.all([safe("t-hb", hb, { allowOverlap: true }), safe("t-hb", hb, { allowOverlap: true })]);
+    assert.equal(peak, 2);
+  });
+  it("spareStrikeWhileBlocked spares at most 4 strikes per submission", async () => {
+    const { spareStrikeWhileBlocked } = await import("../tick-guard.js");
+    const m = new Map<string, number>();
+    const got = Array.from({ length: 6 }, () => spareStrikeWhileBlocked(m, "sub-1"));
+    assert.deepEqual(got, [true, true, true, true, false, false]);
+    assert.equal(spareStrikeWhileBlocked(m, "sub-2"), true, "per submission");
+  });
+
+  it("jev pause escalates through jevDecide and resets on success", async () => {
+    _resetJevForTests();
+    const savedKey = process.env.VENICE_API_KEY, savedJev = process.env.BOT_JEV;
+    process.env.VENICE_API_KEY = "test-key"; delete process.env.BOT_JEV;
+    const f429 = (async () => new Response("{}", { status: 429 })) as unknown as typeof fetch;
+    const ok = (async () => new Response(JSON.stringify({ answers: { q: { type: "noul", noul: 0.5 } }, usage: { input_tokens: 10 } }), { status: 200 })) as unknown as typeof fetch;
+    try {
+      const t0 = 1_000_000;
+      await jevDecide({}, {}, { fetchImpl: f429, onCost: () => {}, nowMs: t0 });
+      assert.equal(jevPausedUntil(), t0 + JEV_PAUSE_MS);
+      const t1 = t0 + JEV_PAUSE_MS + 1;
+      await jevDecide({}, {}, { fetchImpl: f429, onCost: () => {}, nowMs: t1 });
+      assert.equal(jevPausedUntil(), t1 + 2 * JEV_PAUSE_MS, "second consecutive trip doubles");
+      const t2 = t1 + 2 * JEV_PAUSE_MS + 1;
+      assert.ok(await jevDecide({}, {}, { fetchImpl: ok, onCost: () => {}, nowMs: t2 }));
+      const t3 = t2 + 1;
+      await jevDecide({}, {}, { fetchImpl: f429, onCost: () => {}, nowMs: t3 });
+      assert.equal(jevPausedUntil(), t3 + JEV_PAUSE_MS, "a success resets the streak");
+    } finally {
+      _resetJevForTests();
+      if (savedKey === undefined) delete process.env.VENICE_API_KEY; else process.env.VENICE_API_KEY = savedKey;
+      if (savedJev === undefined) delete process.env.BOT_JEV; else process.env.BOT_JEV = savedJev;
+    }
+  });
+
+  it("a quoted filename is code, not a technique (no double credit from the union)", () => {
+    assert.equal(specificityCategories('Writes "data.json" atomically.').techniques, false);
+    assert.equal(passesSpecificityGate('Writes "data.json" atomically.'), false);
+    assert.equal(specificityCategories('Parses with "json.loads" first.').techniques, true);
+  });
+  it("reasoning is read LAST — a payload with both content and reasoning keeps content", () => {
+    assert.equal(traceTextFromIpfsPayload({ content: "the trace", reasoning: "the CoT" }), "the trace");
+    assert.equal(traceTextFromIpfsPayload({ content: "   ", reasoning: "fallback text" }), "fallback text");
   });
 });

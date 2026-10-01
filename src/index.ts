@@ -10,7 +10,8 @@ import { findTemplateFingerprint, findNearDuplicateTrace, nearDupeCorpus, applyO
 import { webSearch, arxivSearch, formatResultsForPrompt, type SearchResult } from "./research.js";
 import { refine } from "./refine.js";
 import { traceTextFromIpfsPayload, isWellFormedCid, cidRejectReason, isPermanentCidError, isTransientIpfsGatewayError, extractTraceCid, cidBearingKeys, type CidStatus } from "./trace-payload.js";
-import { fetchTraceViaPublicGateways } from "./ipfs-fetch.js";
+import { fetchTraceViaPublicGateways, publicGatewaysAllBlocked } from "./ipfs-fetch.js";
+import { safe, spareStrikeWhileBlocked } from "./tick-guard.js";
 import { computeVerifyBatch, pollsRemainingBeforeUtcReset } from "./verify-batch.js";
 import { VERIFY_CALIBRATION_PROMPT } from "./verify-calibration.js";
 import {
@@ -557,6 +558,9 @@ function markComprehensionGated(id: string): void {
 // FETCH_STRIKE_LIMIT times (≈ that many 6h cycles of grace for genuinely-slow
 // IPFS propagation), retire it permanently like the hex-fake spam.
 const FETCH_STRIKE_LIMIT = Number(process.env.BOT_VERIFY_FETCH_STRIKE_LIMIT ?? 3);
+// Strikes spared because the public IPFS fallback was rate-limited (bounded per
+// submission by spareStrikeWhileBlocked — 2026-10-01 review).
+const strikesSparedWhileBlocked = new Map<string, number>();
 const traceFetchStrikes = new Map<string, number>();
 /** Record a transient trace-fetch failure; returns true once the sub should be
  *  retired permanently (strikes exhausted) rather than deferred again. */
@@ -965,6 +969,13 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
         verifiedSubmissions.add(sub.id);
         persistPermanentCidSkip(sub.id, "malformed/invalid trace CID");
         console.log(`   ⏭ trace CID permanently invalid${gateNote} — skipping ${sub.id.slice(0, 8)} (no re-defer)`);
+        return true;
+      }
+      // A rate-limited public fallback says nothing about the CID — re-defer
+      // without a strike, or a temporary block becomes a 14-day retirement.
+      if (publicGatewaysAllBlocked() && spareStrikeWhileBlocked(strikesSparedWhileBlocked, sub.id)) {
+        markComprehensionGated(sub.id);
+        console.log(`   ⏸ full trace unavailable while the public IPFS fallback is rate-limited — deferring ${sub.id.slice(0, 8)} without a strike (${strikesSparedWhileBlocked.get(sub.id)}/4 spared)`);
         return true;
       }
       // Deterministic 502s mean dead/unpinned content — retire after a few
@@ -1532,8 +1543,8 @@ async function startVerificationLoop(runtime: ReturnType<typeof getRuntime>) {
   setTimeout(() => safe("dimensionWatch", () => recordDimensionSnapshot(runtime)), 90 * 1000);
   setInterval(() => safe("dimensionWatch", () => recordDimensionSnapshot(runtime)), 30 * 60 * 1000);
   // RLM spot-check verification — separate 10/day cap, separate queue.
-  setTimeout(() => runRlmSpotCheckLoop(runtime), 90 * 1000);
-  setInterval(() => runRlmSpotCheckLoop(runtime), 8 * 60 * 1000);
+  setTimeout(() => safe("rlmSpotCheckTick", () => runRlmSpotCheckLoop(runtime)), 90 * 1000);
+  setInterval(() => safe("rlmSpotCheckTick", () => runRlmSpotCheckLoop(runtime)), 8 * 60 * 1000);
 }
 
 async function handleBountyOpportunity(runtime: ReturnType<typeof getRuntime>, opp: OpportunityEvent) {
@@ -2353,17 +2364,17 @@ async function startMiningLoop(runtime: ReturnType<typeof getRuntime>) {
 }
 
 async function startCrowdJuryLoop(runtime: ReturnType<typeof getRuntime>) {
-  setTimeout(() => scoreCrowdJurySubmissions(runtime, { dryRun: config.dryRun }), 2 * 60 * 1000);
+  setTimeout(() => safe("crowdJuryTick", () => scoreCrowdJurySubmissions(runtime, { dryRun: config.dryRun })), 2 * 60 * 1000);
   crowdJuryInterval = setInterval(
-    () => scoreCrowdJurySubmissions(runtime, { dryRun: config.dryRun }),
+    () => safe("crowdJuryTick", () => scoreCrowdJurySubmissions(runtime, { dryRun: config.dryRun })),
     10 * 60 * 1000,
   );
 }
 
 async function startLearningsLoop(runtime: ReturnType<typeof getRuntime>) {
-  setTimeout(() => publishPostSolveLearnings(runtime, { dryRun: config.dryRun }), 5 * 60 * 1000);
+  setTimeout(() => safe("learningsTick", () => publishPostSolveLearnings(runtime, { dryRun: config.dryRun })), 5 * 60 * 1000);
   learningsInterval = setInterval(
-    () => publishPostSolveLearnings(runtime, { dryRun: config.dryRun }),
+    () => safe("learningsTick", () => publishPostSolveLearnings(runtime, { dryRun: config.dryRun })),
     30 * 60 * 1000,
   );
 }
@@ -2421,12 +2432,7 @@ async function startObservationLoop(runtime: ReturnType<typeof getRuntime>) {
 // here only wire up the cadence. Every callback swallows its own errors so
 // one failed track never affects the others.
 
-function safe<T>(label: string, fn: () => Promise<T>): Promise<T | undefined> {
-  return fn().catch((err) => {
-    console.warn(`⚠ ${label}: ${(err as Error).message.slice(0, 150)}`);
-    return undefined;
-  });
-}
+// safe() — the in-flight tick guard — lives in tick-guard.ts (testable).
 
 async function startBountyLoop(runtime: ReturnType<typeof getRuntime>) {
   setTimeout(() => safe("bountyTick", () => runBountyTick(runtime)), 4 * 60_000);
@@ -2454,7 +2460,7 @@ async function startSwarmsLoop(runtime: ReturnType<typeof getRuntime>) {
   // a ping every 2-5 min); the old 30-min cadence silently lost every claim.
   const heartbeatMs = Number(process.env.BOT_SWARM_HEARTBEAT_MS ?? 2 * 60_000);
   swarmHeartbeatInterval = setInterval(
-    () => safe("swarmHeartbeat", () => heartbeatHeldSubtasks(runtime)),
+    () => safe("swarmHeartbeat", () => heartbeatHeldSubtasks(runtime), { allowOverlap: true }),
     heartbeatMs,
   );
   // Auto-solve held subtasks (default OFF). Cadence wider — solving is expensive.

@@ -4,6 +4,96 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-10-01 (c) — pre-push review: 110 agents, 29 confirmed findings, several of them mine
+
+Before pushing the Pinata swap, the operator asked for everything to be tested
+by subagents first. Eight specialist reviewers (tests, tilt, roster/timeouts,
+Jev, summary gate, IPFS, privacy, live production) plus three adversarial
+verifiers per finding: 29 confirmed, 3 refuted, 64 low/info kept as ideas.
+Corrections to claims made earlier today and yesterday are recorded here
+rather than by editing those entries.
+
+**Fixed in this commit:**
+- **The 600s timeout floor (d2af8aa) never took effect.** Node 24's built-in
+  fetch (undici 7.16) has its own 300s headersTimeout/bodyTimeout, which fired
+  first: ~half of grok-4-7 mining generations died at ~303s as a bare "fetch
+  failed" (cause UND_ERR_HEADERS_TIMEOUT). Venice calls now go through a
+  dedicated undici Agent with transport limits above the longest per-call
+  timeout, so our AbortController decides; the cause code is surfaced in the
+  error and header/body timeouts are treated like an abort (one retry).
+  Verified locally against a fake server (no Venice calls): a 320s response
+  that previously failed now completes; abort still fires on time. Scoped to
+  Venice only — a global dispatcher would strip the only timeout from the
+  Nookplot SDK's requests. Adds `undici@7.16.0` (Node's bundled version).
+- **In-flight guard in `safe()`.** Challenge posting stacked 7 concurrent
+  runs on 2026-09-30 after lid-close wakes; with longer calls overlaps grow.
+  A tick whose previous run is still going is now skipped; crowd-jury,
+  learnings and RLM ticks route through `safe()` too.
+- **Pool traces are `{"format":"reasoning_v1","reasoning":"…"}`** and the
+  payload parser never read `reasoning`: a primary-gateway 200 parsed to null
+  (deferred, struck) and public-gateway recoveries handed the verifier raw
+  JSON. Parsed now.
+- **A rate-limited public gateway (429 / Cloudflare challenge) is skipped for
+  20 min and the verify lane re-defers without a fetch strike**, so a
+  temporary block can't become a 14-day retirement.
+- **The 2026-09-24 specificity-mirror narrowing was based on the wrong
+  field.** On python_tests/js/exact_answer the gateway stores and length-checks
+  `reasoning`, not `traceSummary` (51/51 accepted code submissions store our
+  reasoning text as their traceSummary), so the python summaries cited on
+  09-24 were never what the gateway scored. On 49 accepted STANDARD summaries
+  the narrowed mirror passed 30 vs 39 and appended needless "Specifics:"
+  tails. Restored as the union of the original arms plus the quoted-method
+  arm; the two tests that encoded the wrong theory are flipped and annotated.
+  The 2026-09-21 diagnosis ("empty summary shipped as template") is likewise
+  superseded for code kinds — see the proposal below.
+- **Inbox triage ranked our own outbound messages.** Threads whose latest
+  message we sent (direction=sent) were scored as inbound "act" — 3 of the
+  first 6. They now get a fixed "replied" state below "read", with no Jev call.
+- **Jev breaker:** pauses escalate (30 min doubling, capped at 24h) and reset
+  only on success; a 400/401/403/404 latches Jev off for the process. The
+  shadow verdict is now keyed to the submission it actually judged, not a
+  later fix-retry's id.
+- **Test isolation:** `npm test` blanks VENICE_API_KEY, sets BOT_JEV=0 and
+  points the Venice base URL at a dead port; a guard test asserts no real key
+  is loaded.
+- The local (untracked) pre-push privacy guard's word-boundary patterns never
+  matched under macOS `git grep -E`; switched to `-P` and verified against a
+  planted test file.
+- The Pinata commit's message claimed "zero successful fallbacks ever"; the
+  log has 1,000+ recoveries through ~08-24. Corrected before it was pushed.
+
+**Second adversarial pass over these fixes** (5 reviewers + 2 skeptics per
+finding, 45 agents): no blockers. Folded in from it: a socket loss late in a
+long generation now gets the abort-style one-retry cap (3 × a 10-min call is
+~30 min of a slot); the no-strike re-defer is bounded at 4 spared strikes per
+submission so a fallback that stays blocked can't keep dead CIDs from
+retiring; `reasoning` is read LAST (purely additive, whitespace ignored); a
+quoted filename no longer counts as a technique (the union had double-credited
+it); the restored call regex has bounded repetition (it was quadratic on long
+dotted runs); `BOT_MIN_CALL_TIMEOUT_MS` is sanitized (undici rejects a
+non-integer on every call); the swarm heartbeat opts out of the overlap guard
+(idempotent and time-critical); `safe()` moved to `tick-guard.ts` with tests;
+the chat() error classification is a pure, table-tested `classifyChatError`;
+`undici` is pinned to 7.16.0 and `engines.node` raised to >=20.18.1 to match.
+A 320s fake-server response now completes through the real `chat()`.
+
+**Proposed, not done (operator's call):**
+1. Point the code-kind summary pipeline at `reasoning` — the field the gateway
+   actually stores and length-checks for python/js/exact — and drop the local
+   skip there (50 of 51 accepted reasonings fail the current mirror).
+2. A shared Venice 402/lockout stand-down for every loop (mining kept renewing
+   guild claims into 402s; verify dropped candidates on 402).
+3. Verify should mark a submission done only on success or a permanent
+   gateway outcome, not on a 402/transport failure.
+4. Ledger rows for failed/abandoned Venice calls.
+5. Rank challenges by survival × composite × baseReward (kind-EV currently
+   folds difficulty into "kind").
+6. A tilt starvation guard when verifiable attempts keep failing locally.
+7. Reject fabricated `Qm…` CIDs whose multihash prefix isn't 0x1220.
+8. An opt-in fallback model for transient failures in the one-model pool.
+
+Tests 592 → 609.
+
 ## 2026-10-01 (b) — summary instructions rewritten: they taught the one category the gate counts least
 
 With grok-4-7 everywhere, 3 of 3 python solves after the timeout fix were

@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { writeFileSync } from "node:fs";
 import type { NookplotRuntime } from "@nookplot/runtime";
 import { NOOK_DIR, readJsonl, appendJsonl } from "./util.js";
-import { jevTriageMessage, compareTriage, labelTriage, TRIAGE_ICON, type InboxTriage } from "./jev.js";
+import { jevTriageMessage, compareTriage, labelTriage, TRIAGE_ICON, REPLIED_TRIAGE, type InboxTriage } from "./jev.js";
 
 type RuntimeLike = Pick<NookplotRuntime, "connection">;
 
@@ -91,6 +91,8 @@ export async function runInboxWatchTick(runtime: RuntimeLike): Promise<void> {
     if (triaged >= TRIAGE_MAX_PER_TICK) break;
     const key = threadKey(t);
     const text = String(t.lastMessage ?? "").trim();
+    // Our own outbound message: fixed "replied" state, no Jev call.
+    if (t.direction === "sent") continue;
     if (triageByKey.has(key) || !text) continue;
     const triage = await jevTriageMessage({ from: t.otherName ?? t.otherAddress, messageType: t.messageType, text });
     if (!triage) break; // Jev paused/disabled/failing — stop, try next tick
@@ -98,7 +100,7 @@ export async function runInboxWatchTick(runtime: RuntimeLike): Promise<void> {
     triaged++;
     appendJsonl(TRIAGE_LOG, { ts: new Date().toISOString(), key, threadId: t.id ?? t.threadId, from: t.otherName ?? t.otherAddress, triage });
   }
-  const triageOf = (t: InboxThread) => triageByKey.get(threadKey(t)) ?? null;
+  const triageOf = (t: InboxThread) => (t.direction === "sent" ? REPLIED_TRIAGE : triageByKey.get(threadKey(t)) ?? null);
 
   // Snapshot for the dashboard (always overwrite with the current view).
   const snapshot = {
@@ -138,7 +140,11 @@ export async function runInboxWatchTick(runtime: RuntimeLike): Promise<void> {
     const body = String(t.lastMessage ?? "").replace(/\s+/g, " ").slice(0, 220);
     const tri = triageOf(t);
     if (tri) labels[tri.label] = (labels[tri.label] ?? 0) + 1;
-    const tag = tri ? `${TRIAGE_ICON[tri.label]} ${tri.label} (${tri.category}, ${tri.priority.toFixed(1)}/3) ` : "";
+    const tag = !tri
+      ? ""
+      : tri.label === "replied"
+        ? `${TRIAGE_ICON.replied} replied, awaiting their reply · `
+        : `${TRIAGE_ICON[tri.label]} ${tri.label} (${tri.category}, ${tri.priority.toFixed(1)}/3) `;
     console.log(
       `📬 ${tag}DM from ${from} (${(t.otherAddress ?? "").slice(0, 12)}, ${t.messageType ?? "dm"}, unread ${t.unreadCount ?? 0}): ${body}`,
     );

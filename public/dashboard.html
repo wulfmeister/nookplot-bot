@@ -1403,10 +1403,12 @@ function renderInbox() {
   const age = d.ageMinutes == null ? "" : ` · updated ${d.ageMinutes}m ago`;
   if (meta) meta.textContent = `— ${d.unread} unread across ${d.threadCount} threads${age}`;
   // Jev triage badge (2026-09-29): threads arrive already sorted risky/act first.
-  const TRI = { risky: ["⚠️", "var(--red, #e5534b)"], act: ["🔴", "var(--red, #e5534b)"], read: ["🟡", "var(--amber, #d6a132)"], low: ["⚪", "var(--muted, #8b949e)"], ignore: ["🗑", "var(--muted, #8b949e)"] };
+  const TRI = { risky: ["⚠️", "var(--red, #e5534b)"], act: ["🔴", "var(--red, #e5534b)"], read: ["🟡", "var(--amber, #d6a132)"], replied: ["↩️", "var(--muted, #8b949e)"], low: ["⚪", "var(--muted, #8b949e)"], ignore: ["🗑", "var(--muted, #8b949e)"] };
   const badge = (tr) => {
     if (!tr || !TRI[tr.label]) return "";
     const [icon, col] = TRI[tr.label];
+    // Our own outbound message: never scored by Jev, so show no score.
+    if (tr.label === "replied") return `<span style="color:${col}; font-size:11px; margin-right:6px">${icon} replied · awaiting their reply</span>`;
     const cat = String(tr.category || "").replace(/</g, "&lt;");
     return `<span style="color:${col}; font-size:11px; margin-right:6px" title="jev priority ${Number(tr.priority).toFixed(2)}/3">${icon} ${tr.label} · ${cat}</span>`;
   };

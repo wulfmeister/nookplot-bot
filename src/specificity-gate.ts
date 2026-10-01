@@ -56,28 +56,27 @@ export function specificityCategories(s: string): {
     // (urlsplit(), json.loads()), or a dotted member (Map.get). The dotted arm
     // excludes file extensions so "solution.py" stays a `code` hit only —
     // double-crediting it would rebuild the false pass this replaced.
-    // RECALIBRATED 2026-09-24 against the gateway's own rejection text:
-    // "technique names (no camelCase/quoted method names)" and "Avoid adding
-    // METADATA (reward amounts, function names, learning IDs) — those don't
-    // increase specificity". The snake_case / call / dotted-member arms added
-    // earlier credited exactly those function names: 9 of 24 deepseek
-    // python_tests summaries passed this gate locally on 2026-09-21 and the
-    // gateway scored every one of them techniques +0 (all six sub-scores +0).
-    // Pass evidence is now what the gateway names: camelCase, or a method name
-    // in quotes. snake_case identifiers still count when BACKTICKED — that is
-    // the `code` category below, which the gateway does credit.
-    // The quoted arm needs a METHOD shape (a dot, an underscore, a "()" call,
-    // or camelCase inside the quotes): the 2026-07-28 tightening found bare
-    // quoted literals ("http", "fast") lifted from source were never credited.
+    // HISTORY (kept, not rewritten): 2026-09-24 narrowed `techniques` to
+    // camelCase / quoted method names and `code` to backticks, citing 9 of 24
+    // deepseek python_tests summaries that passed locally yet scored +0.
+    // CORRECTED 2026-10-01 (pre-push review): on python_tests the gateway
+    // stores and scores the `reasoning` field, NOT traceSummary — those 9 were
+    // never scored on the text this mirror read, so they were no evidence
+    // against the snake_case / call / dotted / bare-filename arms. On 49
+    // gateway-ACCEPTED standard summaries (where traceSummary IS scored) the
+    // narrowed mirror passed 30 vs 39 for the original, and each extra local
+    // fail appended a "Specifics:" tail that reads as template spam. Restored
+    // as the UNION: every original arm plus the quoted-method arm. Bare quoted
+    // literals ("http", "fast") still don't count (2026-07-28 tightening).
     techniques: /\b[a-z]+[A-Z][A-Za-z]+\b/.test(s)
-      || /["'](?:[A-Za-z_][A-Za-z0-9]*(?:[._][A-Za-z0-9_.]{1,40}|\(\))|[a-z]+[A-Z][A-Za-z0-9]{1,40})["']/.test(s),
+      || /\b[a-z][a-z0-9]*_[a-z0-9_]+\b/.test(s)
+      // Repetition bounded: the unbounded form was quadratic on long dotted runs.
+      || /\b[A-Za-z_][A-Za-z0-9_]{0,63}(?:\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,8}\(/.test(s)
+      || /\b[A-Za-z_][A-Za-z0-9_]*\.(?!(?:py|ts|tsx|js|rs|go|java|cpp|c|h|md|json|yaml|toml|sh)\b)[A-Za-z_][A-Za-z0-9_]+\b/.test(s)
+      // A quoted FILENAME ("data.json") is code, not a technique — no double credit.
+      || /["'](?:[A-Za-z_][A-Za-z0-9]*(?:[._](?!(?:py|ts|tsx|js|rs|go|java|cpp|c|h|md|json|yaml|toml|sh)["'])[A-Za-z0-9_.]{1,40}|\(\))|[a-z]+[A-Z][A-Za-z0-9]{1,40})["']/.test(s),
     comparisons: /\b(vs\.?|versus|better than|instead of|compared to|outperforms?|worse than)\b/i.test(s),
-    // code: backtick-quoted identifiers only (gateway 2026-06-10: "code refs
-    // (no `backtick-quoted` identifiers...)"). A bare "solution.py" mention
-    // used to count here and was the other half of the 09-21 false passes;
-    // extractCategoryFragment still turns a filename INTO a backticked ref
-    // when enriching, which is the form that scores.
-    code: /`[^`]+`/.test(s),
+    code: /`[^`]+`/.test(s) || /\.(py|ts|tsx|js|rs|go|java|cpp|c|h|md|json|yaml|toml|sh)\b/.test(s),
     failures: /\b(fails?|broke|breaks?|error|pitfall|edge case|regress(?:ion|es)?|degrade)/i.test(s),
     actionable: /\b(use|pick|set|avoid|prefer|choose|switch to|enable|disable|fallback|retry)/i.test(s),
   };

@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { Agent, fetch as undiciFetch } from "undici";
 import { effortFor } from "./models.js";
 import { recordVeniceCall, shouldFireDailyAlert, veniceSpentToday } from "./venice-cost.js";
 
@@ -92,7 +93,71 @@ const MIN_COMPLETION_TOKENS = Number(process.env.BOT_MIN_COMPLETION_TOKENS ?? 50
  * BOT_MIN_CALL_TIMEOUT_MS. Worst case per hung call: 2 × floor (one
  * same-model abort retry).
  */
-const MIN_CALL_TIMEOUT_MS = Number(process.env.BOT_MIN_CALL_TIMEOUT_MS ?? 600_000);
+const MIN_CALL_TIMEOUT_MS = (() => {
+  const n = Number(process.env.BOT_MIN_CALL_TIMEOUT_MS ?? 600_000);
+  // undici rejects a non-integer timeout with UND_ERR_INVALID_ARG on EVERY
+  // call — a fractional or garbage env value must not silently stop inference.
+  return Number.isFinite(n) && n > 0 ? Math.ceil(n) : 600_000;
+})();
+
+/**
+ * Transport for Venice calls ONLY (2026-10-01). Node's built-in fetch (undici
+ * 7.16) applies its own 300s headersTimeout/bodyTimeout, which fired before
+ * any AbortController above 300s — so the 600s floor never took effect and
+ * about half of grok-4-7 mining generations died at ~303s with a bare "fetch
+ * failed" (cause UND_ERR_HEADERS_TIMEOUT; reproduced locally against a 600s
+ * controller). This agent lifts the transport limits above the longest
+ * per-call timeout (the 1,000s standard solve), so OUR AbortController decides.
+ * Scoped to Venice on purpose: a global dispatcher would also remove the only
+ * timeout on the Nookplot SDK's requests, which set no AbortSignal of their own.
+ */
+const VENICE_TRANSPORT_TIMEOUT_MS = Math.max(1_800_000, MIN_CALL_TIMEOUT_MS * 2);
+const VENICE_DISPATCHER = new Agent({
+  headersTimeout: VENICE_TRANSPORT_TIMEOUT_MS,
+  bodyTimeout: VENICE_TRANSPORT_TIMEOUT_MS,
+});
+
+/** Pure: undici transport-timeout causes behave like our own abort (one retry max). */
+export function isTransportTimeoutCause(code: unknown): boolean {
+  return code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT";
+}
+
+/** Socket-level losses: fast ones (a stale pooled socket, DNS) deserve the
+ *  normal retries; one that lands LATE in a long generation is the same
+ *  situation as a timeout and gets the one-retry cap (3 × a 10-min call is
+ *  ~30 min of a mining slot, and Venice may bill each attempt). */
+const SOCKET_LOSS_CODES = new Set(["UND_ERR_SOCKET", "ECONNRESET"]);
+export const LATE_SOCKET_LOSS_MS = 30_000;
+
+/**
+ * Pure: wrap a chat() failure with its transport cause code and decide its
+ * retry class. `isAbort` errors get at most one same-model retry; other
+ * `transient` errors get the normal 3 attempts; everything else throws.
+ */
+export function classifyChatError(err: unknown, elapsedMs: number): { error: Error; causeCode?: string; isAbort: boolean; transient: boolean } {
+  let error = err instanceof Error ? err : new Error(String(err));
+  const raw = (err as { cause?: { code?: unknown } })?.cause?.code;
+  const causeCode = typeof raw === "string" ? raw : undefined;
+  if (causeCode && !error.message.includes(causeCode)) {
+    // Surface the transport cause — a bare "fetch failed" hid the 300s
+    // headers timeout for two days (2026-09-29 → 10-01).
+    error = new Error(`${error.message} (${causeCode})`, { cause: err });
+  }
+  const m = error.message;
+  const lateSocketLoss = !!causeCode && SOCKET_LOSS_CODES.has(causeCode) && elapsedMs > LATE_SOCKET_LOSS_MS;
+  const isAbort = m.includes("aborted") || isTransportTimeoutCause(causeCode) || lateSocketLoss;
+  const transient =
+    isAbort ||
+    m.includes("timeout") ||
+    m.includes("ECONNRESET") ||
+    m.includes("ENOTFOUND") ||
+    m.includes("UND_ERR_CONNECT_TIMEOUT") ||
+    m.includes("UND_ERR_SOCKET") ||
+    m.includes("Venice API 502") ||
+    m.includes("Venice API 503") ||
+    m.includes("Venice API 504");
+  return { error, causeCode, isAbort, transient };
+}
 
 /** Pure: the timeout a chat() call actually gets. */
 export function effectiveTimeoutMs(requested?: number, floor = MIN_CALL_TIMEOUT_MS): number {
@@ -113,11 +178,13 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
   // (server default) and retry rather than failing the call.
   let effectiveTemperature = opts.temperature;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const attemptStart = Date.now();
     try {
       const ctrl = new AbortController();
       const timeoutId = setTimeout(() => ctrl.abort(), effectiveTimeoutMs(opts.timeoutMs));
       try {
-        const res = await fetch(`${BASE}/chat/completions`, {
+        const res = await undiciFetch(`${BASE}/chat/completions`, {
+          dispatcher: VENICE_DISPATCHER,
           method: "POST",
           headers: {
             Authorization: `Bearer ${KEY}`,
@@ -176,7 +243,8 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
         clearTimeout(timeoutId);
       }
     } catch (err) {
-      lastErr = err as Error;
+      const cls = classifyChatError(err, Date.now() - attemptStart);
+      lastErr = cls.error;
       // Capacity telemetry: a 429 means we hit the provider's rate limit for
       // this model. Recorded per-model so the dashboard can show whether
       // we're starting to max out inference capacity (veniceRateLimited429Today).
@@ -213,16 +281,7 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
       // same timeout usually re-times-out — 3 internal attempts stack to
       // 3×timeoutMs before the caller's cross-model failover (which is the
       // productive path) ever fires. One same-model retry max for aborts.
-      const isAbort = lastErr.message.includes("aborted");
-      const transient =
-        lastErr.message.includes("timeout") ||
-        lastErr.message.includes("ECONNRESET") ||
-        lastErr.message.includes("ENOTFOUND") ||
-        isAbort ||
-        lastErr.message.includes("UND_ERR_CONNECT_TIMEOUT") ||
-        lastErr.message.includes("Venice API 502") ||
-        lastErr.message.includes("Venice API 503") ||
-        lastErr.message.includes("Venice API 504");
+      const { isAbort, transient } = cls;
       if (!transient || attempt === maxAttempts - 1 || (isAbort && attempt >= 1)) throw lastErr;
       await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
     }

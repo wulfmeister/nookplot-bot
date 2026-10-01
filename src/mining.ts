@@ -2197,6 +2197,10 @@ async function discoverAndSolveMiningChallengesInner(
         continue;
       }
 
+      // The Jev shadow verdict judged THIS submission's code; a fix-retry below
+      // resubmits different code under a new id, so pin the id now.
+      const jevCheckedSubmissionId = sub.id;
+
       // Fix-retry: a verifiable challenge that FAILED its deterministic tests
       // gets re-solved with the exact failing test fed back, then resubmitted
       // (gateway grants up to 20 submissions/challenge). Recovers our #1
@@ -2281,10 +2285,10 @@ async function discoverAndSolveMiningChallengesInner(
             ? "deterministic-pass; awaiting reasoning/efficiency/novelty quorum"
             : undefined,
       });
-      if (jevCheck && sub.id) {
+      if (jevCheck && jevCheckedSubmissionId) {
         appendJsonl(JEV_CHECKS_LOG, {
           ts: new Date().toISOString(),
-          submissionId: sub.id,
+          submissionId: jevCheckedSubmissionId,
           challengeId: ch.id,
           kind: s.traceContent ? "standard" : kind,
           model: modelUsed,

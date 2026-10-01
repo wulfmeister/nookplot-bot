@@ -15,6 +15,10 @@
 interface IpfsTracePayload {
   traceMarkdown?: unknown;
   markdown?: unknown;
+  /** Pool traces are pinned as {"format":"reasoning_v1","reasoning":"…"} —
+   *  missed until 2026-10-01, so a primary-gateway 200 parsed to null (deferred
+   *  and struck) and public-gateway recoveries handed the verifier raw JSON. */
+  reasoning?: unknown;
   content?: unknown;
   body?: unknown;
   text?: unknown;
@@ -24,8 +28,10 @@ export function traceTextFromIpfsPayload(payload: unknown): string | null {
   if (typeof payload === "string") return payload;
   if (!payload || typeof payload !== "object") return null;
   const p = payload as IpfsTracePayload;
-  for (const v of [p.traceMarkdown, p.markdown, p.content, p.body, p.text]) {
-    if (typeof v === "string" && v.length > 0) return v;
+  // `reasoning` LAST: purely additive — every pre-existing shape resolves as
+  // before, and reasoning_v1 payloads have no other text field.
+  for (const v of [p.traceMarkdown, p.markdown, p.content, p.body, p.text, p.reasoning]) {
+    if (typeof v === "string" && v.trim().length > 0) return v;
     if (v && typeof v === "object") {
       const inner =
         (v as { text?: unknown; body?: unknown; content?: unknown }).text

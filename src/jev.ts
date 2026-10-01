@@ -20,9 +20,11 @@
  *      it earns that on our own data.
  *
  * Safety: never throws. A 402/429, or 3 consecutive failures, pauses ALL Jev
- * calls for 30 min — on 2026-09-28 a test loop that retried through a spend
- * limit tripped Venice's ">50 failed attempts" lockout on the key the whole
- * bot depends on. BOT_JEV=0 disables every call site.
+ * calls — 30 min, doubling per consecutive trip up to 24h, reset on success —
+ * because on 2026-09-28 a test loop that retried through a spend limit
+ * tripped Venice's ">50 failed attempts" lockout on the key the whole bot
+ * depends on. An HTTP 400/401/403/404 latches Jev off until restart.
+ * BOT_JEV=0 disables every call site.
  */
 import { NOOK_DIR } from "./util.js";
 import { join } from "node:path";
@@ -49,11 +51,26 @@ export interface JevAnswer {
 
 let pausedUntil = 0;
 let consecutiveFailures = 0;
+/** Consecutive pauses without a success in between — each doubles the pause
+ *  (30m, 1h, 2h … capped at 24h), so a persistent failure cannot keep
+ *  spending 3 failed calls every 30 min forever (review, 2026-10-01). */
+let pauseStreak = 0;
+/** A deterministic client error (400/401/403/404: model retired, bad request
+ *  shape, revoked key) latches Jev off for the life of the process. */
+let latchedOff = false;
+export const JEV_PAUSE_CAP_MS = 24 * 3600_000;
 
 /** Test hook: clear the breaker state. */
 export function _resetJevForTests(): void {
   pausedUntil = 0;
   consecutiveFailures = 0;
+  pauseStreak = 0;
+  latchedOff = false;
+}
+
+/** Pure: pause length for the Nth consecutive trip (1-based). */
+export function jevPauseMs(streak: number): number {
+  return Math.min(JEV_PAUSE_MS * 2 ** Math.max(0, streak - 1), JEV_PAUSE_CAP_MS);
 }
 
 export function jevPausedUntil(): number {
@@ -101,16 +118,18 @@ export async function jevDecide(
   questions: Record<string, JevQuestion>,
   opts: JevOptions = {},
 ): Promise<{ answers: Record<string, JevAnswer>; inputTokens: number } | null> {
-  if (process.env.BOT_JEV === "0") return null;
+  if (process.env.BOT_JEV === "0" || latchedOff) return null;
   const now = opts.nowMs ?? Date.now();
   if (now < pausedUntil) return null;
   const key = process.env.VENICE_API_KEY;
   if (!key) return null;
   const doFetch = opts.fetchImpl ?? fetch;
   const pause = (why: string) => {
-    pausedUntil = now + JEV_PAUSE_MS;
+    pauseStreak++;
+    const ms = jevPauseMs(pauseStreak);
+    pausedUntil = now + ms;
     consecutiveFailures = 0;
-    console.warn(`   ⚖️ jev paused 30 min (${why}) — never retry through a spend limit or lockout`);
+    console.warn(`   ⚖️ jev paused ${Math.round(ms / 60_000)} min (${why}) — never retry through a spend limit or lockout`);
   };
   try {
     const r = await doFetch(`${BASE}/decisions`, {
@@ -121,6 +140,11 @@ export async function jevDecide(
     });
     if (r.status === 402 || r.status === 429) {
       pause(`HTTP ${r.status}`);
+      return null;
+    }
+    if ([400, 401, 403, 404].includes(r.status)) {
+      latchedOff = true;
+      console.warn(`   ⚖️ jev DISABLED for this process (HTTP ${r.status} — deterministic: model retired, request shape, or key) — restart to retry`);
       return null;
     }
     if (!r.ok) {
@@ -134,6 +158,7 @@ export async function jevDecide(
       return null;
     }
     consecutiveFailures = 0;
+    pauseStreak = 0;
     const inputTokens = Number(body.usage?.input_tokens ?? 0);
     const sink =
       opts.onCost ??
@@ -191,7 +216,7 @@ export interface InboxTriage {
   priority: number; // 0..3 weighted
   category: string;
   categoryConfidence: number;
-  label: "risky" | "act" | "read" | "low" | "ignore";
+  label: "risky" | "act" | "read" | "replied" | "low" | "ignore";
 }
 
 /** Pure: collapse Jev's answers into one sortable verdict. */
@@ -227,7 +252,13 @@ export function labelTriage(p: number, category: string, categoryConfidence: num
   return { priority: p, category, categoryConfidence, label };
 }
 
-const LABEL_RANK: Record<InboxTriage["label"], number> = { risky: 4, act: 3, read: 2, low: 1, ignore: 0 };
+const LABEL_RANK: Record<InboxTriage["label"], number> = { risky: 5, act: 4, read: 3, replied: 2, low: 1, ignore: 0 };
+
+/** Fixed state for a thread whose latest message is OURS (direction=sent):
+ *  nothing to act on until they answer. Never sent to Jev — the rubric assumes
+ *  another agent wrote the message, and scored our own corrections as "act"
+ *  (3 of the first 6 "act" threads, 2026-10-01). */
+export const REPLIED_TRIAGE: InboxTriage = { priority: 0, category: "replied", categoryConfidence: 1, label: "replied" };
 
 /** Pure: sort key — label first (risky/act on top), then raw priority. */
 export function compareTriage(a?: InboxTriage | null, b?: InboxTriage | null): number {
@@ -241,6 +272,7 @@ export const TRIAGE_ICON: Record<InboxTriage["label"], string> = {
   risky: "⚠️",
   act: "🔴",
   read: "🟡",
+  replied: "↩️",
   low: "⚪",
   ignore: "🗑",
 };

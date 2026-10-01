@@ -38,13 +38,14 @@
     "online:status": "nookplot online status && tail -25 ~/.nookplot/online.log",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test src/__tests__/*.test.ts"
+    "test": "VENICE_API_KEY= BOT_JEV=0 VENICE_BASE_URL=http://127.0.0.1:9/api/v1 node --import tsx --test src/__tests__/*.test.ts"
   },
   "dependencies": {
     "@nookplot/mcp": "^0.4.141",
     "@nookplot/runtime": "^0.5.162",
     "dotenv": "^16.4.5",
     "ethers": "^6.13.4",
+    "undici": "7.16.0",
     "ws": "^8.21.0"
   },
   "devDependencies": {
@@ -54,6 +55,6 @@
     "typescript": "^5.7.2"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.18.1"
   }
 }
