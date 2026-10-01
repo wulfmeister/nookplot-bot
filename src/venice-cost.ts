@@ -2,7 +2,8 @@
  * Venice cost accounting.
  *
  * Every successful Venice chat() call records its model + token usage +
- * estimated cost to ~/.nookplot/venice-costs.jsonl. Used to:
+ * estimated cost to ~/.nookplot/venice-costs.jsonl. Calls that throw record a
+ * zero-usage "timeout" / "other-error" row (2026-10-01). Used to:
  *   1. Surface daily spend on the dashboard.
  *   2. Trigger a single warning when daily spend exceeds the alert threshold.
  *   3. Track per-model parse-failure waste (consumed by mining circuit-breaker).
@@ -107,6 +108,37 @@ export interface CostEntry {
    *  Recorded so a rejection of an OLD wire name does not condemn a corrected one. */
   wireName?: string;
   callSite?: string;
+  /** Failed-call rows only: wall time of the whole chat() call. */
+  elapsedMs?: number;
+  /** Failed-call rows only: HTTP attempts the call made before giving up. */
+  attempts?: number;
+  /** Failed-call rows only: transport cause code, "http <status>", or a short message. */
+  cause?: string;
+}
+
+/**
+ * Outcomes of calls that never produced a response (2026-10-01). Rows carry
+ * zero usage and zero estCost: whether Venice bills a generation the client
+ * abandoned is unverified. They exist so spend forensics and the dashboard can
+ * see failures at all; before, only parsed 2xx responses and 429s left a row.
+ */
+export const FAILED_CALL_OUTCOMES: ReadonlySet<NonNullable<CostEntry["outcome"]>> = new Set(["timeout", "other-error"]);
+
+/**
+ * Rows that are markers, not responses: failed calls, 429s and gateway
+ * submit-rejections. tagLatestCallOutcome never re-tags one. A parse tag
+ * landing on a 429 row would erase the capacity signal, and one landing on a
+ * submit-reject row would erase circuit-breaker evidence.
+ */
+export const UNTAGGABLE_OUTCOMES: ReadonlySet<NonNullable<CostEntry["outcome"]>> = new Set([
+  "timeout",
+  "other-error",
+  "rate-limited",
+  "submit-reject",
+]);
+
+export function isFailedCallOutcome(outcome: CostEntry["outcome"] | undefined): boolean {
+  return !!outcome && FAILED_CALL_OUTCOMES.has(outcome);
 }
 
 /** Estimate a single call's cost in credits given usage data. */
@@ -165,6 +197,40 @@ export function recordVeniceCall(args: {
   return { estCost, totalTokens };
 }
 
+export interface FailedCallArgs {
+  model: string;
+  outcome: "timeout" | "other-error";
+  elapsedMs: number;
+  attempts: number;
+  cause: string;
+}
+
+/** Pure: the zero-usage ledger row for a chat() call that threw. */
+export function buildFailedCallEntry(args: FailedCallArgs, nowMs = Date.now()): CostEntry {
+  return {
+    ts: new Date(nowMs).toISOString(),
+    model: args.model,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    estCost: 0,
+    outcome: args.outcome,
+    elapsedMs: Math.max(0, Math.round(args.elapsedMs)),
+    attempts: args.attempts,
+    cause: args.cause.slice(0, 160),
+  };
+}
+
+/**
+ * Record a chat() call that finally threw (timeout, transport loss, HTTP
+ * error). No callSite: the caller is not known here. tagLatestCallOutcome
+ * skips these rows, and parseFailureRateByModel filters on callSite, so they
+ * cannot reach the parse-fail circuit breaker.
+ */
+export function recordFailedVeniceCall(args: FailedCallArgs): void {
+  appendJsonl(LOG, buildFailedCallEntry(args));
+}
+
 function todayUtc(): string {
   return new Date().toISOString().slice(0, 10);
 }
@@ -183,6 +249,9 @@ export function veniceSpentTodayByModel(): Record<string, { calls: number; estCo
   const byModel: Record<string, { calls: number; estCost: number; tokens: number }> = {};
   for (const e of readJsonl<CostEntry>(LOG)) {
     if (!e.ts || e.ts.slice(0, 10) !== today) continue;
+    // Failed calls are counted in failedToday, not here: "calls" is calls that
+    // returned (plus 429 rows, as before).
+    if (isFailedCallOutcome(e.outcome)) continue;
     const m = e.model ?? "(unknown)";
     if (!byModel[m]) byModel[m] = { calls: 0, estCost: 0, tokens: 0 };
     byModel[m].calls += 1;
@@ -208,6 +277,37 @@ export function veniceRateLimited429Today(): Record<string, number> {
     byModel[m] = (byModel[m] ?? 0) + 1;
   }
   return byModel;
+}
+
+export interface FailedCallSummary {
+  total: number;
+  byOutcome: Record<string, number>;
+  byModel: Record<string, number>;
+  /** Summed wall time of the failed calls. Compare against balance-tick deltas to settle the billing question. */
+  elapsedMs: number;
+  last: { ts: string; model: string; outcome: string; cause?: string; elapsedMs?: number } | null;
+}
+
+/** Pure: summarise failed-call rows for one UTC day (YYYY-MM-DD). */
+export function summarizeFailedCalls(entries: CostEntry[], day: string): FailedCallSummary {
+  const out: FailedCallSummary = { total: 0, byOutcome: {}, byModel: {}, elapsedMs: 0, last: null };
+  for (const e of entries) {
+    if (!e.ts || e.ts.slice(0, 10) !== day || !isFailedCallOutcome(e.outcome)) continue;
+    const outcome = e.outcome as string;
+    const model = e.model ?? "(unknown)";
+    out.total += 1;
+    out.byOutcome[outcome] = (out.byOutcome[outcome] ?? 0) + 1;
+    out.byModel[model] = (out.byModel[model] ?? 0) + 1;
+    out.elapsedMs += Number(e.elapsedMs ?? 0) || 0;
+    if (!out.last || e.ts >= out.last.ts) {
+      out.last = { ts: e.ts, model, outcome, cause: e.cause, elapsedMs: e.elapsedMs };
+    }
+  }
+  return out;
+}
+
+export function veniceFailedCallsToday(): FailedCallSummary {
+  return summarizeFailedCalls(readJsonl<CostEntry>(LOG), todayUtc());
 }
 
 /**
@@ -258,6 +358,11 @@ export function computeParseFailureRates(
   const rejectsByModel: Record<string, CostEntry[]> = {};
   for (const e of sorted) {
     if (!e.model) continue;
+    // A call that threw produced no output to parse. It is neither a parse
+    // failure nor a parse success, so it must not dilute or inflate the rate.
+    // (Failure rows carry no callSite today, so parseFailureRateByModel already
+    // drops them; this keeps that true if a caller ever tags one.)
+    if (isFailedCallOutcome(e.outcome)) continue;
     // Rejections of the model ID ITSELF are DETERMINISTIC — the gateway will
     // refuse this id every time, so one occurrence is proof at any age. They
     // are never windowed out; a wire-name CHANGE (not time) is what discounts
@@ -313,23 +418,36 @@ export function parseFailureRateByModel(lookback = 10): Record<string, ParseFail
  * Atomic: rewrites the JSONL file with the last matching entry updated.
  * Idempotent — calling twice tags the same entry.
  */
+/**
+ * Pure: index of the row tagLatestCallOutcome should tag. That is the newest
+ * row for `model` that is a real response, skipping UNTAGGABLE_OUTCOMES
+ * markers. Since failed calls write rows, a concurrent call's failure row can
+ * be the newest row for the model when a successful call's caller comes to tag
+ * it. Returns -1 when nothing is taggable.
+ */
+export function findTaggableIndex(entries: CostEntry[], model: string): number {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (e.model !== model) continue;
+    if (e.outcome && UNTAGGABLE_OUTCOMES.has(e.outcome)) continue;
+    return i;
+  }
+  return -1;
+}
+
 export function tagLatestCallOutcome(
   model: string,
   outcome: CostEntry["outcome"],
   callSite?: string,
 ): void {
   const all = readJsonl<CostEntry>(LOG);
-  // Find most-recent entry for this model
-  for (let i = all.length - 1; i >= 0; i--) {
-    if (all[i].model === model) {
-      all[i].outcome = outcome;
-      if (callSite) all[i].callSite = callSite;
-      // Rewrite the file atomically. For our scale (10k lines = ~3MB) this
-      // is fine; if it gets much bigger, swap to an append-and-compact model.
-      writeFileSync(LOG, all.map((e) => JSON.stringify(e)).join("\n") + "\n");
-      return;
-    }
-  }
+  const i = findTaggableIndex(all, model);
+  if (i < 0) return;
+  all[i].outcome = outcome;
+  if (callSite) all[i].callSite = callSite;
+  // Rewrite the file atomically. For our scale (10k lines = ~3MB) this
+  // is fine; if it gets much bigger, swap to an append-and-compact model.
+  writeFileSync(LOG, all.map((e) => JSON.stringify(e)).join("\n") + "\n");
 }
 
 /**
@@ -377,15 +495,21 @@ export interface VeniceCostSummary {
   byModel: Record<string, { calls: number; estCost: number; tokens: number }>;
   /** Per-model 429 count today — inference-capacity pressure signal. */
   rateLimited429: Record<string, number>;
+  /** chat() calls that threw today (timeout + other-error). Not in byModel. */
+  failedToday: number;
+  failedTodayDetail: FailedCallSummary;
 }
 
 export function veniceCostSummary(): VeniceCostSummary {
   const spent = veniceSpentToday();
+  const failed = veniceFailedCallsToday();
   return {
     spentToday: spent,
     alertThreshold: DAILY_COST_ALERT,
     remainingBudgetBeforeAlert: Math.max(0, DAILY_COST_ALERT - spent),
     byModel: veniceSpentTodayByModel(),
     rateLimited429: veniceRateLimited429Today(),
+    failedToday: failed.total,
+    failedTodayDetail: failed,
   };
 }

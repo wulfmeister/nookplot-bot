@@ -22,6 +22,7 @@ import type { NookplotRuntime } from "@nookplot/runtime";
 import { chat } from "./venice.js";
 import { NOOK_DIR, BOT_LOG_PATH, appendJsonl, extractJsonObj, readJsonl } from "./util.js";
 import { readCapacity, capacityUnderuse } from "./capacity.js";
+import { standDownSkip } from "./venice-breaker.js";
 
 type RuntimeLike = Pick<NookplotRuntime, "connection">;
 
@@ -410,6 +411,10 @@ export async function runObservationTick(_runtime: RuntimeLike, opts: { dryRun?:
   }
   console.log(`🔭 observe tick — log=${stats.log.lineCount} lines${stats.log.stale ? " (STALE)" : `, ${stats.log.errors} errors, ${stats.log.rateLimits} rate-limits`}`);
 
+  // The stale-log and capacity warnings above need no Venice. The pattern
+  // pass does, so a stand-down skips only that (and its writes, so an empty
+  // tick doesn't refresh OBSERVATIONS.md as if nothing were wrong).
+  if (standDownSkip("observe")) return;
   const obs = await askForPatterns(stats, recentLog.lines);
   // Filter: confidence ≥ 0.6 AND reversibility = "easy" (safe to auto-act, or at least to consider)
   const filtered = obs.filter((o) => o.confidence >= 0.6 && o.reversibility === "easy");

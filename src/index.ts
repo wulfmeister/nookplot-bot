@@ -71,6 +71,7 @@ import { runCohortBenchmarkTick } from "./cohort-benchmark.js";
 import { runEarningSurfacesTick } from "./earning-surfaces.js";
 import { runSettlementsTick } from "./settlements.js";
 import { maybeWarnVeniceBalance } from "./venice-balance.js";
+import { standDownSkip } from "./venice-breaker.js";
 import { runApiMarketplaceTick } from "./api-marketplace-sell.js";
 import { runProjectsReviewTick, runExecScoringTick } from "./projects.js";
 import { runPeerReviewTick } from "./peer-review.js";
@@ -490,6 +491,7 @@ async function handleVerificationOpportunity(runtime: ReturnType<typeof getRunti
     console.log("   (DRY_RUN — would score + completeAction)");
     return;
   }
+  if (standDownSkip("verification-opportunity")) return;
   try {
     const trace = JSON.stringify(opp.data || opp, null, 2);
     const { scores, justification, skip } = await scoreVerification(trace);
@@ -881,6 +883,9 @@ let artifactRerunCount = 0;
  * consecutive polls doing nothing (07-31 verify blackout).
  */
 async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: VerifiableSubmission): Promise<boolean> {
+  // Venice stand-down: return before the trace fetch and the comprehension
+  // POST, without marking the sub handled, so it is picked up after the refill.
+  if (standDownSkip("verify")) return false;
   if (verifiedSubmissions.has(sub.id)) return false;
   if (isComprehensionGated(sub.id)) return false;
   if (finalizedSubmissionSkip.isSkipped(sub.id)) return false;
@@ -1118,6 +1123,9 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
  * failure anywhere here only skips this one submission.
  */
 async function verifyArtifactSubmission(runtime: ReturnType<typeof getRuntime>, sub: VerifiableSubmission): Promise<void> {
+  // Before the comprehension POST, the inspect and the (5/hr) rerun: the
+  // grade at the end needs Venice, so all of that is wasted while standing down.
+  if (standDownSkip("artifact verify")) return;
   try {
     console.log(`💎🔁 verifying ARTIFACT submission ${sub.id.slice(0, 8)} (kind=${sub.verifier_kind})`);
     const fetchedTrace = await fetchSubmissionTrace(runtime, sub);
@@ -1340,6 +1348,8 @@ async function pollVerifiableSubmissions(runtime: ReturnType<typeof getRuntime>)
     console.log("💎 previous verification poll still running — skipping this tick");
     return;
   }
+  // Venice stand-down: skip the pool fetch too. Nothing in it can be scored.
+  if (standDownSkip("verify")) return;
   // Re-sync the local counter to the rolling-24h shared count (matches the
   // gateway's window; frees slots as entries age out instead of a false midnight
   // reset). In-poll `verifyRollingCount += 1` increments then prevent overspend
@@ -1517,6 +1527,9 @@ async function pollVerifiableSubmissions(runtime: ReturnType<typeof getRuntime>)
     }
     for (const sub of plannedBatch) {
       if (verifyRollingCount >= VERIFY_ROLLING_CAP) break;
+      // A 402 on the previous sub trips the stand-down. Stop the batch rather
+      // than run each remaining sub's trace fetch + comprehension POST.
+      if (standDownSkip("verify")) break;
       const worked = await verifyOneSubmission(runtime, sub);
       // Pacing sleep only after real gateway work — a no-op skip must not cost
       // 70s (07-31: a batch of own-challenge no-ops burned every poll's budget).
@@ -2216,6 +2229,8 @@ async function publishOneKnowledgeItem(runtime: ReturnType<typeof getRuntime>) {
     console.log("📚 (DRY_RUN — skipping knowledge publish)");
     return;
   }
+  // Grounded sources and the fallback both generate through Venice.
+  if (standDownSkip("knowledge publish")) return;
 
   // Try grounded sources first — these cite real network artifacts.
   let post: KnowledgePost | null = null;

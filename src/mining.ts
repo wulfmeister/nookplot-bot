@@ -21,6 +21,7 @@ import { recordSolveAsWorkspace } from "./workspace-solve.js";
 import { withGenerationSlot } from "./generation-semaphore.js";
 import { recordAudit } from "./audit.js";
 import { jevCheckSolution, JEV_CHECKS_LOG, type JevCheck } from "./jev.js";
+import { isVeniceBillingError, standDownSkip } from "./venice-breaker.js";
 import {
   alreadySubmittedChallenges,
   guildClaimedUntil,
@@ -373,6 +374,15 @@ function loadCaches(inGuild: boolean): { attempted: Set<string>; todayCount: num
   const now = Date.now();
   for (const e of entries) {
     if (e.outcome === "error") {
+      // A Venice billing refusal (402 spend limit / balance, failed-attempt
+      // lockout, stand-down) says nothing about the challenge, only that the
+      // key couldn't pay. Without this, the 4h error cooldown below turned
+      // every 402 row into a PERMANENT skip: on 2026-10-01 the key-limit
+      // outage wrote 158 rows over 17 challenges, each retried every 15 min
+      // (up to 17 times) and then dropped once its first 402 row was 4h old.
+      // Ignored entirely, so the challenge is eligible again once the
+      // stand-down lifts.
+      if (isVeniceBillingError(e.notes)) continue;
       if (isPermanentFailure(e.notes)) {
         // Guild-exclusive errors logged before we joined a guild are no
         // longer permanent for us — retry them now that we have access.
@@ -1702,6 +1712,10 @@ async function discoverAndSolveMiningChallengesInner(
     console.log("⛏ (DRY_RUN — skipping mining poll)");
     return;
   }
+  // Venice stand-down (venice-breaker.ts): skip before the epoch-cap probe,
+  // the discover GETs, guild claims and context gathering. All of it is
+  // wasted when the solve call cannot run.
+  if (standDownSkip("mining")) return;
   const { attempted, todayCount } = loadCaches(Boolean(opts.guildId));
   if (todayCount >= DAILY_CAP) {
     console.log(`⛏ mining daily cap hit (${todayCount}/${DAILY_CAP}) — skipping`);
@@ -1848,6 +1862,10 @@ async function discoverAndSolveMiningChallengesInner(
       console.log(`⛏ ${idShort} — skip (specificity-rejected twice; 24h cooldown)`);
       continue;
     }
+    // A 402 on the previous challenge trips the stand-down. Stop here, before
+    // the next guild claim (a 2h exclusive claim on a challenge we cannot
+    // solve keeps it from every other solver) and its context gathering.
+    if (standDownSkip("mining")) break;
     // Per-iteration epoch-cap pre-flight: if we hit the gateway's "Maximum
     // 12 regular challenges per 24h" error on a PREVIOUS iteration of this
     // same loop, every subsequent submit will also 429 → save Venice spend

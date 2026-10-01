@@ -32,6 +32,7 @@ import { search as vaultSearch, noteSummary } from "./vault.js";
 import { countSpecificity } from "./specificity-gate.js";
 import { specializeDomains } from "./mining.js";
 import { recordAudit } from "./audit.js";
+import { isVeniceBillingError, standDownSkip, veniceStandingDown } from "./venice-breaker.js";
 
 type RuntimeLike = Pick<NookplotRuntime, "connection">;
 
@@ -500,6 +501,10 @@ async function draftChallenge(domain: string, grounding: string, avoidTitles: st
 
 export async function runChallengePostTick(runtime: RuntimeLike): Promise<void> {
   if (process.env.BOT_CHALLENGE_POST === "0") return;
+  // Every path below drafts through Venice. Skip before the rescue check's
+  // GETs (2026-10-01: 18 "draft failed: Venice API 402" lines; a tick can
+  // make up to 3 domains × 3 attempts).
+  if (standDownSkip("challenge posting")) return;
   const prior = readJsonl<PostedEntry>(LOG);
   const nowIso = new Date().toISOString();
   const postedCount = postedToday(prior, nowIso);
@@ -535,8 +540,9 @@ export async function runChallengePostTick(runtime: RuntimeLike): Promise<void> 
   let draftDomain = "";
   let draftGrounding: string[] = [];
   let lastSkipNote = "";
+  let billingStop = false;
   for (const domain of domainOrder.length > 0 ? domainOrder : [primary]) {
-    if (draft) break;
+    if (draft || billingStop) break;
     // Ground in our own work — rotated two ways: notes that grounded a post
     // in the last 30 days go to the back of the line (vaultSearch is
     // deterministic, so un-rotated grounding re-derives the same challenge),
@@ -566,6 +572,12 @@ export async function runChallengePostTick(runtime: RuntimeLike): Promise<void> 
       } catch (err) {
         lastSkipNote = `draft failed: ${(err as Error).message.slice(0, 100)}`;
         console.warn(`📮 challenge-post: ${lastSkipNote} (attempt ${attempt}/3, ${domain})`);
+        // The key can't pay: the remaining attempts and domains would only
+        // repeat this failure. Stop the tick; the next one skips up front.
+        if (veniceStandingDown().active || isVeniceBillingError((err as Error).message)) {
+          billingStop = true;
+          break;
+        }
         continue;
       }
       if (!cand) {

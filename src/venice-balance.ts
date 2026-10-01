@@ -12,9 +12,29 @@
  * This module only WARNS (log line the observer picks up). It deliberately
  * does not auto-buy credits — purchases stay manual via `npm run buy-credits`
  * (operator preference).
+ *
+ * BLIND SPOT (2026-10-01): these are ACCOUNT balances. A spend limit set on the
+ * API KEY ("API key DIEM spend limit exceeded") 402s every call while the
+ * account still holds DIEM, and nothing here can see it. The process-wide
+ * stand-down (venice-breaker.ts) reacts to that 402 instead; this watch only
+ * hands it `nextEpochBegins` so the pause ends at the real refill time.
  */
 
+import { join } from "node:path";
+import { NOOK_DIR, appendJsonl } from "./util.js";
+import { noteVeniceNextEpoch } from "./venice-breaker.js";
+
 const BASE = process.env.VENICE_BASE_URL ?? "https://api.venice.ai/api/v1";
+
+/**
+ * Every 30-min reading, persisted (2026-10-01). Until now a reading was only
+ * logged when it crossed the low threshold, so there was no balance series to
+ * check the cost ledger against: neither whether the estimates match real
+ * drain, nor whether Venice bills a generation the client abandoned (compare
+ * the drop across a window holding a "timeout" row in venice-costs.jsonl with
+ * that window's ledger sum). ~48 short rows a day.
+ */
+export const BALANCE_LOG = join(NOOK_DIR, "venice-balance.jsonl");
 
 export interface VeniceBalances {
   usd: number;
@@ -46,7 +66,9 @@ export function assessVeniceBalance(
   return (
     `Venice balance low: ${spendable.toFixed(2)} spendable (DIEM ${b.diem.toFixed(2)}, ` +
     `USD ${b.usd.toFixed(2)}) < ${threshold} — inference will 402 when it hits zero ` +
-    `(2026-08-05: ~5.7h outage, ~3 slots lost).${refill} Top up manually: npm run buy-credits`
+    `(2026-08-05: ~5.7h outage, ~3 slots lost).${refill} Top up manually: npm run buy-credits. ` +
+    `This reads account balances only: it cannot see a per-API-key DIEM/USD spend limit, which 402s every call ` +
+    `even while the account has balance (2026-10-01).`
   );
 }
 
@@ -82,6 +104,10 @@ let warnedLowBalance = false;
 export async function maybeWarnVeniceBalance(): Promise<void> {
   const b = await fetchVeniceBalances();
   if (!b) return;
+  noteVeniceNextEpoch(b.nextEpochBegins);
+  try {
+    appendJsonl(BALANCE_LOG, { ts: new Date().toISOString(), usd: b.usd, diem: b.diem, nextEpochBegins: b.nextEpochBegins });
+  } catch { /* telemetry must never break the tick */ }
   const warning = assessVeniceBalance(b);
   if (warning) {
     if (!warnedLowBalance) {

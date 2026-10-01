@@ -23,6 +23,7 @@ import type { NookplotRuntime } from "@nookplot/runtime";
 import { chat } from "./venice.js";
 import { NOOK_DIR, appendJsonl, sleep } from "./util.js";
 import { fallbackGateways } from "./ipfs-fetch.js";
+import { standDownSkip } from "./venice-breaker.js";
 
 type RuntimeLike = Pick<NookplotRuntime, "connection">;
 
@@ -154,6 +155,8 @@ async function callDisclosedModel(prompt: string, model: string): Promise<string
 
 export async function runRlmSpotCheckLoop(runtime: RuntimeLike): Promise<void> {
   if (process.env.BOT_RLM_SPOTCHECK === "0") return;
+  // Each replay is a Venice call; skip before the pending fetch and IPFS reads.
+  if (standDownSkip("rlm spot-check")) return;
   let pending: PendingResp;
   try {
     pending = (await runtime.connection.request(
