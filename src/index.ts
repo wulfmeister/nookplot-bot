@@ -21,11 +21,23 @@ import {
   FINALIZED_TTL_MS,
   DIVERSITY_TTL_MS,
   RECIPROCAL_TTL_MS,
-  isDiversityBlockError,
-  isFinalizedError,
-  isReciprocalVerificationError,
   maybeWarnDiversitySaturation,
+  verifyTransientSkip,
+  verifyBudgetPause,
+  VERIFY_BUDGET_PAUSE_KEY,
+  verifyStreakPause,
+  VERIFY_STREAK_PAUSE_KEY,
 } from "./skip-caches.js";
+import {
+  decideVerifyFailure,
+  feedsVerifyStreak,
+  nextVerifyStreak,
+  NO_VERIFY_STREAK,
+  SCORE_PARSE_FAIL,
+  VERIFY_RETRY_DEFAULTS,
+  type VerifyRetryState,
+  type VerifyStreakState,
+} from "./verify-errors.js";
 import {
   recordDiversityPollSaturation,
   maybeWarnDiversityPollSaturation,
@@ -56,7 +68,6 @@ import {
   recordVerifyLimitHit,
   verifySharedCount,
   VERIFY_SHARED_CAP,
-  isVerifyCapError,
 } from "./quotas.js";
 import { recordAudit } from "./audit.js";
 import { runBountyTick, truncateApplicationMessage } from "./bounties.js";
@@ -569,9 +580,105 @@ function recordFetchStrikeAndShouldRetire(id: string): boolean {
   traceFetchStrikes.set(id, n);
   return n >= FETCH_STRIKE_LIMIT;
 }
-function isComprehensionGateError(msg: string): boolean {
-  return /complete the comprehension challenge before verifying/i.test(msg)
-    || /ARTIFACT_INSPECTION_REQUIRED/i.test(msg);
+// isComprehensionGateError moved to ./verify-errors (pure, tested) with the
+// rest of the verify failure classification.
+
+// Retry bookkeeping for temporary verify failures: strikes (failures that might
+// be deterministic for one submission: gateway 500, unknown 429, timeout, parse
+// fail, unknown) and attempts (every temporary failure except the 402 pause and
+// the shared-cap halt, capped at VERIFY_RETRY_DEFAULTS.retryMax). Cleared
+// whenever the submission is marked done.
+const verifyRetryState = new Map<string, VerifyRetryState>();
+
+// Loop-level failure streak (nextVerifyStreak): consecutive temporary failures
+// across candidates with no success in between pause the whole verify loop.
+let verifyStreak: VerifyStreakState = NO_VERIFY_STREAK;
+
+function markVerifyDone(id: string): void {
+  verifiedSubmissions.add(id);
+  verifyRetryState.delete(id);
+}
+
+/** POST /verify accepted: clears the loop-level failure streak. */
+function recordVerifySuccess(): void {
+  verifyStreak = nextVerifyStreak(verifyStreak, "success", Date.now()).state;
+}
+
+/** True while a 402 budget pause or a failure-streak pause is active. */
+function verifyLoopPaused(): boolean {
+  return verifyBudgetPause.isSkipped(VERIFY_BUDGET_PAUSE_KEY) || verifyStreakPause.isSkipped(VERIFY_STREAK_PAUSE_KEY);
+}
+
+/**
+ * The one failure handler for both verify paths. It used to be two copies of
+ * an if/else chain that ran `verifiedSubmissions.add(sub.id)` BEFORE looking
+ * at the error, so a Venice 402 or a "fetch failed" dropped a real candidate
+ * until restart (8fc39106 and 34618e81, 2026-10-01). Now only success or a
+ * gateway-permanent outcome marks the submission done; temporary failures get
+ * a short-TTL skip and, if they could be about this submission, a strike.
+ * Every temporary failure also counts toward a per-submission ceiling and the
+ * loop-level failure streak, so no class can retry forever.
+ */
+function handleVerifyFailure(sub: VerifiableSubmission, rawMsg: string | undefined, label: string): void {
+  const msg = String(rawMsg ?? ""); // a non-Error throw has no .message
+  const id8 = sub.id.slice(0, 8);
+  const d = decideVerifyFailure(msg, verifyRetryState.get(sub.id) ?? {});
+  const solver = sub.solver_address?.toLowerCase();
+  if (d.cls.kind === "verify-cap") {
+    // Shared-cap 429: halt further attempts (saves the SDK retry storm).
+    recordVerifyLimitHit();
+    console.warn(`   ⚠ verify shared cap hit (${VERIFY_SHARED_CAP}/day) — halting verify attempts until UTC midnight`);
+  } else if (d.cls.kind === "comprehension-gate") {
+    markComprehensionGated(sub.id);
+    console.warn(`   ⚠ comprehension/artifact gate on ${id8} — skipping for ${COMPREHENSION_GATE_TTL_MS / 3600_000}h`);
+  } else if (d.cls.kind === "finalized") {
+    finalizedSubmissionSkip.markFor(sub.id, FINALIZED_TTL_MS);
+    console.warn(`   ⚠ ${id8} already finalized — skipping for ${FINALIZED_TTL_MS / 3600_000}h`);
+  } else if (d.cls.kind === "diversity" && solver) {
+    solverDiversityBlockedUntil.markFor(solver, DIVERSITY_TTL_MS);
+    console.warn(`   ⚠ solver ${sub.solver_address!.slice(0, 10)} hit diversity cap — skipping all its subs for 14d`);
+    maybeWarnDiversitySaturation();
+  } else if (d.cls.kind === "reciprocal" && solver) {
+    reciprocalVerifierSkipUntil.markFor(solver, RECIPROCAL_TTL_MS);
+    const ttlH = (RECIPROCAL_TTL_MS / 3600_000).toFixed(0);
+    console.warn(`   ⚠ solver ${sub.solver_address!.slice(0, 10)} hit reciprocal mutual-pair cap — skipping their subs for ${ttlH}h`);
+  } else if (msg === label) {
+    console.warn(`   ⚠ ${label} for ${id8}`);
+  } else {
+    // First line only: gateway 502 bodies are multi-line Cloudflare HTML.
+    console.warn(`   ⚠ ${label} for ${id8}: ${msg.split("\n")[0].slice(0, 200)}`);
+  }
+  if (d.action === "mark-done") {
+    markVerifyDone(sub.id);
+    if (d.retiredBy === "strikes") {
+      console.warn(`   ⏭ retiring ${id8} after ${VERIFY_RETRY_DEFAULTS.strikeLimit} strike-counting failures (last: ${d.cls.kind})`);
+    } else if (d.retiredBy === "ceiling") {
+      console.warn(`   ⏭ retiring ${id8} after ${VERIFY_RETRY_DEFAULTS.retryMax} temporary failures (retry ceiling; last: ${d.cls.kind})`);
+    }
+  } else {
+    if (d.strikesAfter > 0 || d.attemptsAfter > 0) {
+      verifyRetryState.set(sub.id, { strikes: d.strikesAfter, attempts: d.attemptsAfter });
+    }
+    verifyTransientSkip.markFor(sub.id, d.retryAfterMs);
+    const strikeNote = d.cls.strikes ? `, strike ${d.strikesAfter}/${VERIFY_RETRY_DEFAULTS.strikeLimit}` : "";
+    const ceilingNote = d.cls.ceiling ? `, attempt ${d.attemptsAfter}/${VERIFY_RETRY_DEFAULTS.retryMax}` : "";
+    console.log(`   ↻ ${id8} kept as a candidate (${d.cls.kind}${strikeNote}${ceilingNote}) — retry in ${Math.round(d.retryAfterMs / 60_000)}m`);
+  }
+  if (d.pauseAllMs > 0 && !verifyBudgetPause.isSkipped(VERIFY_BUDGET_PAUSE_KEY)) {
+    verifyBudgetPause.markFor(VERIFY_BUDGET_PAUSE_KEY, d.pauseAllMs);
+    console.warn(`   ⏸ Venice budget exhausted (402) — pausing all verify attempts for ${Math.round(d.pauseAllMs / 60_000)}m`);
+  }
+  if (feedsVerifyStreak(d)) {
+    const next = nextVerifyStreak(verifyStreak, "failure", Date.now());
+    verifyStreak = next.state;
+    if (next.pauseMs > 0) {
+      verifyStreakPause.markFor(VERIFY_STREAK_PAUSE_KEY, next.pauseMs);
+      console.warn(
+        `   ⏸ ${next.state.trips === 1 ? "consecutive temporary verify failures" : "verify still failing after pause"} ` +
+        `(last: ${d.cls.kind}) — pausing all verify attempts for ${Math.round(next.pauseMs / 60_000)}m (trip ${next.state.trips}, clears on next success)`,
+      );
+    }
+  }
 }
 // Re-synced from the rolling-24h shared count (verifySharedCount) at the start
 // of every verify poll — no midnight/boot reset (the gateway's window is rolling,
@@ -883,23 +990,25 @@ let artifactRerunCount = 0;
  */
 async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: VerifiableSubmission): Promise<boolean> {
   if (verifiedSubmissions.has(sub.id)) return false;
+  if (verifyTransientSkip.isSkipped(sub.id)) return false;
+  // 402 budget pause or failure-streak pause: may start mid-batch, so re-check per candidate.
+  if (verifyLoopPaused()) return false;
   if (isComprehensionGated(sub.id)) return false;
   if (finalizedSubmissionSkip.isSkipped(sub.id)) return false;
   if (sub.solver_address && solverDiversityBlockedUntil.isSkipped(sub.solver_address.toLowerCase())) {
-    verifiedSubmissions.add(sub.id);
+    markVerifyDone(sub.id);
     return false;
   }
   if (sub.solver_address && reciprocalVerifierSkipUntil.isSkipped(sub.solver_address.toLowerCase())) {
-    verifiedSubmissions.add(sub.id);
+    markVerifyDone(sub.id);
     return false;
   }
   // Honor the shared gateway cap (verifies + crowd-jury combined). Once we've
   // hit the cap or seen a 429 today, we stop attempting to avoid the SDK
-  // retry storm visible in the logs.
-  if (!canVerifyNow()) {
-    verifiedSubmissions.add(sub.id);
-    return false;
-  }
+  // retry storm visible in the logs. Deliberately NOT marked done: the cap is a
+  // rolling-24h condition, and marking here used to drop every remaining
+  // candidate in the batch until restart.
+  if (!canVerifyNow()) return false;
   if (verifyRollingCount >= VERIFY_ROLLING_CAP) return false;
   // EXPERIMENT (additive): when BOT_VERIFY_ARTIFACTS=1, code-executing verifiable
   // kinds get the rerun-based verify path below instead of being skipped. Every
@@ -911,7 +1020,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
   if (sub.solver_address) {
     const recentCount = recentSolverVerifyCount(sub.solver_address);
     if (recentCount >= SOLVER_DIVERSITY_CAP) {
-      verifiedSubmissions.add(sub.id);
+      markVerifyDone(sub.id);
       console.log(`💎 ${sub.id.slice(0, 8)} — diversity skip (${recentCount} prior on solver ${sub.solver_address.slice(0, 10)})`);
       return false;
     }
@@ -920,7 +1029,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
   // path hits the same gateway 403). Normally pre-filtered at poll selection;
   // this is the belt-and-braces backstop for any other caller.
   if (sub.challenge_id && isOwnChallenge(sub.challenge_id)) {
-    verifiedSubmissions.add(sub.id);
+    markVerifyDone(sub.id);
     console.log(`💎 ${sub.id.slice(0, 8)} — own-challenge skip (we posted ${sub.challenge_id.slice(0, 8)})`);
     return false;
   }
@@ -937,7 +1046,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
     const abstain = verifyAbstainReason(sub.id, fetchedTrace.trace);
     recordTraceSeen(sub.id, fetchedTrace.trace, abstain);
     if (abstain) {
-      verifiedSubmissions.add(sub.id);
+      markVerifyDone(sub.id);
       console.log(`   ⛔ abstain — ${abstain}; no quorum credit, no verify slot spent`);
       return true;
     }
@@ -955,8 +1064,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
       };
       questions = cRes.questions ?? [];
     } catch (err) {
-      console.warn(`   ⚠ comprehension request failed: ${(err as Error).message}`);
-      verifiedSubmissions.add(sub.id);
+      handleVerifyFailure(sub, (err as Error).message, "comprehension request failed");
       return true;
     }
     // Full trace unavailable. If comprehension is required (or the salvage is
@@ -967,7 +1075,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
     if (traceUnavailable && (questions.length > 0 || process.env.BOT_VERIFY_DETAIL_FALLBACK === "0")) {
       const gateNote = questions.length > 0 ? " (comprehension-gated)" : "";
       if (fetchedTrace.cidStatus === "permanent") {
-        verifiedSubmissions.add(sub.id);
+        markVerifyDone(sub.id);
         persistPermanentCidSkip(sub.id, "malformed/invalid trace CID");
         console.log(`   ⏭ trace CID permanently invalid${gateNote} — skipping ${sub.id.slice(0, 8)} (no re-defer)`);
         return true;
@@ -982,7 +1090,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
       // Deterministic 502s mean dead/unpinned content — retire after a few
       // strikes instead of re-deferring every 6h indefinitely.
       if (recordFetchStrikeAndShouldRetire(sub.id)) {
-        verifiedSubmissions.add(sub.id);
+        markVerifyDone(sub.id);
         traceFetchStrikes.delete(sub.id);
         persistPermanentCidSkip(sub.id, `trace unfetchable after ${FETCH_STRIKE_LIMIT} strikes (dead/unpinned CID)`);
         console.log(`   ⏭ trace persistently unfetchable (${FETCH_STRIKE_LIMIT} strikes${gateNote}) — retiring ${sub.id.slice(0, 8)} (dead/unpinned CID)`);
@@ -1002,20 +1110,18 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
           answers,
         });
       } catch (err) {
-        console.warn(`   ⚠ comprehension answers failed: ${(err as Error).message}`);
-        verifiedSubmissions.add(sub.id);
+        handleVerifyFailure(sub, (err as Error).message, "comprehension answers failed");
         return true;
       }
     }
     const scored = await scoreSubmissionTrace(fetchedTrace.trace, sub.domain_tags ?? []);
     if (!scored) {
-      console.warn(`   ⚠ score parse fail for ${sub.id.slice(0, 8)}`);
-      verifiedSubmissions.add(sub.id);
+      handleVerifyFailure(sub, SCORE_PARSE_FAIL, SCORE_PARSE_FAIL);
       return true;
     }
     if (scored.skip) {
       console.log(`   → skip: ${scored.skip}`);
-      verifiedSubmissions.add(sub.id);
+      markVerifyDone(sub.id);
       return true;
     }
     if (scored.justification.length < 50) {
@@ -1037,7 +1143,8 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
       knowledgeInsight: scored.knowledgeInsight,
       knowledgeDomainTags: scored.knowledgeDomainTags ?? sub.domain_tags ?? [],
     });
-    verifiedSubmissions.add(sub.id);
+    markVerifyDone(sub.id);
+    recordVerifySuccess();
     traceFetchStrikes.delete(sub.id); // recovered after transient strikes — free the entry
     verifyRollingCount += 1;
     recordVerify();
@@ -1080,30 +1187,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
       `## Trace source\n\n${fetchedTrace.source}\n\n## Trace excerpt\n\n${fetchedTrace.trace.slice(0, 2500)}\n\n## Scores (0-1)\n\n- correctness: ${scored.correctnessScore}\n- reasoning: ${scored.reasoningScore}\n- efficiency: ${scored.efficiencyScore}\n- novelty: ${scored.noveltyScore}\n\n## Justification\n\n${scored.justification}\n\n## Insight submitted\n\n${scored.knowledgeInsight}\n\n## Gateway response\n\n\`\`\`\n${JSON.stringify(res, null, 2).slice(0, 800)}\n\`\`\`\n`,
     );
   } catch (err) {
-    verifiedSubmissions.add(sub.id);
-    const msg = (err as Error).message;
-    // If this is the shared-cap 429, mark the limit hit and halt further
-    // attempts today (saves the SDK retry storm visible in the logs).
-    if (isVerifyCapError(msg)) {
-      recordVerifyLimitHit();
-      console.warn(`   ⚠ verify shared cap hit (${VERIFY_SHARED_CAP}/day) — halting verify attempts until UTC midnight`);
-    } else if (isComprehensionGateError(msg)) {
-      markComprehensionGated(sub.id);
-      console.warn(`   ⚠ comprehension/artifact gate on ${sub.id.slice(0, 8)} — skipping for ${COMPREHENSION_GATE_TTL_MS / 3600_000}h`);
-    } else if (isFinalizedError(msg)) {
-      finalizedSubmissionSkip.markFor(sub.id, FINALIZED_TTL_MS);
-      console.warn(`   ⚠ ${sub.id.slice(0, 8)} already finalized — skipping for ${FINALIZED_TTL_MS / 3600_000}h`);
-    } else if (isDiversityBlockError(msg) && sub.solver_address) {
-      solverDiversityBlockedUntil.markFor(sub.solver_address.toLowerCase(), DIVERSITY_TTL_MS);
-      console.warn(`   ⚠ solver ${sub.solver_address.slice(0, 10)} hit diversity cap — skipping all its subs for 14d`);
-      maybeWarnDiversitySaturation();
-    } else if (isReciprocalVerificationError(msg) && sub.solver_address) {
-      reciprocalVerifierSkipUntil.markFor(sub.solver_address.toLowerCase(), RECIPROCAL_TTL_MS);
-      const ttlH = (RECIPROCAL_TTL_MS / 3600_000).toFixed(0);
-      console.warn(`   ⚠ solver ${sub.solver_address.slice(0, 10)} hit reciprocal mutual-pair cap — skipping their subs for ${ttlH}h`);
-    } else {
-      console.warn(`   ⚠ verify error for ${sub.id.slice(0, 8)}: ${msg.slice(0, 200)}`);
-    }
+    handleVerifyFailure(sub, (err as Error).message, "verify error");
   }
   return true;
 }
@@ -1127,7 +1211,7 @@ async function verifyArtifactSubmission(runtime: ReturnType<typeof getRuntime>, 
     const abstain = verifyAbstainReason(sub.id, fetchedTrace.trace);
     recordTraceSeen(sub.id, fetchedTrace.trace, abstain);
     if (abstain) {
-      verifiedSubmissions.add(sub.id);
+      markVerifyDone(sub.id);
       console.log(`   ⛔ abstain — ${abstain}; no quorum credit, no verify slot spent`);
       return;
     }
@@ -1140,8 +1224,7 @@ async function verifyArtifactSubmission(runtime: ReturnType<typeof getRuntime>, 
       };
       questions = cRes.questions ?? [];
     } catch (err) {
-      console.warn(`   ⚠ comprehension request failed: ${(err as Error).message.slice(0, 120)}`);
-      verifiedSubmissions.add(sub.id);
+      handleVerifyFailure(sub, (err as Error).message, "comprehension request failed");
       return;
     }
     if (questions.length > 0) {
@@ -1149,8 +1232,7 @@ async function verifyArtifactSubmission(runtime: ReturnType<typeof getRuntime>, 
       try {
         await runtime.connection.request("POST", `/v1/mining/submissions/${sub.id}/comprehension/answers`, { answers });
       } catch (err) {
-        console.warn(`   ⚠ comprehension answers failed: ${(err as Error).message.slice(0, 120)}`);
-        verifiedSubmissions.add(sub.id);
+        handleVerifyFailure(sub, (err as Error).message, "comprehension answers failed");
         return;
       }
     }
@@ -1165,8 +1247,7 @@ async function verifyArtifactSubmission(runtime: ReturnType<typeof getRuntime>, 
       artifactText = JSON.stringify(insp?.artifact ?? {}).slice(0, 6000);
       console.log(`   🔍 inspected artifact (${insp?.artifactType ?? "?"}, ${artifactText.length}c)`);
     } catch (err) {
-      console.warn(`   ⚠ inspect_submission_artifact failed for ${sub.id.slice(0, 8)}: ${(err as Error).message.slice(0, 120)} — skipping`);
-      verifiedSubmissions.add(sub.id);
+      handleVerifyFailure(sub, (err as Error).message, "inspect_submission_artifact failed");
       return;
     }
 
@@ -1204,7 +1285,7 @@ async function verifyArtifactSubmission(runtime: ReturnType<typeof getRuntime>, 
     // instead of vouching either way — that protects our verifier reputation.
     const decision = decideFromRerun(rerunResult);
     if (decision.action === "abstain") {
-      verifiedSubmissions.add(sub.id);
+      markVerifyDone(sub.id);
       recordAudit("verify", "skipped", decision.note, { submissionId: sub.id, kind: sub.verifier_kind ?? "?" });
       console.warn(`   ⚖️ abstain ${sub.id.slice(0, 8)}: ${decision.note}`);
       return;
@@ -1214,9 +1295,13 @@ async function verifyArtifactSubmission(runtime: ReturnType<typeof getRuntime>, 
     //    reasoning/efficiency/novelty from the trace + artifact code via the LLM.
     const gradeInput = `${fetchedTrace.trace}\n\n## Submitted artifact\n${artifactText}`;
     const scored = await scoreSubmissionTrace(gradeInput, sub.domain_tags ?? []);
-    if (!scored || scored.skip) {
-      console.log(`   → artifact verify skip${scored?.skip ? `: ${scored.skip}` : " (score parse fail)"}`);
-      verifiedSubmissions.add(sub.id);
+    if (!scored) {
+      handleVerifyFailure(sub, SCORE_PARSE_FAIL, SCORE_PARSE_FAIL);
+      return;
+    }
+    if (scored.skip) {
+      console.log(`   → artifact verify skip: ${scored.skip}`);
+      markVerifyDone(sub.id);
       return;
     }
     scored.correctnessScore = decision.correctness;
@@ -1240,7 +1325,8 @@ async function verifyArtifactSubmission(runtime: ReturnType<typeof getRuntime>, 
       knowledgeInsight: scored.knowledgeInsight,
       knowledgeDomainTags: scored.knowledgeDomainTags ?? sub.domain_tags ?? [],
     });
-    verifiedSubmissions.add(sub.id);
+    markVerifyDone(sub.id);
+    recordVerifySuccess();
     verifyRollingCount += 1;
     recordVerify();
     const sc = [scored.correctnessScore, scored.reasoningScore, scored.efficiencyScore, scored.noveltyScore]
@@ -1249,29 +1335,9 @@ async function verifyArtifactSubmission(runtime: ReturnType<typeof getRuntime>, 
     recordAudit("verify", "submitted", `artifact scores=${sc}`, { submissionId: sub.id, kind: sub.verifier_kind ?? "?" });
     console.log(`   ✅🔁 verified ARTIFACT ${sub.id.slice(0, 8)} scores=${sc} (${verifyRollingCount}/${VERIFY_ROLLING_CAP})`);
   } catch (err) {
-    verifiedSubmissions.add(sub.id);
-    const msg = (err as Error).message;
-    if (isVerifyCapError(msg)) {
-      recordVerifyLimitHit();
-      console.warn(`   ⚠ verify shared cap hit — halting verify attempts until UTC midnight`);
-    } else if (isComprehensionGateError(msg)) {
-      markComprehensionGated(sub.id);
-      console.warn(`   ⚠ comprehension/artifact gate on ${sub.id.slice(0, 8)} — skipping`);
-    } else if (isFinalizedError(msg)) {
-      finalizedSubmissionSkip.markFor(sub.id, FINALIZED_TTL_MS);
-      console.warn(`   ⚠ ${sub.id.slice(0, 8)} already finalized — skipping`);
-    } else if (isDiversityBlockError(msg) && sub.solver_address) {
-      // Same per-solver 14d cap as the standard path. Mark the solver blocked so
-      // we stop burning rate-limited reruns on the rest of their artifact subs.
-      solverDiversityBlockedUntil.markFor(sub.solver_address.toLowerCase(), DIVERSITY_TTL_MS);
-      console.warn(`   ⚠ solver ${sub.solver_address.slice(0, 10)} hit diversity cap — skipping all its subs for 14d`);
-      maybeWarnDiversitySaturation();
-    } else if (isReciprocalVerificationError(msg) && sub.solver_address) {
-      reciprocalVerifierSkipUntil.markFor(sub.solver_address.toLowerCase(), RECIPROCAL_TTL_MS);
-      console.warn(`   ⚠ solver ${sub.solver_address.slice(0, 10)} hit reciprocal mutual-pair cap — skipping their subs`);
-    } else {
-      console.warn(`   ⚠ artifact verify error for ${sub.id.slice(0, 8)}: ${msg.slice(0, 180)}`);
-    }
+    // Same handler as the standard path. A diversity 429 here also marks the
+    // solver blocked so we stop burning rate-limited reruns on their other subs.
+    handleVerifyFailure(sub, (err as Error).message, "artifact verify error");
   }
 }
 
@@ -1352,6 +1418,10 @@ async function pollVerifiableSubmissions(runtime: ReturnType<typeof getRuntime>)
     return;
   }
   if (verifyRollingCount >= VERIFY_ROLLING_CAP) return;
+  // Venice 402 pause (key-level budget) or failure-streak pause (consecutive
+  // temporary failures across candidates): every candidate would fail the same
+  // way, so don't even fetch the pool until it lapses. Logged once at pause start.
+  if (verifyLoopPaused()) return;
   verifyPollInFlight = true;
   try {
     const res = (await runtime.connection.request(
@@ -1374,6 +1444,7 @@ async function pollVerifiableSubmissions(runtime: ReturnType<typeof getRuntime>)
     const subs = raw.filter(
       (s) =>
         !verifiedSubmissions.has(s.id) &&
+        !verifyTransientSkip.isSkipped(s.id) &&
         !isComprehensionGated(s.id) &&
         !finalizedSubmissionSkip.isSkipped(s.id) &&
         !(s.challenge_id && isOwnChallenge(s.challenge_id)),
