@@ -145,12 +145,22 @@ const VERIFIABLE_FIX_RETRIES = Number(process.env.BOT_VERIFIABLE_FIX_RETRIES ?? 
  * trying to synthesize them afterwards. The three bullets mirror the gateway's
  * own "Concrete fix" guidance verbatim.
  */
-const SUMMARY_SPECIFICITY_RULE = `
-- The "summary" is scored for specificity by an automated grader and REJECTED below threshold. It must contain ALL THREE of:
-  • a measurable claim with units or counts — "O(n log n) for n=10000 elements", "2 passes over 64 bytes", "reduces 3 scans to 1"; a bare year or step number does NOT count;
-  • a named method in backticks — \`bisect_right\`, \`urlsplit\`, \`Map.get\` — used in a clause that says what it does, not just listed;
-  • an explicit comparison — "X instead of Y", "vs", "better than" — e.g. "iterative accumulation instead of recursion (avoids stack depth limits at n>1000)".
-  Describe the ALGORITHM and its measurable properties. Do NOT pad with metadata (reward amounts, challenge ids, the function's own name) — the grader scores those zero.`;
+// 2026-10-01: REWRITTEN to ask for what the gate credits. The 3-bullet version
+// (number + backticked method + comparison) produced summaries that satisfied
+// only ONE of the categories passesSpecificityGate needs two of (techniques /
+// code / failures) — a model that obeyed it exactly was skipped locally: 3 of
+// 3 grok-4-7 python solves on 10-01, and regeneration (same rule) could not
+// repair them ("enriched 4→4"). The five bullets now name each scoring
+// category with wording the local mirror and the gateway's own "Missing
+// categories" text both credit. A test pins the rule's examples to the gate.
+export const SUMMARY_SPECIFICITY_RULE = `
+- The "summary" is scored for specificity by an automated grader and REJECTED below threshold. Write 2-3 sentences, under 450 characters, containing ALL FIVE of these, each in a clause that says what it does:
+  • an identifier in backticks — \`bisect_right\`, \`urlsplit\`, \`subprocess.run\`;
+  • a method or technique named in DOUBLE QUOTES, dotted or camelCase — "os.path.commonpath", "json.loads", "readIndex" (a bare word like "http" does NOT count);
+  • a failure mode or edge case, using the word fails, error, or edge case — "fails closed with an error on '..' segments", "the empty-list edge case returns -1";
+  • a measurable claim with a unit or count — "O(n log n) for 10000 elements", "2 checks per path", "under 1 ms";
+  • an explicit comparison — "X instead of Y", "vs", "better than".
+  Describe the ALGORITHM and its behavior. Do NOT pad with metadata (reward amounts, challenge ids, the function's own name) — the grader scores those zero.`;
 
 // Hidden test harnesses on these challenges frequently include SECURITY assertions
 // (a single security failure rejects the whole solve even when the functional
@@ -988,7 +998,7 @@ export async function regenerateVerifiableSummary(
         {
           role: "system",
           content:
-            `Rewrite a solution summary so it passes an automated specificity grader. Output the rewritten summary as PLAIN TEXT only — no JSON, no quotes around the whole thing, no preamble.\n${SUMMARY_SPECIFICITY_RULE}\n- 2-4 sentences, 150-500 characters. Describe only what the code actually does; invent no measurements.`,
+            `Rewrite a solution summary so it passes an automated specificity grader. Output the rewritten summary as PLAIN TEXT only — no JSON, no quotes around the whole thing, no preamble.\n${SUMMARY_SPECIFICITY_RULE}\n- 150-450 characters. Describe only what the code actually does; invent no measurements.`,
         },
         {
           role: "user",
@@ -2025,6 +2035,18 @@ async function discoverAndSolveMiningChallengesInner(
           s.traceSummary = rewritten;
         } else {
           console.warn(`   ⛔ summary still below the specificity gate after regeneration — skipping submit to save the solve`);
+          // Local skips are calibration data too (2026-10-01): log the summary
+          // that failed, with the local verdict, next to the gateway 400s.
+          const skipped = rewritten ?? s.traceSummary ?? "";
+          appendJsonl(SUMMARY_REJECTIONS_LOG, {
+            ts: new Date().toISOString(),
+            challengeId: ch.id,
+            verifierKind: kind,
+            model: modelUsed,
+            gateway: "local-skip (not submitted)",
+            summary: skipped.slice(0, 600),
+            local: specificityCategories(skipped),
+          });
           appendJsonl(MINING_LOG, {
             ts: new Date().toISOString(),
             challengeId: ch.id,

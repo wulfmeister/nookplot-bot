@@ -5637,3 +5637,27 @@ describe("2026-10-01 chat() timeout floor (grok-4-7 at xhigh outlasts 90-300s ca
     assert.equal(effectiveTimeoutMs(90_000, 0), 90_000, "floor 0 restores the call-site value");
   });
 });
+
+describe("2026-10-01 SUMMARY_SPECIFICITY_RULE is pinned to the local gate (they drifted apart once)", () => {
+  it("each bullet's own examples trigger the category that bullet teaches", async () => {
+    const { SUMMARY_SPECIFICITY_RULE } = await import("../mining.js");
+    const bullets = SUMMARY_SPECIFICITY_RULE.split("•").slice(1);
+    assert.equal(bullets.length, 5, "five scoring bullets");
+    const [code, technique, failure] = bullets;
+    assert.ok(specificityCategories(code).code, "backtick bullet must read as code");
+    // Only the quoted examples, not the bullet's prose, should earn the technique credit.
+    const quoted = [...technique.matchAll(/"[^"]+"/g)].map((m) => m[0]).filter((q) => q !== '"http"');
+    assert.ok(quoted.length >= 2);
+    for (const q of quoted) assert.ok(specificityCategories(`Uses ${q} here.`).techniques, `${q} must count as a technique`);
+    assert.equal(specificityCategories('Uses "http" here.').techniques, false, "the rule's own counter-example must not count");
+    const failEx = [...failure.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    for (const f of failEx) assert.ok(specificityCategories(f).failures, `failure example must count: ${f}`);
+  });
+  it("a summary that follows the rule passes passesSpecificityGate", () => {
+    const followed =
+      'Resolves each name with "os.path.commonpath" under base_dir instead of string prefix checks, so a path outside it fails closed with an error. ' +
+      "`subprocess.run` gets an argv list (no shell), and the missing-file edge case returns -1 after 2 checks per path.";
+    assert.ok(followed.length < 450);
+    assert.equal(passesSpecificityGate(followed), true);
+  });
+});
