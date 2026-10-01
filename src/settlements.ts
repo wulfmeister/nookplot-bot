@@ -51,6 +51,19 @@ export interface SettlementRow {
   compositeScore?: number;
   submittedAt?: string;
   verifiedAt?: string;
+  /** Challenge baseReward (NOOK) copied from our own mining-submissions row —
+   *  present from 2026-10-01. realized = compositeScore × baseReward × R with
+   *  R constant per settlement epoch, so this is what turns K into R. */
+  baseReward?: number;
+  difficulty?: string;
+}
+
+/** Local mining-row fields the reconciler copies onto a settlement row. */
+export interface LocalSubmissionMeta {
+  verifierKind?: string;
+  model?: string;
+  baseReward?: number;
+  difficulty?: string;
 }
 
 const TERMINAL = new Set(["verified", "expired", "rejected"]);
@@ -64,7 +77,7 @@ const TERMINAL = new Set(["verified", "expired", "rejected"]);
  */
 export function reconcileSettlements(
   gwRows: GatewaySubmissionRow[],
-  localKindBySubId: Map<string, { verifierKind?: string; model?: string }>,
+  localKindBySubId: Map<string, LocalSubmissionMeta>,
   existing: Array<{ submissionId?: string; status?: string; realizedNook?: number }>,
   nowIso: string,
 ): SettlementRow[] {
@@ -93,9 +106,84 @@ export function reconcileSettlements(
       ...(Number.isFinite(comp) ? { compositeScore: comp } : {}),
       submittedAt: r.submittedAt,
       verifiedAt: r.verifiedAt,
+      ...(local?.baseReward !== undefined && Number.isFinite(local.baseReward) && local.baseReward > 0 ? { baseReward: local.baseReward } : {}),
+      ...(local?.difficulty ? { difficulty: local.difficulty } : {}),
     });
   }
   return out;
+}
+
+/**
+ * Settlement-batch key: the mining epoch-day (02:00Z boundary) of the
+ * settlement time. Measured 2026-10-01 on our ledger + 14 challenge-detail
+ * GETs: R = K / baseReward is identical across kinds AND difficulties inside
+ * one epoch (09-01: standard hard, standard easy and python hard all
+ * R=0.2745; 09-18: python medium + hard R=4.375; 09-22: standard easy +
+ * python medium R=2.4656; 09-27: python medium + standard expert R=1.7731)
+ * and stays put across that epoch's settlement passes (09-20, 09-21/22,
+ * 09-22/23, 09-29 each paid the same K at two pass times; 09-15 standards
+ * verified 02:56..07:11 all one K). The 02:00Z boundary is visible in the
+ * data: 08-13T00:xx paid 08-12's K (117,184) while 08-13T02:xx paid a new
+ * one (125,856). No counterexample among our own paid rows since 08-08. So
+ * one epoch-day is ONE independent observation of R, however many
+ * difficulty variants (distinct K) it contains.
+ *
+ * Scope: OUR rows only. Other solvers on the same challenge settle at a
+ * different R (09-27: 0.8526 vs our 1.7731) — consistent with R carrying the
+ * solver's stake-tier × guild multiplier (unverified) — which is irrelevant
+ * here because this ledger only holds our submissions.
+ */
+export function settlementEpochKey(ms: number): number {
+  return Math.floor((ms - 2 * 3_600_000) / 86_400_000);
+}
+
+/** ISO date (YYYY-MM-DD) of the epoch start for a settlementEpochKey. */
+export function settlementEpochLabel(key: number): string {
+  return new Date(key * 86_400_000 + 2 * 3_600_000).toISOString().slice(0, 10);
+}
+
+function median(xs: number[]): number {
+  const sorted = [...xs].sort((a, c) => a - c);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
+/**
+ * Pro-rata rate R per settlement epoch from PAID rows that carry baseReward
+ * (R = realized / (compositeScore × baseReward)). Diagnostics only — R is
+ * exogenous and cancels out of the per-challenge ranking. Newest first.
+ */
+export function rHatByEpoch(
+  rows: Array<{ ts?: string; verifiedAt?: string; status?: string; realizedNook?: number; compositeScore?: number; baseReward?: number }>,
+  nowMs: number,
+  windowDays = 14,
+): Array<{ epoch: string; r: number; n: number }> {
+  const cutoff = nowMs - windowDays * 86_400_000;
+  const byEpoch = new Map<number, number[]>();
+  for (const r of rows) {
+    if (r.status !== "verified" || r.realizedNook === undefined || !r.compositeScore) continue;
+    if (!(r.baseReward && r.baseReward > 0)) continue;
+    const t = Date.parse(r.verifiedAt ?? r.ts ?? "");
+    if (!Number.isFinite(t) || t < cutoff) continue;
+    const key = settlementEpochKey(t);
+    const list = byEpoch.get(key) ?? [];
+    list.push(r.realizedNook / (r.compositeScore * r.baseReward));
+    byEpoch.set(key, list);
+  }
+  return [...byEpoch.entries()]
+    .sort((a, b) => b[0] - a[0])
+    .map(([key, rs]) => ({ epoch: settlementEpochLabel(key), r: median(rs), n: rs.length }));
+}
+
+export interface KHatEntry {
+  kHat: number;
+  compHat: number;
+  ev: number;
+  n: number;
+  /** Distinct settlement epochs (independent draws of R), NOT distinct K. */
+  batches: number;
+  /** Median R = K / baseReward over rows that carry baseReward (diagnostic). */
+  rHat?: number;
+  rN?: number;
 }
 
 /**
@@ -111,36 +199,53 @@ export function reconcileSettlements(
  * windowing would blend cross-regime K (measured 2.4x skew on live data)
  * for up to windowDays after any catch-up.
  *
- * `batches` counts DISTINCT K values: K is batch-constant per settlement
- * epoch, so three rows can be ONE independent observation. Evidence gates
- * must use batches, not row count, or a single lucky-epoch batch whipsaws
- * the ranking (R swings ~9x — more than the historical 5-6.5x kind gap).
+ * `batches` counts DISTINCT SETTLEMENT EPOCHS (settlementEpochKey), not
+ * distinct K. Corrected 2026-10-01: K = baseReward × R, so one epoch that
+ * paid a medium and a hard python solve has two K values but ONE draw of R —
+ * counting distinct K let a single epoch pass the 2-batch evidence bar.
+ * Evidence gates must use batches, not row count, or a single lucky-epoch
+ * batch whipsaws the ranking (R swings ~9x — more than the historical 5-6.5x
+ * kind gap).
+ *
+ * LEGACY CAVEAT: kHat still mixes difficulties (a standard expert's K is
+ * 3.3x a standard hard's in the same epoch), so this kind-level EV is only
+ * the input for the legacy ordering (BOT_CHALLENGE_EV_RANK=0). The default
+ * ranker (src/challenge-ev.ts) ranks each challenge by its own baseReward,
+ * where R cancels. `rHat` (median R over rows that carry baseReward) is
+ * reported for diagnostics.
  */
 export function kHatByKind(
-  rows: Array<{ ts?: string; verifiedAt?: string; verifierKind?: string; status?: string; realizedNook?: number; compositeScore?: number }>,
+  rows: Array<{ ts?: string; verifiedAt?: string; verifierKind?: string; status?: string; realizedNook?: number; compositeScore?: number; baseReward?: number }>,
   nowMs: number,
   windowDays = 14,
-): Record<string, { kHat: number; compHat: number; ev: number; n: number; batches: number }> {
+): Record<string, KHatEntry> {
   const cutoff = nowMs - windowDays * 86_400_000;
-  const byKind = new Map<string, { ks: number[]; comps: number[]; kSet: Set<number> }>();
+  const byKind = new Map<string, { ks: number[]; comps: number[]; epochs: Set<number>; rs: number[] }>();
   for (const r of rows) {
     if (r.status !== "verified" || r.realizedNook === undefined || !r.compositeScore) continue;
     const t = Date.parse(r.verifiedAt ?? r.ts ?? "");
     if (!Number.isFinite(t) || t < cutoff) continue;
     const kind = r.verifierKind ?? "standard";
-    const b = byKind.get(kind) ?? { ks: [], comps: [], kSet: new Set<number>() };
+    const b = byKind.get(kind) ?? { ks: [], comps: [], epochs: new Set<number>(), rs: [] };
     const k = r.realizedNook / r.compositeScore;
     b.ks.push(k);
     b.comps.push(r.compositeScore);
-    b.kSet.add(Math.round(k));
+    b.epochs.add(settlementEpochKey(t));
+    if (r.baseReward && r.baseReward > 0) b.rs.push(k / r.baseReward);
     byKind.set(kind, b);
   }
-  const out: Record<string, { kHat: number; compHat: number; ev: number; n: number; batches: number }> = {};
+  const out: Record<string, KHatEntry> = {};
   for (const [kind, b] of byKind) {
-    const sorted = [...b.ks].sort((a, c) => a - c);
-    const kHat = sorted[Math.floor(sorted.length / 2)];
+    const kHat = median(b.ks);
     const compHat = b.comps.reduce((s, c) => s + c, 0) / b.comps.length;
-    out[kind] = { kHat, compHat, ev: kHat * compHat, n: b.ks.length, batches: b.kSet.size };
+    out[kind] = {
+      kHat,
+      compHat,
+      ev: kHat * compHat,
+      n: b.ks.length,
+      batches: b.epochs.size,
+      ...(b.rs.length > 0 ? { rHat: median(b.rs), rN: b.rs.length } : {}),
+    };
   }
   return out;
 }
@@ -179,9 +284,16 @@ export async function runSettlementsTick(runtime: RuntimeLike, myAddress: string
     console.warn(`   ⚠ settlements fetch failed: ${(err as Error).message.slice(0, 120)}`);
     return { appended: 0 };
   }
-  const localKindBySubId = new Map<string, { verifierKind?: string; model?: string }>();
-  for (const m of readJsonl<{ submissionId?: string; verifierKind?: string; model?: string }>(MINING_LOG)) {
-    if (m.submissionId) localKindBySubId.set(m.submissionId, { verifierKind: m.verifierKind, model: m.model });
+  const localKindBySubId = new Map<string, LocalSubmissionMeta>();
+  for (const m of readJsonl<{ submissionId?: string } & LocalSubmissionMeta>(MINING_LOG)) {
+    if (m.submissionId) {
+      localKindBySubId.set(m.submissionId, {
+        verifierKind: m.verifierKind,
+        model: m.model,
+        baseReward: m.baseReward,
+        difficulty: m.difficulty,
+      });
+    }
   }
   const fresh = reconcileSettlements(gwRows, localKindBySubId, readSettlements(), new Date().toISOString());
   const { recordMiningOutcomeOnce } = await import("./learnings.js");
