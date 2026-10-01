@@ -198,14 +198,26 @@ export interface InboxTriage {
 export function triageFromAnswers(a: Record<string, JevAnswer> | null | undefined): InboxTriage | null {
   const p = a?.priority?.score;
   if (p === undefined) return null;
-  const category = a?.category?.choice ?? "other";
-  const categoryConfidence = a?.category?.confidence ?? 0;
+  return labelTriage(p, a?.category?.choice ?? "other", a?.category?.confidence ?? 0);
+}
+
+/**
+ * Pure: the label rule, applied to raw scores. Stored verdicts are re-labelled
+ * through this on every read, so a rule change re-ranks the backlog too.
+ */
+export function labelTriage(p: number, category: string, categoryConfidence: number): InboxTriage {
   // A message asking for keys/funds/links is flagged whatever its priority —
   // the operator must see it, and must know not to act on it blindly.
+  // Promotion and bot chatter are capped at "low" whatever the score: on the
+  // first live backfill (2026-10-01, 25 threads) Jev scored NOTHING below
+  // 1.5, so a confident category is the better signal for the noise floor.
+  const noise = (category === "promotion" || category === "bot_chatter") && categoryConfidence >= 0.5;
   const label: InboxTriage["label"] =
     category === "risky" && categoryConfidence >= 0.5
       ? "risky"
-      : p >= 2.25
+      : noise
+        ? (p >= 0.75 ? "low" : "ignore")
+        : p >= 2.25
         ? "act"
         : p >= 1.5
           ? "read"

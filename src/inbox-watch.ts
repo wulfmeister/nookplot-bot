@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { writeFileSync } from "node:fs";
 import type { NookplotRuntime } from "@nookplot/runtime";
 import { NOOK_DIR, readJsonl, appendJsonl } from "./util.js";
-import { jevTriageMessage, compareTriage, TRIAGE_ICON, type InboxTriage } from "./jev.js";
+import { jevTriageMessage, compareTriage, labelTriage, TRIAGE_ICON, type InboxTriage } from "./jev.js";
 
 type RuntimeLike = Pick<NookplotRuntime, "connection">;
 
@@ -83,7 +83,8 @@ export async function runInboxWatchTick(runtime: RuntimeLike): Promise<void> {
   // bounded score/choice, and nothing here acts on it except sort order.
   const triageByKey = new Map<string, InboxTriage>();
   for (const e of readJsonl<{ key?: string; triage?: InboxTriage }>(TRIAGE_LOG)) {
-    if (e.key && e.triage) triageByKey.set(e.key, e.triage);
+    // Re-label from the stored raw scores so a rule change re-ranks the backlog.
+    if (e.key && e.triage) triageByKey.set(e.key, labelTriage(e.triage.priority, e.triage.category, e.triage.categoryConfidence));
   }
   let triaged = 0;
   for (const t of threads) {

@@ -5582,6 +5582,9 @@ describe("jev (Venice decision model) client + triage + shadow-check report", ()
     assert.equal(t(0.2).label, "ignore");
     assert.equal(t(0.2, "risky").label, "risky", "asks for keys/funds must surface even at low priority");
     assert.equal(t(2.6, "risky", 0.3).label, "act", "a low-confidence risky call does not override");
+    assert.equal(t(2.6, "promotion").label, "low", "confident promotion is capped at low (live: Jev scored nothing below 1.5)");
+    assert.equal(t(0.3, "bot_chatter").label, "ignore");
+    assert.equal(t(2.6, "promotion", 0.3).label, "act", "an unsure promotion call does not cap");
     assert.equal(triageFromAnswers(null), null);
   });
 
