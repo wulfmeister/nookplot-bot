@@ -109,6 +109,15 @@ export const verifyTransientSkip = new SkipCache();
 export const verifyBudgetPause = new SkipCache();
 export const VERIFY_BUDGET_PAUSE_KEY = "venice-budget";
 
+/**
+ * Verify path — whole-loop pause after a run of consecutive temporary failures
+ * with no success in between (in practice across different candidates, since
+ * each failed one sits in verifyTransientSkip): an account-level block the
+ * per-submission bounds can't see. Escalating TTL: nextVerifyStreak in verify-errors.ts.
+ */
+export const verifyStreakPause = new SkipCache();
+export const VERIFY_STREAK_PAUSE_KEY = "failure-streak";
+
 /** Mining path — challenge id we've already submitted, gateway 409 told us. */
 export const alreadySubmittedChallenges = new SkipCache();
 

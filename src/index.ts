@@ -25,8 +25,19 @@ import {
   verifyTransientSkip,
   verifyBudgetPause,
   VERIFY_BUDGET_PAUSE_KEY,
+  verifyStreakPause,
+  VERIFY_STREAK_PAUSE_KEY,
 } from "./skip-caches.js";
-import { decideVerifyFailure, SCORE_PARSE_FAIL, VERIFY_RETRY_DEFAULTS } from "./verify-errors.js";
+import {
+  decideVerifyFailure,
+  feedsVerifyStreak,
+  nextVerifyStreak,
+  NO_VERIFY_STREAK,
+  SCORE_PARSE_FAIL,
+  VERIFY_RETRY_DEFAULTS,
+  type VerifyRetryState,
+  type VerifyStreakState,
+} from "./verify-errors.js";
 import {
   recordDiversityPollSaturation,
   maybeWarnDiversityPollSaturation,
@@ -572,15 +583,30 @@ function recordFetchStrikeAndShouldRetire(id: string): boolean {
 // isComprehensionGateError moved to ./verify-errors (pure, tested) with the
 // rest of the verify failure classification.
 
-// Strike counts for temporary verify failures that might be deterministic for
-// one submission (gateway 500, timeout, parse fail, unknown). Rate limits,
-// Venice 402, 502/503/504 and transport errors never strike. Cleared whenever
-// the submission is marked done.
-const verifyTransientStrikes = new Map<string, number>();
+// Retry bookkeeping for temporary verify failures: strikes (failures that might
+// be deterministic for one submission: gateway 500, unknown 429, timeout, parse
+// fail, unknown) and attempts (every temporary failure except the 402 pause and
+// the shared-cap halt, capped at VERIFY_RETRY_DEFAULTS.retryMax). Cleared
+// whenever the submission is marked done.
+const verifyRetryState = new Map<string, VerifyRetryState>();
+
+// Loop-level failure streak (nextVerifyStreak): consecutive temporary failures
+// across candidates with no success in between pause the whole verify loop.
+let verifyStreak: VerifyStreakState = NO_VERIFY_STREAK;
 
 function markVerifyDone(id: string): void {
   verifiedSubmissions.add(id);
-  verifyTransientStrikes.delete(id);
+  verifyRetryState.delete(id);
+}
+
+/** POST /verify accepted: clears the loop-level failure streak. */
+function recordVerifySuccess(): void {
+  verifyStreak = nextVerifyStreak(verifyStreak, "success", Date.now()).state;
+}
+
+/** True while a 402 budget pause or a failure-streak pause is active. */
+function verifyLoopPaused(): boolean {
+  return verifyBudgetPause.isSkipped(VERIFY_BUDGET_PAUSE_KEY) || verifyStreakPause.isSkipped(VERIFY_STREAK_PAUSE_KEY);
 }
 
 /**
@@ -590,11 +616,13 @@ function markVerifyDone(id: string): void {
  * until restart (8fc39106 and 34618e81, 2026-10-01). Now only success or a
  * gateway-permanent outcome marks the submission done; temporary failures get
  * a short-TTL skip and, if they could be about this submission, a strike.
+ * Every temporary failure also counts toward a per-submission ceiling and the
+ * loop-level failure streak, so no class can retry forever.
  */
 function handleVerifyFailure(sub: VerifiableSubmission, rawMsg: string | undefined, label: string): void {
   const msg = String(rawMsg ?? ""); // a non-Error throw has no .message
   const id8 = sub.id.slice(0, 8);
-  const d = decideVerifyFailure(msg, verifyTransientStrikes.get(sub.id) ?? 0);
+  const d = decideVerifyFailure(msg, verifyRetryState.get(sub.id) ?? {});
   const solver = sub.solver_address?.toLowerCase();
   if (d.cls.kind === "verify-cap") {
     // Shared-cap 429: halt further attempts (saves the SDK retry storm).
@@ -622,18 +650,34 @@ function handleVerifyFailure(sub: VerifiableSubmission, rawMsg: string | undefin
   }
   if (d.action === "mark-done") {
     markVerifyDone(sub.id);
-    if (d.retired) {
-      console.warn(`   ⏭ retiring ${id8} after ${VERIFY_RETRY_DEFAULTS.strikeLimit} temporary failures (last: ${d.cls.kind})`);
+    if (d.retiredBy === "strikes") {
+      console.warn(`   ⏭ retiring ${id8} after ${VERIFY_RETRY_DEFAULTS.strikeLimit} strike-counting failures (last: ${d.cls.kind})`);
+    } else if (d.retiredBy === "ceiling") {
+      console.warn(`   ⏭ retiring ${id8} after ${VERIFY_RETRY_DEFAULTS.retryMax} temporary failures (retry ceiling; last: ${d.cls.kind})`);
     }
   } else {
-    if (d.strikesAfter > 0) verifyTransientStrikes.set(sub.id, d.strikesAfter);
+    if (d.strikesAfter > 0 || d.attemptsAfter > 0) {
+      verifyRetryState.set(sub.id, { strikes: d.strikesAfter, attempts: d.attemptsAfter });
+    }
     verifyTransientSkip.markFor(sub.id, d.retryAfterMs);
     const strikeNote = d.cls.strikes ? `, strike ${d.strikesAfter}/${VERIFY_RETRY_DEFAULTS.strikeLimit}` : "";
-    console.log(`   ↻ ${id8} kept as a candidate (${d.cls.kind}${strikeNote}) — retry in ${Math.round(d.retryAfterMs / 60_000)}m`);
+    const ceilingNote = d.cls.ceiling ? `, attempt ${d.attemptsAfter}/${VERIFY_RETRY_DEFAULTS.retryMax}` : "";
+    console.log(`   ↻ ${id8} kept as a candidate (${d.cls.kind}${strikeNote}${ceilingNote}) — retry in ${Math.round(d.retryAfterMs / 60_000)}m`);
   }
   if (d.pauseAllMs > 0 && !verifyBudgetPause.isSkipped(VERIFY_BUDGET_PAUSE_KEY)) {
     verifyBudgetPause.markFor(VERIFY_BUDGET_PAUSE_KEY, d.pauseAllMs);
     console.warn(`   ⏸ Venice budget exhausted (402) — pausing all verify attempts for ${Math.round(d.pauseAllMs / 60_000)}m`);
+  }
+  if (feedsVerifyStreak(d)) {
+    const next = nextVerifyStreak(verifyStreak, "failure", Date.now());
+    verifyStreak = next.state;
+    if (next.pauseMs > 0) {
+      verifyStreakPause.markFor(VERIFY_STREAK_PAUSE_KEY, next.pauseMs);
+      console.warn(
+        `   ⏸ ${next.state.trips === 1 ? "consecutive temporary verify failures" : "verify still failing after pause"} ` +
+        `(last: ${d.cls.kind}) — pausing all verify attempts for ${Math.round(next.pauseMs / 60_000)}m (trip ${next.state.trips}, clears on next success)`,
+      );
+    }
   }
 }
 // Re-synced from the rolling-24h shared count (verifySharedCount) at the start
@@ -946,7 +990,8 @@ let artifactRerunCount = 0;
 async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: VerifiableSubmission): Promise<boolean> {
   if (verifiedSubmissions.has(sub.id)) return false;
   if (verifyTransientSkip.isSkipped(sub.id)) return false;
-  if (verifyBudgetPause.isSkipped(VERIFY_BUDGET_PAUSE_KEY)) return false;
+  // 402 budget pause or failure-streak pause: may start mid-batch, so re-check per candidate.
+  if (verifyLoopPaused()) return false;
   if (isComprehensionGated(sub.id)) return false;
   if (finalizedSubmissionSkip.isSkipped(sub.id)) return false;
   if (sub.solver_address && solverDiversityBlockedUntil.isSkipped(sub.solver_address.toLowerCase())) {
@@ -1098,6 +1143,7 @@ async function verifyOneSubmission(runtime: ReturnType<typeof getRuntime>, sub: 
       knowledgeDomainTags: scored.knowledgeDomainTags ?? sub.domain_tags ?? [],
     });
     markVerifyDone(sub.id);
+    recordVerifySuccess();
     traceFetchStrikes.delete(sub.id); // recovered after transient strikes — free the entry
     verifyRollingCount += 1;
     recordVerify();
@@ -1279,6 +1325,7 @@ async function verifyArtifactSubmission(runtime: ReturnType<typeof getRuntime>, 
       knowledgeDomainTags: scored.knowledgeDomainTags ?? sub.domain_tags ?? [],
     });
     markVerifyDone(sub.id);
+    recordVerifySuccess();
     verifyRollingCount += 1;
     recordVerify();
     const sc = [scored.correctnessScore, scored.reasoningScore, scored.efficiencyScore, scored.noveltyScore]
@@ -1370,9 +1417,10 @@ async function pollVerifiableSubmissions(runtime: ReturnType<typeof getRuntime>)
     return;
   }
   if (verifyRollingCount >= VERIFY_ROLLING_CAP) return;
-  // Venice 402 pause (key-level budget): every candidate would fail the same
+  // Venice 402 pause (key-level budget) or failure-streak pause (consecutive
+  // temporary failures across candidates): every candidate would fail the same
   // way, so don't even fetch the pool until it lapses. Logged once at pause start.
-  if (verifyBudgetPause.isSkipped(VERIFY_BUDGET_PAUSE_KEY)) return;
+  if (verifyLoopPaused()) return;
   verifyPollInFlight = true;
   try {
     const res = (await runtime.connection.request(

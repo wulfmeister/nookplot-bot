@@ -106,7 +106,7 @@ describe("verify-errors.classifyVerifyError (table over production strings)", ()
   it("a non-Error throw (message undefined) classifies as unknown instead of throwing", () => {
     const c = classifyVerifyError(undefined as unknown as string);
     assert.equal(c.kind, "unknown");
-    assert.equal(decideVerifyFailure(undefined as unknown as string, 0).action, "retry-later");
+    assert.equal(decideVerifyFailure(undefined as unknown as string, {}).action, "retry-later");
   });
 
   it("no temporary class is permanent and no permanent class strikes", () => {
@@ -140,7 +140,7 @@ describe("verify-errors detectors", () => {
 });
 
 describe("verify-errors.decideVerifyFailure", () => {
-  const cfg: VerifyRetryConfig = { retryAfterMs: 45 * 60_000, strikeLimit: 3 };
+  const cfg: VerifyRetryConfig = { retryAfterMs: 45 * 60_000, strikeLimit: 3, retryMax: 8 };
 
   it("defaults: 45-minute retry window, 3 strikes", () => {
     // The test script does not set BOT_VERIFY_RETRY_MIN / BOT_VERIFY_RETRY_STRIKES.
@@ -150,7 +150,7 @@ describe("verify-errors.decideVerifyFailure", () => {
 
   it("permanent outcomes mark done whatever the strike count", () => {
     for (const prior of [0, 2, 9]) {
-      const d = decideVerifyFailure("Gateway request failed (410): Submission already finalized (status: verified)", prior, cfg);
+      const d = decideVerifyFailure("Gateway request failed (410): Submission already finalized (status: verified)", { strikes: prior, attempts: prior }, cfg);
       assert.equal(d.action, "mark-done");
       assert.equal(d.retired, false);
       assert.equal(d.retryAfterMs, 0);
@@ -158,52 +158,57 @@ describe("verify-errors.decideVerifyFailure", () => {
   });
 
   it("Venice 402 keeps the candidate, never strikes, and pauses the loop", () => {
-    const d = decideVerifyFailure(VENICE_402_SPEND_LIMIT, 2, cfg);
+    const d = decideVerifyFailure(VENICE_402_SPEND_LIMIT, { strikes: 2 }, cfg);
     assert.equal(d.action, "retry-later");
     assert.equal(d.retryAfterMs, cfg.retryAfterMs);
     assert.equal(d.pauseAllMs, cfg.retryAfterMs);
     assert.equal(d.strikesAfter, 2, "a 402 does not consume a strike");
-    // Even a long outage (many 402s) never retires the submission.
-    assert.equal(decideVerifyFailure(VENICE_402_SPEND_LIMIT, 1000, cfg).action, "retry-later");
+    // Even a long outage (many 402s) never retires the submission: a 402 does
+    // not count toward the retry ceiling either (the loop pause bounds it).
+    const edge = decideVerifyFailure(VENICE_402_SPEND_LIMIT, { strikes: 2, attempts: cfg.retryMax - 1 }, cfg);
+    assert.equal(edge.action, "retry-later");
+    assert.equal(edge.attemptsAfter, cfg.retryMax - 1);
   });
 
-  it("rate limits, outages and transport errors never retire", () => {
+  it("rate limits, outages and transport errors never strike (the retry ceiling bounds them)", () => {
     for (const msg of ["fetch failed", GATEWAY_502_HTML, 'Venice API 429: {"error":"The model is currently overloaded. Please try again later."}']) {
-      const d = decideVerifyFailure(msg, 50, cfg);
+      const d = decideVerifyFailure(msg, { strikes: 2 }, cfg);
       assert.equal(d.action, "retry-later", msg);
       assert.equal(d.pauseAllMs, 0, msg);
-      assert.equal(d.strikesAfter, 50, msg);
+      assert.equal(d.strikesAfter, 2, msg);
     }
   });
 
   it("strike-counting failures retire on the third strike", () => {
-    const first = decideVerifyFailure(GATEWAY_500_RECORDING, 0, cfg);
+    const first = decideVerifyFailure(GATEWAY_500_RECORDING, {}, cfg);
     assert.deepEqual([first.action, first.strikesAfter], ["retry-later", 1]);
-    const second = decideVerifyFailure("This operation was aborted", first.strikesAfter, cfg);
+    const second = decideVerifyFailure("This operation was aborted", { strikes: first.strikesAfter, attempts: first.attemptsAfter }, cfg);
     assert.deepEqual([second.action, second.strikesAfter], ["retry-later", 2]);
-    const third = decideVerifyFailure(SCORE_PARSE_FAIL, second.strikesAfter, cfg);
+    const third = decideVerifyFailure(SCORE_PARSE_FAIL, { strikes: second.strikesAfter, attempts: second.attemptsAfter }, cfg);
     assert.equal(third.action, "mark-done");
     assert.equal(third.retired, true);
   });
 
   it("strikeLimit=1 restores the old mark-on-first-failure behaviour for strike kinds only", () => {
-    const one: VerifyRetryConfig = { retryAfterMs: cfg.retryAfterMs, strikeLimit: 1 };
-    assert.equal(decideVerifyFailure(GATEWAY_500_RECORDING, 0, one).action, "mark-done");
-    assert.equal(decideVerifyFailure(VENICE_402_SPEND_LIMIT, 0, one).action, "retry-later");
+    const one: VerifyRetryConfig = { retryAfterMs: cfg.retryAfterMs, strikeLimit: 1, retryMax: cfg.retryMax };
+    assert.equal(decideVerifyFailure(GATEWAY_500_RECORDING, {}, one).action, "mark-done");
+    assert.equal(decideVerifyFailure(VENICE_402_SPEND_LIMIT, {}, one).action, "retry-later");
   });
 });
 
 describe("verify-errors replay of the 2026-10-01 incidents", () => {
   // Minimal model of index.ts handleVerifyFailure's bookkeeping.
-  function replay(msgs: string[], cfg: VerifyRetryConfig = { retryAfterMs: 45 * 60_000, strikeLimit: 3 }) {
+  function replay(msgs: string[], cfg: VerifyRetryConfig = { retryAfterMs: 45 * 60_000, strikeLimit: 3, retryMax: 8 }) {
     let strikes = 0;
+    let attempts = 0;
     let done = false;
     let paused = false;
     for (const m of msgs) {
-      const d = decideVerifyFailure(m, strikes, cfg);
+      const d = decideVerifyFailure(m, { strikes, attempts }, cfg);
       if (d.pauseAllMs > 0) paused = true;
       if (d.action === "mark-done") { done = true; break; }
       strikes = d.strikesAfter;
+      attempts = d.attemptsAfter;
     }
     return { done, strikes, paused };
   }
