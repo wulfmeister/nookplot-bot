@@ -5623,3 +5623,14 @@ describe("jev (Venice decision model) client + triage + shadow-check report", ()
     assert.ok(Number.isNaN(r.python_tests.aucScore), "no rejected rows → AUC undefined");
   });
 });
+
+describe("2026-10-01 chat() timeout floor (grok-4-7 at xhigh outlasts 90-300s call-site timeouts)", () => {
+  it("raises short call-site timeouts to the floor and keeps longer ones", async () => {
+    const { effectiveTimeoutMs } = await import("../venice.js");
+    assert.equal(effectiveTimeoutMs(90_000, 600_000), 600_000);
+    assert.equal(effectiveTimeoutMs(300_000, 600_000), 600_000);
+    assert.equal(effectiveTimeoutMs(undefined, 600_000), 600_000);
+    assert.equal(effectiveTimeoutMs(1_000_000, 600_000), 1_000_000, "the standard-trace solve keeps its 1,000s");
+    assert.equal(effectiveTimeoutMs(90_000, 0), 90_000, "floor 0 restores the call-site value");
+  });
+});

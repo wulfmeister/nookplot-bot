@@ -80,6 +80,25 @@ export function assertVeniceKey(): void {
  */
 const MIN_COMPLETION_TOKENS = Number(process.env.BOT_MIN_COMPLETION_TOKENS ?? 50_000);
 
+/**
+ * Timeout FLOOR for every chat() call (2026-10-01). grok-4-7 at xhigh — the
+ * whole roster since 2026-09-29 — took 149-249s on the bare probe shapes and
+ * more than 300s on production python prompts: two consecutive 300s aborts on
+ * one attempt (10 min, then failure — a one-model pool has no failover).
+ * Call-site timeouts (90-300s) were sized for faster models and aborted
+ * silently. Same design as MIN_COMPLETION_TOKENS: a caller's timeoutMs is a
+ * hint, this is the floor. The effort dial is NOT lowered — that stays the
+ * operator's calibration (see the temperature note below). Override with
+ * BOT_MIN_CALL_TIMEOUT_MS. Worst case per hung call: 2 × floor (one
+ * same-model abort retry).
+ */
+const MIN_CALL_TIMEOUT_MS = Number(process.env.BOT_MIN_CALL_TIMEOUT_MS ?? 600_000);
+
+/** Pure: the timeout a chat() call actually gets. */
+export function effectiveTimeoutMs(requested?: number, floor = MIN_CALL_TIMEOUT_MS): number {
+  return Math.max(requested ?? 180_000, floor);
+}
+
 export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
   assertVeniceKey();
   const maxAttempts = 3;
@@ -96,7 +115,7 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
       const ctrl = new AbortController();
-      const timeoutId = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 180_000);
+      const timeoutId = setTimeout(() => ctrl.abort(), effectiveTimeoutMs(opts.timeoutMs));
       try {
         const res = await fetch(`${BASE}/chat/completions`, {
           method: "POST",

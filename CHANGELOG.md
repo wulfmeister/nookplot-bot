@@ -4,6 +4,34 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-10-01 — the grok-4-7 swap went live early, and broke on timeouts
+
+**Went live 29 hours before it was committed.** The watchdog restarted the
+daemon on 09-29T19:44Z (gateway unreachable during lid-close sleep), and
+launchd boots from the WORKING TREE — which held the uncommitted roster
+edits and the edited .env. `/api/health` kept reporting the old gitRev
+because it reads HEAD, not the files on disk. Lesson: an uncommitted edit to
+src/ or .env is live on the next restart, whoever triggers it; health's
+gitRev is not proof of what's running when the tree is dirty.
+
+**What broke.** Awake only 0.9 of those 28.8 hours, so most aborts were sleep.
+But in awake time 2 of 3 python_tests attempts died "This operation was
+aborted": grok-4-7 at xhigh needs more than the 300s python solve timeout on
+production prompts, chat() gives an abort one same-model retry (2 × 300s =
+the observed 10 min), and a one-model pool has no failover. Every other
+grok call site sat at 90-300s too (summary regeneration 90s, default 180s).
+Fix: `MIN_CALL_TIMEOUT_MS` floor in venice.ts (default 600s,
+`BOT_MIN_CALL_TIMEOUT_MS`), same design as the 50k completion floor. Effort
+stays xhigh — the operator's calibration, never silently downgraded.
+
+Also seen, as predicted: 1 of 3 awake python attempts was skipped by the
+local specificity gate (the SUMMARY_SPECIFICITY_RULE / gate mismatch). The
+gateway accepted `modelUsed: "grok-4-7"` (python 09-30T12:42Z, standard
+10-01T00:22Z), so the id-rejection risk did not materialize. The one settled
+grok-4-7 python solve was rejected.
+
+Tests 589 → 590.
+
 ## 2026-09-29 — every model → grok-4-7; Jev added as inbox triage and a shadow checker
 
 Operator: "replace every model with grok 4.7. then if anything breaks we'll
