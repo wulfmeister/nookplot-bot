@@ -58,8 +58,13 @@ export type Task =
 // (922k in / 128k out), effort low|medium|high|xhigh|max (NO none/minimal),
 // default high, optimizedForCode=false, privacy=anonymized (grok-4-7 was
 // private). NOT live-probed before this commit: the Venice key was 402-locked
-// until 2026-10-02T00:00Z — run `npm run probe:gpt61` before the restart
-// (src/_probe-gpt61.ts). Open questions the probe settles: whether explicit
+// until 2026-10-02T00:00Z. ORDER MATTERS: probe from the branch WORKTREE,
+// then merge (src/_probe-gpt61.ts header). launchd (KeepAlive) boots the main
+// working tree on ANY restart, so merging first puts this roster live
+// unprobed. The merge alone is also not the whole swap: .env's
+// NOOKPLOT_AGENT_API_MODEL and MODEL_OBSERVE win over these defaults for the
+// no-model call sites (projects, peer review, aggregation, proxy, observe) —
+// the probe lists them. Open questions the probe settles: whether explicit
 // temperature is rejected (terra — like 6.1-sol a developers.openai.com-sourced
 // catalog listing, unlike the openrouter-sourced 5.6 sol that accepted it —
 // 400'd on any temperature 09-03), whether xhigh answers on the live path,

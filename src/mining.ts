@@ -957,6 +957,29 @@ export function isModelRejection(error: string): boolean {
 }
 
 /**
+ * Id-rejection stand-down (2026-10-01, one-arm roster). The breaker sidelines
+ * an id-rejected arm, but with ONE arm the empty-pool fail-safe in
+ * filterPoolByParseFailure hands it straight back, and the verifiable override
+ * checks only the rate bench. Nothing else stops the next paid solve: the
+ * rejection is not a permanent-fail pattern, error rows do not count toward
+ * the daily cap, and a tick runs up to 3 solves. Returns the log line to print
+ * before skipping this poll's solves, or null when the pick is usable. Pass
+ * rates AFTER discountStaleIdRejections, so a corrected wire name or a
+ * MODEL_MINING_SOLVE rollback to another model clears it.
+ */
+export function idRejectionStandDown(
+  model: string,
+  failureRates: Record<string, { idRejected?: number }>,
+): string | null {
+  if ((failureRates[model]?.idRejected ?? 0) <= 0) return null;
+  return (
+    `⛔ gateway refused modelUsed "${gatewayModelName(model)}" and no usable alternative arm was picked — ` +
+    `skipping this poll's mining solves (each would be a paid solve the gateway rejects at submit). ` +
+    `Fix: MODEL_MINING_SOLVE=<a model the gateway accepts> (e.g. grok-4-7), then restart.`
+  );
+}
+
+/**
  * A recorded id-rejection condemns the WIRE NAME that was refused, not the
  * model. Once an override changes what we send (see
  * GATEWAY_MODEL_NAME_OVERRIDES), prior rejections of the old string are stale
@@ -1070,7 +1093,7 @@ export function verifiableFailHint(ks: Record<string, unknown> | undefined | nul
  * top solvers' density patterns suggest this is what they do. Toggle with
  * BOT_MINING_REFINE=0.
  */
-async function refineStandardTrace(
+export async function refineStandardTrace( // exported for src/_probe-gpt61.ts (2026-10-01)
   ch: Challenge,
   draft: SolveResult,
   model: string,
@@ -1884,6 +1907,11 @@ async function discoverAndSolveMiningChallengesInner(
     // Verifiable challenges → route to code-optimized model unless overridden,
     // skipping the override when that model is parse-fail-sidelined.
     const ab = maybeOverrideModelForVerifiable(ch, abRaw, failureRates);
+    const idStandDown = idRejectionStandDown(ab.model, failureRates);
+    if (idStandDown) {
+      console.warn(idStandDown);
+      break;
+    }
     let modelUsed = ab.model;
     let effortUsed = ab.reasoning_effort;
     if (ab.model !== abRaw.model) {
