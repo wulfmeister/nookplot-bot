@@ -7,6 +7,27 @@
  * rates each lost slot is ~10-20k NOOK. We hit 3 of these in the 36h before
  * 2026-06-11.
  *
+ * CORRECTED 2026-10-01 (measured, kept next to the claim above): a 400 does
+ * NOT burn an epoch slot. In mining-submissions.jsonl, 205 accepted
+ * submissions landed while the trailing 24h already held ≥13 accepted +
+ * specificity/min-100-rejected rows (60 of them in September, e.g. 09-21
+ * 13:28 with 11 accepted + 10 rejected), and every "Maximum 12 regular" 429
+ * fired at 12 accepted regardless of how many 400s sat in the window. The
+ * logged rejections are a LOWER bound (a rejection rescued by the enriched
+ * retry leaves no error row), which only strengthens this. What a 400 does
+ * cost is the paid solve behind it if we give up on the challenge — so
+ * submit-then-enrich beats skipping locally. The playbook claim was never
+ * verified here.
+ *
+ * WHICH FIELD (2026-10-01): on /submit-solution (python_tests /
+ * javascript_tests / exact_answer) the gateway stores and length-checks
+ * `reasoning`, not `traceSummary` — per the 2026-10-01 review, 51/51 accepted
+ * code submissions' stored traceSummary equals the reasoning we sent (not
+ * re-fetched for this change). The mirror below was fitted to
+ * traceSummary rejections and rejects ~88% of gateway-ACCEPTED reasonings
+ * (205 of 232 vault rows), so it must not gate the code path; see
+ * verifiable-reasoning.ts.
+ *
  * The gateway's rejection body is actionable: it lists exactly which
  * categories scored zero ("Missing categories: numbers (...); technique
  * names (...)..."). This module:
@@ -133,11 +154,49 @@ export function parseMissingCategories(msg: string): SpecificityCategory[] {
 }
 
 /**
+ * A method/technique name in `source`, in a shape the `techniques` matcher
+ * above credits once quoted: camelCase (`readIndex`), a dotted call
+ * (`os.path.normpath(…)`, `json.loads(…)`), or a quoted string that is itself
+ * dotted / a call / camelCase. Names that appear in `exclude` are skipped (the
+ * caller passes the text it is extending, so nothing is added twice).
+ *
+ * Never returns a bare quoted literal. Until 2026-10-01 the extractor fell
+ * back to ANY 4-40-char quoted string, which on snake_case Python (no
+ * camelCase) yielded `technique "http"` / `technique "utf-8"`: fragments the
+ * matcher above scores techniques=false (bare literals were excluded on
+ * purpose, see :71-74). Pure snake_case is not offered either: it is the shape
+ * the gateway scored techniques +0 on (2026-10-01 review).
+ */
+export function findTechniqueName(source: string, exclude = ""): string | null {
+  const patterns = [
+    /\b([a-z]+[A-Z][A-Za-z0-9]{2,40})\b/g,
+    /\b([A-Za-z_][A-Za-z0-9_]{0,40}(?:\.[A-Za-z_][A-Za-z0-9_]{0,40}){1,4})\s*\(/g,
+    /["']((?:[A-Za-z_][A-Za-z0-9_]{0,40}\.){1,4}[A-Za-z_][A-Za-z0-9_]{0,40}(?:\(\))?|[A-Za-z_][A-Za-z0-9_]{0,40}\(\)|[a-z]+[A-Z][A-Za-z0-9]{1,40})["']/g,
+  ];
+  for (const re of patterns) {
+    for (const m of source.matchAll(re)) {
+      const name = m[1];
+      if (/^(?:self|this|cls)\./.test(name)) continue; // instance plumbing, not a technique
+      if (exclude.includes(name)) continue;
+      if (specificityCategories(JSON.stringify(name)).techniques) return name;
+    }
+  }
+  return null;
+}
+
+/**
  * Extract a concrete fragment for one category from source text.
  * Returns "" when the source has nothing extractable for that category —
- * the caller simply skips it. NEVER fabricates.
+ * the caller simply skips it. NEVER fabricates, and never returns a fragment
+ * the matcher above does not credit for `category` (a fragment that scores
+ * nothing locally only pads the text).
  */
 export function extractCategoryFragment(category: SpecificityCategory, source: string): string {
+  const frag = rawCategoryFragment(category, source);
+  return frag && specificityCategories(frag)[category] ? frag : "";
+}
+
+function rawCategoryFragment(category: SpecificityCategory, source: string): string {
   switch (category) {
     case "numbers": {
       // Require a unit (or complexity class) — bare integers score nothing.
@@ -146,8 +205,8 @@ export function extractCategoryFragment(category: SpecificityCategory, source: s
       return m ? `measured ${m[0]}` : "";
     }
     case "techniques": {
-      const m = source.match(/\b([a-z]+[A-Z][A-Za-z]{2,})\b/) ?? source.match(/"([^"]{4,40})"/);
-      return m ? `technique ${JSON.stringify(m[1])}` : "";
+      const name = findTechniqueName(source);
+      return name ? `technique ${JSON.stringify(name)}` : "";
     }
     case "comparisons": {
       const m = source.match(/\b([A-Za-z][\w-]{1,30})\s+(?:vs\.?|versus)\s+([A-Za-z][\w-]{1,30})/i)
@@ -181,7 +240,7 @@ const TARGET_CATEGORIES = 4; // gateway needs ~3; one extra as margin
  * fragments the gateway ignores and could hit the stop-condition before adding
  * a category that scores.
  */
-const ENRICH_PRIORITY: SpecificityCategory[] = [
+export const ENRICH_PRIORITY: readonly SpecificityCategory[] = [
   "failures", "techniques", "code", "numbers", "comparisons", "actionable",
 ];
 
@@ -194,6 +253,15 @@ const ENRICH_PRIORITY: SpecificityCategory[] = [
  *
  * Hard cap 500 chars (gateway summary limit). Idempotent-ish: categories
  * already present in the summary are never re-added.
+ *
+ * STANDARD traces only (traceSummary on /submit). The code-kind `reasoning`
+ * retry has its own extraction in verifiable-reasoning.ts: its sources are raw
+ * code, and its text is what verifiers read, so it must not get this
+ * function's comment-line windows or its 500-char mid-word body cut.
+ * HISTORY: a `trustWanted` option was briefly added here on 2026-10-01 for
+ * that retry and removed the same day (review): trusting the gateway's +0 over
+ * the mirror re-appended tokens the gateway had just scored +0 on the same
+ * text ("measured 2048 bytes" next to "2048 bytes").
  */
 export function enrichSummarySpecificity(
   summary: string,
