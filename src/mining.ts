@@ -4,6 +4,18 @@ import type { NookplotRuntime } from "@nookplot/runtime";
 import { chat, VENICE_WEB_SEARCH } from "./venice.js";
 import { pickModel, pickModelAB, pickAlternateModel, effortFor, abPool, isParseFailRateBenched } from "./models.js";
 import { isFarmChallengeTitle } from "./trace-fingerprint.js";
+import {
+  VERIFIABLE_KINDS,
+  challengeKindKey,
+  parseBaseRewardField,
+  rankChallengesByEv,
+  loadChallengeEvInputs,
+  loadStarvationGuard,
+  formatEvTop,
+  formatEvShadow,
+  formatKindFactors,
+  challengeRankerMode,
+} from "./challenge-ev.js";
 import { writeNote } from "./vault.js";
 import { NOOK_DIR, readJsonl, readJsonlTail, appendJsonl, extractJsonObj, sleep } from "./util.js";
 import { gatherMiningContext, type MiningContext } from "./mining-context.js";
@@ -76,7 +88,7 @@ const DAILY_CAP = 13;
 const REGULAR_ROLLING_CAP = 12;
 const ROLLING_WINDOW_MS = 24 * 3600_000;
 const ERROR_COOLDOWN_MS = 4 * 3600_000;
-const VERIFIABLE_KINDS = new Set(["python_tests", "javascript_tests", "exact_answer"]);
+// VERIFIABLE_KINDS lives in challenge-ev.ts (single source for the ranker and the solve path).
 // Verifiable kinds are HARD-ROUTED (maybeOverrideModelForVerifiable): a weak-
 // for-code A/B pick is replaced by VERIFIABLE_DEFAULT_MODEL, while a pick that
 // is already in VERIFIABLE_CODE_MODELS stays. BOT_VERIFIABLE_MODEL_OVERRIDE=0
@@ -359,6 +371,9 @@ export interface Challenge {
   maxSubmissions?: number;
   baselineScore?: Record<string, unknown> | null;
   estimatedRewardNook?: number;
+  /** Gateway base pool for one solve, in NOOK — a STRING on the wire
+   *  ("50000"). realized = composite × baseReward × R(epoch); see challenge-ev.ts. */
+  baseReward?: string | number | null;
   status?: string;
   posterAddress?: string | null;
   sourceType?: string;
@@ -377,6 +392,22 @@ interface MiningLogEntry {
   /** HISTORICAL (feature retired 2026-08-27): row came from the value-floor
    *  idle-release that ran 08-17..08-27. Rows keep the tag for analysis. */
   floorRelease?: boolean;
+  /** From 2026-10-01: the challenge's gateway baseReward (NOOK) and
+   *  difficulty, so settlements can turn K into R and the ranker can be
+   *  audited per difficulty. Absent on older rows. */
+  baseReward?: number;
+  difficulty?: string;
+}
+
+/** baseReward + difficulty stamped onto every mining-submissions row the
+ *  solve loop writes for a challenge (the raw gateway field only — no
+ *  difficulty fallback, so the ledger never records an inferred price). */
+export function challengeRowMeta(ch: Pick<Challenge, "baseReward" | "difficulty">): { baseReward?: number; difficulty?: string } {
+  const base = parseBaseRewardField(ch.baseReward);
+  return {
+    ...(base !== null ? { baseReward: base } : {}),
+    ...(ch.difficulty ? { difficulty: ch.difficulty } : {}),
+  };
 }
 
 /**
@@ -1207,6 +1238,19 @@ async function runSandboxSmokeTest(
  * `BOT_SPECIALIZE_MATCH_MODE=all` — match only if ALL tags overlap (strict)
  */
 /**
+ * LEGACY ORDERING (2026-10-01): everything from here through
+ * compareChallengePriority (the value tier, the verifiable tilt, kind-EV) is
+ * still the ACTIVE order by default. The per-challenge EV ranker in
+ * challenge-ev.ts runs in shadow next to it and becomes active only with
+ * BOT_CHALLENGE_EV_RANK=1. EV uses realized = composite × baseReward × R,
+ * with R shared by every kind and difficulty in a settlement epoch. A
+ * kind-level multiple folds difficulty into "kind" and so misranks
+ * individual challenges. But EV's "R cancels" premise fails in epochs that hit
+ * the 1,575,000/epoch solving cap (most days since 09-17, see settlements.ts
+ * EPOCH_SOLVING_CAP), and this order is just as blind to the cap, since its K
+ * is cap-scaled. Which one earns more is unmeasured. The bounded starvation
+ * guard (challenge-ev.ts) cancels preferVerifiable here while it holds.
+ *
  * Competition-aware challenge ordering (2026-06-11, from operator-playbook
  * research). Solve rewards are share-of-pool per challenge: the first mover
  * on a low-competition challenge takes the largest share, while piling onto
@@ -1284,6 +1328,9 @@ export interface TiltInputs {
   standardRewardMultiple: number;
   /** Where standardRewardMultiple came from — surfaced in the tilt reason. */
   standardRewardMultipleSource?: "env" | "measured" | "default";
+  /** Settlement-epoch batch counts behind a MEASURED multiple, e.g.
+   *  "standard b5 vs python_tests b6" — logged next to the multiple. */
+  standardRewardMultipleBatches?: string;
   minResolved: number; // minimum resolved standards before survival is trusted
   standardResolved: number; // verified+expired+rejected standard rows in the window
   /** Share of resolved standards that paid nothing: expired (no quorum) or rejected (quorum under the floor). */
@@ -1317,7 +1364,8 @@ export function computeVerifiableTilt(i: TiltInputs): TiltState {
   const standardEv = (1 - i.standardLossShare) * i.standardRewardMultiple;
   const verifiableEv = i.verifiableSurvival;
   const src = i.standardRewardMultipleSource ? ` ${i.standardRewardMultipleSource}` : "";
-  const ev = `standard EV ${standardEv.toFixed(2)} (${((1 - i.standardLossShare) * 100).toFixed(0)}% survival × ${i.standardRewardMultiple.toFixed(2)}x${src} reward) vs verifiable ${verifiableEv.toFixed(2)}`;
+  const batches = i.standardRewardMultipleBatches ? `, ${i.standardRewardMultipleBatches}` : "";
+  const ev = `standard EV ${standardEv.toFixed(2)} (${((1 - i.standardLossShare) * 100).toFixed(0)}% survival × ${i.standardRewardMultiple.toFixed(2)}x${src} reward${batches}) vs verifiable ${verifiableEv.toFixed(2)}`;
   if (standardEv >= verifiableEv) {
     return { active: false, preferVerifiable: false, reason: `${ev} → standard first` };
   }
@@ -1406,6 +1454,12 @@ export function loadTiltInputs(nowMs: number, kindEv?: Record<string, KindEvEntr
     standardRewardMultiple = measured;
     standardRewardMultipleSource = "measured";
   }
+  const standardRewardMultipleBatches = standardRewardMultipleSource === "measured" && kindEv
+    ? Object.entries(kindEv)
+        .filter(([k]) => k === "standard" || VERIFIABLE_KINDS.has(k))
+        .map(([k, v]) => `${k} b${v.batches}`)
+        .join(" vs ")
+    : undefined;
   const windowMs = num(process.env.BOT_VERIFIABLE_TILT_WINDOW_DAYS, 10) * 86_400_000;
   const { standardResolved, standardLost, verifiableResolved, verifiableVerified } = tallyTiltOutcomes(
     readJsonlTail<{ ts?: string; verifierKind?: string; status?: string }>(MINING_VERIFIED_LOG, 600),
@@ -1424,6 +1478,7 @@ export function loadTiltInputs(nowMs: number, kindEv?: Record<string, KindEvEntr
     ratio,
     standardRewardMultiple,
     standardRewardMultipleSource,
+    ...(standardRewardMultipleBatches ? { standardRewardMultipleBatches } : {}),
     minResolved: 10,
     standardResolved,
     standardLossShare: standardResolved ? standardLost / standardResolved : 0,
@@ -1435,10 +1490,9 @@ export function loadTiltInputs(nowMs: number, kindEv?: Record<string, KindEvEntr
   };
 }
 
-/** Ranking key for kind-EV lookup: specific verifiable kind, else standard. */
-export function challengeKindKey(c: Challenge): string {
-  return c.verifierKind && VERIFIABLE_KINDS.has(c.verifierKind) ? c.verifierKind : "standard";
-}
+/** Ranking key for kind-EV lookup (defined in challenge-ev.ts; re-exported
+ *  here for existing importers). */
+export { challengeKindKey };
 
 /** Evidence bar before a kind's MEASURED EV replaces its prior: at least 3
  *  paid rows across at least 2 DISTINCT settlement batches (K is batch-
@@ -1570,7 +1624,7 @@ export function passesSpecializationFilter(ch: Challenge): boolean {
  * floor on it screens on noise. The est>=10 default (shipped 07-30 off a
  * placeholder-contaminated reading) caused the 08-14..23 submission halt +
  * the 08-16 royalty break and cost ~1.4-2.1M NOOK for the month. Ranking by
- * kind-EV (see kHatByKind in settlements.ts + compareChallengePriority)
+ * per-challenge EV (challenge-ev.ts; kind-EV via kHatByKind before 10-01)
  * replaces it. BOT_MIN_CHALLENGE_REWARD>0 re-enables a floor if the field
  * ever becomes meaningful.
  */
@@ -1719,6 +1773,104 @@ export function composePostSolveLearning(reasoning: string, traceSummary: string
 }
 
 /**
+ * Per-challenge EV ordering (see challenge-ev.ts for the derivation, the
+ * measurements behind it, and the epoch-cap caveat). Computes the EV ranking
+ * and logs two lines per poll: per-kind factors with their evidence (R-hat,
+ * capped epochs flagged, and the cap tally), and the top 3 challenges with
+ * every EV component plus what the ranker could see (pages, max base).
+ *
+ * `apply` (BOT_CHALLENGE_EV_RANK=1) sorts `eligible` in place. Otherwise
+ * (shadow, the default) it leaves `eligible` alone and logs what EV would
+ * attempt next to what the active order attempts. Returns false when local
+ * state can't be read; in apply mode the caller then falls back to legacy.
+ */
+function orderEligibleByEv(
+  eligible: Challenge[],
+  targets: string[],
+  opts: { apply: boolean; pages: number; take: number },
+): boolean {
+  try {
+    const nowMs = Date.now();
+    const ev = loadChallengeEvInputs(nowMs);
+    const specMatch = targets.length > 0 ? (c: Challenge) => passesSpecializationFilter(c) : undefined;
+    const ranked = rankChallengesByEv(eligible, ev.table, { guardActive: ev.guard.active, specMatch });
+    if (opts.apply) eligible.splice(0, eligible.length, ...ranked.map((r) => r.challenge));
+    console.log(formatKindFactors(ev.table, ev.windowDays, ev.rHat, ev.caps));
+    console.log(formatEvTop(ranked, ev.guard, 3, { pages: opts.pages }));
+    if (!opts.apply) console.log(formatEvShadow(ranked, eligible, opts.take));
+    return true;
+  } catch (err) {
+    console.warn(
+      `   ⚠ EV ranking unavailable (${(err as Error).message.slice(0, 120)})` +
+        (opts.apply ? " — using the legacy ordering" : " — shadow log skipped"),
+    );
+    return false;
+  }
+}
+
+/**
+ * Pure: the bounded starvation guard applied to the legacy tilt. While the
+ * guard holds, the poll must not PREFER verifiable (item 6 as specified).
+ * The kind-EV order then decides, which is not necessarily "standard first".
+ */
+export function applyStarvationGuardToTilt(tilt: TiltState, guard: { active: boolean; reason: string } | undefined): TiltState {
+  if (!guard?.active || !tilt.preferVerifiable) return tilt;
+  return {
+    ...tilt,
+    preferVerifiable: false,
+    reason: `${tilt.reason} → overridden by the starvation guard (${guard.reason})`,
+  };
+}
+
+/**
+ * LEGACY ordering: kind-EV from kHatByKind + the verifiable tilt. This is the
+ * ACTIVE order by default (shadow mode) and with BOT_CHALLENGE_EV_RANK=0,
+ * and the fallback when EV can't read its state under
+ * BOT_CHALLENGE_EV_RANK=1. It misranks across difficulties because kHat
+ * folds baseReward into the kind. The bounded starvation guard cancels
+ * preferVerifiable while it holds (BOT_VERIFIABLE_STARVATION_N=0 disables it).
+ */
+async function orderEligibleLegacy(eligible: Challenge[], targets: string[]): Promise<void> {
+  let guard: { active: boolean; reason: string } | undefined;
+  try {
+    guard = loadStarvationGuard(Date.now());
+  } catch (err) {
+    console.warn(`   ⚠ starvation guard state unavailable (${(err as Error).message.slice(0, 120)}) — guard off this poll`);
+  }
+  // Kind-EV from our own paid settlements (trailing 14d). Best-effort — an
+  // empty/young ledger just means the static tier order ranks kinds. Read
+  // BEFORE the tilt: the tilt's reward multiple is measured from it.
+  let kindEv: Record<string, { kHat: number; compHat: number; ev: number; n: number; batches: number }> | undefined;
+  try {
+    const { readSettlements, kHatByKind } = await import("./settlements.js");
+    kindEv = kHatByKind(readSettlements(), Date.now());
+  } catch { /* ledger optional */ }
+  let tilt: TiltState = { active: false, preferVerifiable: false, reason: "" };
+  try {
+    tilt = computeVerifiableTilt(loadTiltInputs(Date.now(), kindEv));
+  } catch (err) {
+    // Tilt is best-effort — on any state-read failure fall back to the
+    // healthy-network ordering rather than blocking the poll.
+    console.warn(`   ⚠ tilt state unavailable (${(err as Error).message}) — using default ordering`);
+  }
+  const guarded = applyStarvationGuardToTilt(tilt, guard);
+  if (guard?.active && guarded === tilt) {
+    console.log(`   🛑 starvation guard ON (no verifiable preference to cancel this poll): ${guard.reason}`);
+  }
+  tilt = guarded;
+  eligible.sort((a, b) => compareChallengePriority(a, b, targets, { ...tilt, kindEv }));
+  // Logged either way: the 09-23→27 misranking was invisible because only an
+  // ACTIVE tilt printed anything.
+  if (tilt.reason) console.log(`   ⚖ verifiable tilt (legacy ranker)${tilt.active ? "" : " (off)"}: ${tilt.reason}`);
+  if (kindEv && Object.keys(kindEv).length > 0) {
+    // Batch count (distinct settlement epochs) next to n: the evidence bar
+    // gates on batches, and a multiple from one batch is one draw of R.
+    const parts = Object.entries(kindEv).map(([k, v]) => `${k}=${Math.round(v.ev / 1000)}k(n${v.n},b${v.batches})`);
+    console.log(`   📐 kind-EV (legacy): ${parts.join(" ")}`);
+  }
+}
+
+/**
  * Re-entrancy guard (2026-08-19). The 15-min setInterval fires whether or not
  * the previous poll finished, and a max/xhigh-effort solve can run 10-15+
  * minutes. An overlapping poll re-picks the SAME in-flight challenge — its
@@ -1793,14 +1945,24 @@ async function discoverAndSolveMiningChallengesInner(
 
   let challenges: Challenge[] = [];
   let scanTruncated = false;
+  let pagesScanned = 0;
   try {
     // limit=100 (observed gateway max), NOT 25: the list is newest-first and
     // templated python challenges arrive in batches that bury standard
     // challenges below a 25-item cutoff — which silently flipped our cap mix to 68% python at
     // ~8k NOOK/slot while standard (~41-52k/slot, 5-6.5x) sat unseen at #26+.
-    // The tier sort below prefers standard strictly; it just needs to SEE them.
     // DEEP PAGING (2026-08-13): the same bury bug recurred at the next scale;
     // see fetchOpenChallengesPaged for the mechanics + evidence.
+    // VISIBILITY GAP (review, 2026-10-01): paging stops as soon as pollNeed
+    // (3) eligible items are visible, and page 1 is newest-first python. So
+    // high-base standards one page deeper never reach the ranker, legacy or
+    // EV. Live 10-01: 23 eligible on page 1 (20 python medium, 3 standard
+    // hard) vs 68 standard expert (500k, 'open', 0/20 subs) on page 2, never
+    // fetched. The 'open' status gate in challengeFitsBudget is NOT what hid
+    // them. Fetching deeper (e.g. ≥2 pages, +1 GET per poll, when EV is
+    // active) is an eligibility decision for the operator. It is proposed,
+    // not done, and should be weighed together with the epoch cap
+    // (settlements.ts EPOCH_SOLVING_CAP).
     const paged = await fetchOpenChallengesPaged(
       async (offset) => {
         const res = (await runtime.connection.request(
@@ -1814,6 +1976,7 @@ async function discoverAndSolveMiningChallengesInner(
     );
     challenges = paged.challenges;
     scanTruncated = Boolean(paged.stoppedEarly);
+    pagesScanned = paged.pages;
     if (paged.stoppedEarly) {
       console.warn(`   ⚠ discover paging stopped early (${challenges.length} scanned): ${paged.stoppedEarly.slice(0, 120)}`);
     }
@@ -1841,29 +2004,17 @@ async function discoverAndSolveMiningChallengesInner(
   }
 
   const targets = specializeDomains();
-  // Kind-EV from our own paid settlements (trailing 14d). Best-effort — an
-  // empty/young ledger just means the static tier order ranks kinds. Read
-  // BEFORE the tilt: the tilt's reward multiple is measured from it.
-  let kindEv: Record<string, { kHat: number; compHat: number; ev: number; n: number; batches: number }> | undefined;
-  try {
-    const { readSettlements, kHatByKind } = await import("./settlements.js");
-    kindEv = kHatByKind(readSettlements(), Date.now());
-  } catch { /* ledger optional */ }
-  let tilt: TiltState = { active: false, preferVerifiable: false, reason: "" };
-  try {
-    tilt = computeVerifiableTilt(loadTiltInputs(Date.now(), kindEv));
-  } catch (err) {
-    // Tilt is best-effort — on any state-read failure fall back to the
-    // healthy-network ordering rather than blocking the poll.
-    console.warn(`   ⚠ tilt state unavailable (${(err as Error).message}) — using default ordering`);
-  }
-  eligible.sort((a, b) => compareChallengePriority(a, b, targets, { ...tilt, kindEv }));
-  // Logged either way: the 09-23→27 misranking was invisible because only an
-  // ACTIVE tilt printed anything.
-  if (tilt.reason) console.log(`   ⚖ verifiable tilt${tilt.active ? "" : " (off)"}: ${tilt.reason}`);
-  if (kindEv && Object.keys(kindEv).length > 0) {
-    const parts = Object.entries(kindEv).map(([k, v]) => `${k}=${Math.round(v.ev / 1000)}k(n${v.n})`);
-    console.log(`   📐 kind-EV: ${parts.join(" ")}`);
+  // Ranker mode (src/challenge-ev.ts challengeRankerMode). By default (shadow)
+  // the legacy kind-EV + tilt order is ACTIVE and per-challenge EV is only
+  // logged next to it: EV's "R cancels" premise fails in epochs that hit the
+  // per-epoch solving cap, which is most days since 09-17. Making EV active
+  // (BOT_CHALLENGE_EV_RANK=1) is the operator's call. In ev mode, an EV
+  // failure (unreadable state) falls back to legacy rather than blocking the
+  // poll. BOT_CHALLENGE_EV_RANK=0 skips EV entirely.
+  const rankerMode = challengeRankerMode();
+  if (!(rankerMode === "ev" && orderEligibleByEv(eligible, targets, { apply: true, pages: pagesScanned, take: pollNeed }))) {
+    await orderEligibleLegacy(eligible, targets);
+    if (rankerMode === "shadow") orderEligibleByEv(eligible, targets, { apply: false, pages: pagesScanned, take: pollNeed });
   }
 
   const matched = targets.length > 0 ? eligible.filter((c) => passesSpecializationFilter(c)).length : 0;
@@ -2032,6 +2183,7 @@ async function discoverAndSolveMiningChallengesInner(
           appendJsonl(MINING_LOG, {
             ts: new Date().toISOString(),
             challengeId: ch.id,
+            ...challengeRowMeta(ch),
             verifierKind: kind,
             outcome: "error" as const,
             notes: `dryrun hard-fail (retryable): ${gate.details}`.slice(0, 200),
@@ -2059,6 +2211,7 @@ async function discoverAndSolveMiningChallengesInner(
         appendJsonl(MINING_LOG, {
           ts: new Date().toISOString(),
           challengeId: ch.id,
+          ...challengeRowMeta(ch),
           verifierKind: kind,
           outcome: "error" as const,
           notes: "solver produced no output",
@@ -2123,6 +2276,7 @@ async function discoverAndSolveMiningChallengesInner(
           appendJsonl(MINING_LOG, {
             ts: new Date().toISOString(),
             challengeId: ch.id,
+            ...challengeRowMeta(ch),
             verifierKind: kind,
             outcome: "error" as const,
             notes: "IPFS upload failed",
@@ -2295,6 +2449,7 @@ async function discoverAndSolveMiningChallengesInner(
         appendJsonl(MINING_LOG, {
           ts: new Date().toISOString(),
           challengeId: ch.id,
+          ...challengeRowMeta(ch),
           verifierKind: kind,
           outcome: "error" as const,
           notes: sub.error,
@@ -2379,6 +2534,7 @@ async function discoverAndSolveMiningChallengesInner(
       appendJsonl(MINING_LOG, {
         ts: new Date().toISOString(),
         challengeId: ch.id,
+        ...challengeRowMeta(ch),
         verifierKind: kind,
         outcome: status,
         rewardNook: ch.estimatedRewardNook,
@@ -2475,6 +2631,7 @@ async function discoverAndSolveMiningChallengesInner(
       appendJsonl(MINING_LOG, {
         ts: new Date().toISOString(),
         challengeId: ch.id,
+        ...challengeRowMeta(ch),
         verifierKind: kind,
         outcome: "error" as const,
         notes: msg.slice(0, 200),
