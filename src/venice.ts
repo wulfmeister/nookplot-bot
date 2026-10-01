@@ -40,7 +40,7 @@ const KEY = process.env.VENICE_API_KEY;
 // Fallback for chat() calls that pass no model (projects.ts, peer-review.ts).
 // NOTE: .env's NOOKPLOT_AGENT_API_MODEL wins — it was claude-opus-4-8 until
 // 2026-09-29, which silently routed those call sites to opus-4-8.
-const DEFAULT_MODEL = process.env.NOOKPLOT_AGENT_API_MODEL ?? "grok-4-7";
+const DEFAULT_MODEL = process.env.NOOKPLOT_AGENT_API_MODEL ?? "openai-gpt-61-sol";
 
 /**
  * Convenience: Venice web-search-enabled parameters.

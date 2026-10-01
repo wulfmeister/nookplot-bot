@@ -106,7 +106,8 @@ const VERIFIABLE_KINDS = new Set(["python_tests", "javascript_tests", "exact_ans
 // 1M ctx, optimizedForCode, effort low..max; probed at xhigh with the real
 // python_tests shape before shipping).
 const VERIFIABLE_CODE_MODELS = new Set([
-  "grok-4-7", // 2026-09-29 single-model roster
+  "openai-gpt-61-sol", // 2026-10-01 single-model roster
+  "grok-4-7", // 2026-09-29 single-model roster (kept: env rollback stays a no-op reroute)
   "claude-opus-4-8",
   "claude-opus-5",
   "claude-opus-5-5",
@@ -127,7 +128,9 @@ const VERIFIABLE_CODE_MODELS = new Set([
 // VERIFIABLE_CODE_MODELS note above for the 36h numbers behind the reversal.
 // Standard traces are untouched (DEFAULTS.mining_solve / the A/B pool).
 // → grok-4-7 (operator, 2026-09-29): single-model roster; see models.ts DEFAULTS.
-const VERIFIABLE_DEFAULT_MODEL = "grok-4-7";
+// → openai-gpt-61-sol (operator, 2026-10-01): roster moved; see models.ts DEFAULTS.
+// Pin this lane alone with BOT_VERIFIABLE_MODEL=<model> (no code change).
+const VERIFIABLE_DEFAULT_MODEL = "openai-gpt-61-sol";
 // How many times to re-solve + resubmit a verifiable challenge that failed its
 // deterministic tests, feeding the exact failing test back to the solver. The
 // gateway grants up to 20 slots/challenge; we use a few. Tune via env.
@@ -460,7 +463,7 @@ export function parseVerifiableSolution(
   return null;
 }
 
-async function solvePythonTests(
+export async function solvePythonTests( // exported for src/_probe-gpt61.ts (2026-10-01)
   ch: Challenge,
   learnings: string,
   model: string,
@@ -615,7 +618,7 @@ Constraints:
  * Trace MUST be structured (## Approach, ## Steps, ## Conclusion, ## Citations)
  * — unstructured blobs score lower per the SDK guidance.
  */
-async function solveStandardTrace(
+export async function solveStandardTrace( // exported for src/_probe-gpt61.ts (2026-10-01)
   ch: Challenge,
   learnings: string,
   model: string,

@@ -50,7 +50,11 @@ const MODEL_PRICING: Record<string, { in: number; out: number }> = {
   // Current mining A/B arms
   "grok-4-5": { in: 2.27, out: 6.8 },
   "grok-4-6": { in: 2.27, out: 6.8 },
-  "grok-4-7": { in: 2.27, out: 6.8 }, // live catalog 2026-09-29; whole roster since then
+  "grok-4-7": { in: 2.27, out: 6.8 }, // live catalog 2026-09-29; whole roster 09-29 → 10-01
+  // Live catalog 2026-10-01; whole roster since then. Cache tiers ($0.125
+  // cached-in) and the >272k extended tier ($5/$18.75) are not expressible
+  // here — mining prompts are uncached and ~4-12k tokens, so immaterial.
+  "openai-gpt-61-sol": { in: 2.5, out: 12.5 },
   // Jev (Venice decision model, beta): input-only pricing, $0 output (catalog 2026-09-29).
   "jev-latest": { in: 0.042, out: 0 },
   "claude-opus-5": { in: 6, out: 30 },
