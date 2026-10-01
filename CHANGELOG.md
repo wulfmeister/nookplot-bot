@@ -4,6 +4,109 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-10-01 (d) — the seven review suggestions, built and adversarially reviewed
+
+The operator asked for all seven suggestions from entry (c). Five isolated
+branches (one per area), each reviewed by a separate agent, every medium+
+finding checked by two skeptics, confirmed ones fixed on a `-fixed` branch:
+28 agents, 7 findings confirmed and fixed, 0 refuted. Merged together they
+pass 837/837 (609 before). Merging surfaced one interaction bug, fixed below.
+
+**1. Code kinds now drive from `reasoning`** (`src/verifiable-reasoning.ts`).
+For python_tests/javascript_tests/exact_answer one composed 100-400 char text,
+written to SUMMARY_SPECIFICITY_RULE, goes in both `reasoning` and
+`traceSummary`. The local mirror no longer skips or regenerates before submit
+on these kinds (it fails 205 of 232 gateway-ACCEPTED reasonings). On a text
+400 the model rewrites the reasoning first, told the gateway's +0 categories;
+an extractive tail is only a fallback and must add ≥2 categories the gateway
+said were missing. Retry once, then the 24h cooldown. summary-rejections rows
+gain `field` and `attempt`.
+- **Measured: a 400 does NOT consume a rolling epoch slot.** 165 accepts
+  landed with ≤11 prior accepts but ≥14 accepted+400 in the trailing 24h, and
+  every "Maximum 12 regular" 429 fired at 11-12 accepted. The claim in
+  `specificity-gate.ts` (and the reasoning of the 09-24 entry that leaned on
+  it) was wrong; the comment keeps it with the correction beside it.
+- **Correction to 09-21/09-24:** the python "minimum 100 characters" 400s were
+  a reasoning under 100 chars (the `??`-kept `""`, the ~65-char stub, or an
+  in-spec 50-99 char answer; the ledger can't tell which), not an empty
+  traceSummary. `padTraceSummary` always emitted ≥146 chars.
+- Not done: re-fitting the STANDARD mirror against standard-trace gateway
+  verdicts (entry (c) found c3c6001 made it worse there: 39→30 of 49
+  accepted summaries pass). Still open.
+
+**2+5. Venice stand-down + ledger rows for failed calls** (`src/venice-breaker.ts`).
+A 402 naming a spend limit or insufficient balance pauses every Venice call
+and LLM tick until the refill (`nextEpochBegins`, else 00:00Z, +2 min); a 429
+"Too many failed attempts" or an unrecognised 402 pauses 30 min. A refused
+call sends no request, so it never counts toward Venice's failed-attempt
+lockout. The pause lifts early when the balance watch sees a top-up, or sees
+`accessPermitted` go false→true after a key-limit pause. Failed chat() calls
+now write zero-usage `timeout`/`other-error` rows; parse tags skip them;
+balance readings are saved to `venice-balance.jsonl` so whether Venice bills
+abandoned generations can finally be measured (UNVERIFIED until then).
+- **The outage was destroying work, not just wasting calls.** 244 Venice 402s
+  on 10-01 from 03:46Z. Mining's 4h error cooldown turned each into a
+  PERMANENT skip: 17 challenges / 158 rows on 10-01 (63 rows / 10 on 09-28).
+  Learnings error rows dropped 5 verified learnings. Both now ignore billing
+  errors, and existing billing rows are released, so expect a retry burst
+  after the next refill.
+- **Correction to my evidence in (c):** I wrote "the same 3 challenges" and
+  "14-18 mining 402 rows"; it was 17 challenges and 158 rows.
+
+**3. Verify keeps a candidate after a temporary error** (`src/verify-errors.ts`).
+`verifiedSubmissions` (in-memory, never evicted) was marked before the error
+was classified: 53 submissions lost to a Venice 402 had 0 later verifies.
+Now only success or a gateway-permanent outcome marks done; temporary
+failures skip 45 min; submission-specific ones (500, timeout, parse fail,
+unrecognised 429) retire after 3 strikes; every class is capped at 8 attempts;
+3 consecutive failures pause the loop (45 min, doubling to 6h). Rate-limit
+wording only counts on a 429, so a reworded 4xx can't retry forever.
+Hitting the shared cap or pace guard mid-batch no longer drops the rest of
+the batch. Also found: the 33 gateway 500s "while recording your
+verification" were a duplicate race from the pre-guard poll-overlap era.
+
+**4+6. Per-challenge EV ranker — built, but SHADOW by default** (`src/challenge-ev.ts`).
+EV = submitRate(kind) × survival(kind) × compHat(kind) × baseReward(challenge),
+shrunk toward priors. Verified premise: within one settlement epoch every kind
+and difficulty pays the same R (09-27: python medium K 88,654 and standard
+expert K 886,545, exactly the 50k:500k base ratio). It is logged beside the
+legacy order every poll (`🕶 EV shadow`); `BOT_CHALLENGE_EV_RANK=1` activates
+it. Shadow because the review found what breaks the premise:
+- **Our solving income has a per-epoch ceiling of 1,575,000 NOOK.** Claims:
+  `epoch_solving` = exactly 1,575,000 on 8 of the 14 non-zero claims since
+  09-17 (09-17/19/21/22/26/28/29/30); per-epoch settlement sums match to 1e-4
+  on 9 epochs. On 09-28 one python medium solve was paid the whole cap. On a
+  capped day R is cap ÷ our own work, and extra solves earn nothing.
+  Mechanism UNVERIFIED (1,575,000 = 900k × our 1.75 tier, and = 45% of the
+  3.5M pool).
+- **The biggest EV lever is hidden by paging depth, not ranking:** ~68-70
+  open 500k standard experts sit on page 2 and the poll stops after page 1
+  once 3 eligible are visible. Changing what's visible is an eligibility
+  decision, so it's proposed, not done.
+- Item 6's starvation guard is live in the legacy order: if the last 4
+  verifiable attempts in the rolling day all failed locally (402s, fetch
+  failures, aborts excluded), it cancels the verifiable preference while the
+  newest failure is under 2h old. Rows now carry `baseReward`/`difficulty`;
+  settlement batches are counted by epoch, not distinct K.
+
+**7. Fabricated Qm CIDs are rejected before any fetch** (`src/trace-payload.ts`).
+A CIDv0 must base58-decode to a 0x1220 (sha2-256/32) header. 1,979 of 4,399
+distinct failed Qm prefixes in bot.log were fabricated (0x121e-0x1222); 0 of
+~6,300 genuine CIDs in our ledgers are rejected; all 1,538 public-gateway
+recoveries were 0x1220.
+
+**Merge fix:** a Venice stand-down refusal ("Venice stand-down (...) ...; no
+request sent") fell through verify-errors to `unknown` + strike, so a verify
+pass caught between its two Venice calls when mining tripped the breaker took
+a strike for a billing stop. It is now the loop-level budget class
+(`src/__tests__/integ-seven.test.ts`; fails without the fix).
+
+**Left open (low, or policy):** crowd-jury still marks error rows as seen
+forever (dormant surface); un-gated submissions with a provably fake CID can
+still be verified from the detail summary; a Jev 402 with an unrecognised
+body can pause all Venice use for 30 min; `[self-smoke failed: …]` is
+appended to the scored reasoning.
+
 ## 2026-10-01 (c) — pre-push review: 110 agents, 29 confirmed findings, several of them mine
 
 Before pushing the Pinata swap, the operator asked for everything to be tested
