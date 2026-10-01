@@ -20,6 +20,7 @@ import { refine } from "./refine.js";
 import { recordSolveAsWorkspace } from "./workspace-solve.js";
 import { withGenerationSlot } from "./generation-semaphore.js";
 import { recordAudit } from "./audit.js";
+import { jevCheckSolution, JEV_CHECKS_LOG, type JevCheck } from "./jev.js";
 import {
   alreadySubmittedChallenges,
   guildClaimedUntil,
@@ -105,6 +106,7 @@ const VERIFIABLE_KINDS = new Set(["python_tests", "javascript_tests", "exact_ans
 // 1M ctx, optimizedForCode, effort low..max; probed at xhigh with the real
 // python_tests shape before shipping).
 const VERIFIABLE_CODE_MODELS = new Set([
+  "grok-4-7", // 2026-09-29 single-model roster
   "claude-opus-4-8",
   "claude-opus-5",
   "claude-opus-5-5",
@@ -124,7 +126,8 @@ const VERIFIABLE_CODE_MODELS = new Set([
 // deepseek-v4-1-flash → claude-opus-5-5 (operator, 2026-09-24): see the
 // VERIFIABLE_CODE_MODELS note above for the 36h numbers behind the reversal.
 // Standard traces are untouched (DEFAULTS.mining_solve / the A/B pool).
-const VERIFIABLE_DEFAULT_MODEL = "claude-opus-5-5";
+// → grok-4-7 (operator, 2026-09-29): single-model roster; see models.ts DEFAULTS.
+const VERIFIABLE_DEFAULT_MODEL = "grok-4-7";
 // How many times to re-solve + resubmit a verifiable challenge that failed its
 // deterministic tests, feeding the exact failing test back to the solver. The
 // gateway grants up to 20 slots/challenge; we use a few. Tune via env.
@@ -2041,6 +2044,19 @@ async function discoverAndSolveMiningChallengesInner(
         error?: string;
       };
 
+      // Jev SHADOW check (2026-09-29): a bounded verdict on what we are about
+      // to submit, recorded with the submission id and scored against the
+      // settlement later (`npm run mining-stats`). It never gates or edits the
+      // submission — on 72 settled essays it could not tell paid from rejected
+      // (AUC 0.49), so it has to earn a vote on our own data first.
+      let jevCheck: JevCheck | null = null;
+      if (process.env.BOT_JEV_CHECK !== "0") {
+        jevCheck = await jevCheckSolution({ challenge: ch, trace: s.traceContent, code: codeText }).catch(() => null);
+        if (jevCheck) {
+          console.log(`   ⚖️ jev check (shadow, not acted on): quality ${jevCheck.score.toFixed(2)}/3, P(pass) ${jevCheck.pPass.toFixed(2)}`);
+        }
+      }
+
       let cid: string | null = null;
       let traceHash: string | undefined;
       if (s.traceContent) {
@@ -2243,6 +2259,18 @@ async function discoverAndSolveMiningChallengesInner(
             ? "deterministic-pass; awaiting reasoning/efficiency/novelty quorum"
             : undefined,
       });
+      if (jevCheck && sub.id) {
+        appendJsonl(JEV_CHECKS_LOG, {
+          ts: new Date().toISOString(),
+          submissionId: sub.id,
+          challengeId: ch.id,
+          kind: s.traceContent ? "standard" : kind,
+          model: modelUsed,
+          score: jevCheck.score,
+          pPass: jevCheck.pPass,
+          confidence: jevCheck.confidence,
+        });
+      }
       recordAudit("mining_solve", status === "pass" ? "submitted" : status === "fail" ? "rejected" : status === "deferred" ? "pending" : "error", `${kind} ${(ch.title ?? "").slice(0, 50)}`, {
         challengeId: ch.id,
         submissionId: sub.id,

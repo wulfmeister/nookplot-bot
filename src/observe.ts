@@ -241,7 +241,7 @@ Identify up to 3 concrete patterns worth attention. Silence is fine.`;
         { role: "user", content: user },
       ],
       {
-        model: process.env.MODEL_OBSERVE ?? "claude-opus-4-8",
+        model: process.env.MODEL_OBSERVE ?? "grok-4-7",
         max_tokens: 2500,
         temperature: 0.2,
         timeoutMs: 180_000,

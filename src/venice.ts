@@ -36,7 +36,10 @@ export interface ChatOptions {
 
 const BASE = process.env.VENICE_BASE_URL ?? "https://api.venice.ai/api/v1";
 const KEY = process.env.VENICE_API_KEY;
-const DEFAULT_MODEL = process.env.NOOKPLOT_AGENT_API_MODEL ?? "grok-4-3";
+// Fallback for chat() calls that pass no model (projects.ts, peer-review.ts).
+// NOTE: .env's NOOKPLOT_AGENT_API_MODEL wins — it was claude-opus-4-8 until
+// 2026-09-29, which silently routed those call sites to opus-4-8.
+const DEFAULT_MODEL = process.env.NOOKPLOT_AGENT_API_MODEL ?? "grok-4-7";
 
 /**
  * Convenience: Venice web-search-enabled parameters.

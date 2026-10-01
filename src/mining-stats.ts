@@ -18,6 +18,7 @@
  */
 import { join } from "node:path";
 import { NOOK_DIR, readJsonl } from "./util.js";
+import { jevCheckReport, JEV_CHECKS_LOG } from "./jev.js";
 
 const MINING_LOG = join(NOOK_DIR, "mining-submissions.jsonl");
 const MINING_VERIFIED_LOG = join(NOOK_DIR, "mining-verified.jsonl");
@@ -225,6 +226,29 @@ function main() {
     render("", tally((e) => e.verifierKind ?? "?"));
     console.log("  -- model × kind --");
     render("", tally((e) => `${e.model ?? "(unrecorded)"} / ${e.verifierKind ?? "?"}`), 40);
+  }
+
+  // Jev shadow check vs settlement (2026-09-29). AUC 0.5 = coin flip; it
+  // only earns a say in submissions if this climbs well above that (≥0.70)
+  // with ≥10 paid AND ≥10 rejected per kind. Windowed by submission time
+  // like the verified-rate section above.
+  console.log("\n== Jev shadow check vs settled outcome (AUC: 0.5 = coin flip) ==");
+  const jevRows = readJsonl<{ ts?: string; submissionId?: string; kind?: string; score?: number; pPass?: number }>(JEV_CHECKS_LOG)
+    .filter((r) => !r.ts || new Date(r.ts).getTime() >= cutoff);
+  const settleRows = readJsonl<{ submissionId?: string; status?: string }>(join(NOOK_DIR, "mining-settlements.jsonl"));
+  const rep = jevCheckReport(jevRows, settleRows);
+  if (jevRows.length === 0) {
+    console.log("  No checks recorded yet (jev-checks.jsonl fills as submissions go out).");
+  } else if (Object.keys(rep).length === 0) {
+    console.log(`  ${jevRows.length} checks recorded, none settled as verified/rejected yet.`);
+  } else {
+    for (const [k, r] of Object.entries(rep)) {
+      const enough = r.paid >= 10 && r.rejected >= 10;
+      const fmt = (x: number) => (Number.isFinite(x) ? x.toFixed(2) : "  - ");
+      console.log(
+        `  ${k.padEnd(14)} paid ${String(r.paid).padStart(3)}  rejected ${String(r.rejected).padStart(3)}  AUC(score) ${fmt(r.aucScore)}  AUC(P pass) ${fmt(r.aucPass)}${enough ? "" : "  (too few to judge)"}`,
+      );
+    }
   }
 
   // Recommendation

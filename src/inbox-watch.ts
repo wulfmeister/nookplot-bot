@@ -20,10 +20,15 @@ import { join } from "node:path";
 import { writeFileSync } from "node:fs";
 import type { NookplotRuntime } from "@nookplot/runtime";
 import { NOOK_DIR, readJsonl, appendJsonl } from "./util.js";
+import { jevTriageMessage, compareTriage, TRIAGE_ICON, type InboxTriage } from "./jev.js";
 
 type RuntimeLike = Pick<NookplotRuntime, "connection">;
 
 const LOG = join(NOOK_DIR, "inbox-watch.jsonl");
+// Jev triage verdicts, one per thread per latest message (2026-09-29). Ranking
+// only — the bot never replies (docs/inbox-strategy.md).
+const TRIAGE_LOG = join(NOOK_DIR, "inbox-triage.jsonl");
+const TRIAGE_MAX_PER_TICK = 30;
 const SNAPSHOT = join(NOOK_DIR, "inbox-threads.json");
 
 interface InboxThread {
@@ -71,6 +76,29 @@ export async function runInboxWatchTick(runtime: RuntimeLike): Promise<void> {
     return;
   }
 
+  // Jev triage: rank every thread whose CURRENT latest message has no verdict
+  // yet (first run backfills the existing threads; afterwards only new or
+  // updated ones). Sequential and bounded; a null (Jev paused/disabled) just
+  // retries next tick. The message is untrusted text — Jev returns only a
+  // bounded score/choice, and nothing here acts on it except sort order.
+  const triageByKey = new Map<string, InboxTriage>();
+  for (const e of readJsonl<{ key?: string; triage?: InboxTriage }>(TRIAGE_LOG)) {
+    if (e.key && e.triage) triageByKey.set(e.key, e.triage);
+  }
+  let triaged = 0;
+  for (const t of threads) {
+    if (triaged >= TRIAGE_MAX_PER_TICK) break;
+    const key = threadKey(t);
+    const text = String(t.lastMessage ?? "").trim();
+    if (triageByKey.has(key) || !text) continue;
+    const triage = await jevTriageMessage({ from: t.otherName ?? t.otherAddress, messageType: t.messageType, text });
+    if (!triage) break; // Jev paused/disabled/failing — stop, try next tick
+    triageByKey.set(key, triage);
+    triaged++;
+    appendJsonl(TRIAGE_LOG, { ts: new Date().toISOString(), key, threadId: t.id ?? t.threadId, from: t.otherName ?? t.otherAddress, triage });
+  }
+  const triageOf = (t: InboxThread) => triageByKey.get(threadKey(t)) ?? null;
+
   // Snapshot for the dashboard (always overwrite with the current view).
   const snapshot = {
     ts: new Date().toISOString(),
@@ -78,8 +106,9 @@ export async function runInboxWatchTick(runtime: RuntimeLike): Promise<void> {
     threadCount: threads.length,
     threads: threads
       .slice()
-      .sort((a, b) => (b.unreadCount ?? 0) - (a.unreadCount ?? 0))
+      .sort((a, b) => compareTriage(triageOf(a), triageOf(b)) || (b.unreadCount ?? 0) - (a.unreadCount ?? 0))
       .map((t) => ({
+        triage: triageOf(t),
         id: t.id ?? t.threadId ?? null,
         from: t.otherName ?? "(unnamed)",
         otherAddress: t.otherAddress ?? null,
@@ -99,14 +128,18 @@ export async function runInboxWatchTick(runtime: RuntimeLike): Promise<void> {
   // Surface new/updated threads to the log + jsonl (one-shot per last-message).
   const seen = new Set(readJsonl<{ key?: string }>(LOG).map((e) => e.key));
   let fresh = 0;
-  for (const t of threads) {
+  const labels: Record<string, number> = {};
+  const freshThreads = threads.filter((t) => !seen.has(threadKey(t))).sort((a, b) => compareTriage(triageOf(a), triageOf(b)));
+  for (const t of freshThreads) {
     const key = threadKey(t);
-    if (seen.has(key)) continue;
     fresh++;
     const from = t.otherName ?? t.otherAddress ?? "?";
     const body = String(t.lastMessage ?? "").replace(/\s+/g, " ").slice(0, 220);
+    const tri = triageOf(t);
+    if (tri) labels[tri.label] = (labels[tri.label] ?? 0) + 1;
+    const tag = tri ? `${TRIAGE_ICON[tri.label]} ${tri.label} (${tri.category}, ${tri.priority.toFixed(1)}/3) ` : "";
     console.log(
-      `📬 DM from ${from} (${(t.otherAddress ?? "").slice(0, 12)}, ${t.messageType ?? "dm"}, unread ${t.unreadCount ?? 0}): ${body}`,
+      `📬 ${tag}DM from ${from} (${(t.otherAddress ?? "").slice(0, 12)}, ${t.messageType ?? "dm"}, unread ${t.unreadCount ?? 0}): ${body}`,
     );
     appendJsonl(LOG, {
       ts: new Date().toISOString(),
@@ -117,9 +150,14 @@ export async function runInboxWatchTick(runtime: RuntimeLike): Promise<void> {
       messageType: t.messageType,
       unreadCount: t.unreadCount,
       preview: body,
+      triage: tri ?? undefined,
     });
   }
-  if (fresh > 0) {
-    console.log(`📬 inbox: ${fresh} new/updated thread(s) surfaced — ${threads.length} threads, ${unread} unread. Reply via 'nookplot inbox send' (operator decision).`);
+  if (fresh > 0 || triaged > 0) {
+    const mix = Object.entries(labels).map(([l, n]) => `${n} ${l}`).join(", ");
+    console.log(
+      `📬 inbox: ${fresh} new/updated thread(s) surfaced${mix ? ` (${mix})` : ""}, ${triaged} triaged by jev — ${threads.length} threads, ${unread} unread. ` +
+        `Ranked view: ~/.nookplot/inbox-threads.json. Reply via 'nookplot inbox send' (operator decision).`,
+    );
   }
 }

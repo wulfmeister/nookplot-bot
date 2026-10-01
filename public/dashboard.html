@@ -1402,14 +1402,22 @@ function renderInbox() {
   card.style.display = "";
   const age = d.ageMinutes == null ? "" : ` · updated ${d.ageMinutes}m ago`;
   if (meta) meta.textContent = `— ${d.unread} unread across ${d.threadCount} threads${age}`;
+  // Jev triage badge (2026-09-29): threads arrive already sorted risky/act first.
+  const TRI = { risky: ["⚠️", "var(--red, #e5534b)"], act: ["🔴", "var(--red, #e5534b)"], read: ["🟡", "var(--amber, #d6a132)"], low: ["⚪", "var(--muted, #8b949e)"], ignore: ["🗑", "var(--muted, #8b949e)"] };
+  const badge = (tr) => {
+    if (!tr || !TRI[tr.label]) return "";
+    const [icon, col] = TRI[tr.label];
+    const cat = String(tr.category || "").replace(/</g, "&lt;");
+    return `<span style="color:${col}; font-size:11px; margin-right:6px" title="jev priority ${Number(tr.priority).toFixed(2)}/3">${icon} ${tr.label} · ${cat}</span>`;
+  };
   el.innerHTML = threads.map((t) => `
     <div style="padding:8px 0; border-bottom:1px solid var(--border)">
-      <div><strong>${(t.from||"?").replace(/</g,"&lt;")}</strong>
+      <div>${badge(t.triage)}<strong>${(t.from||"?").replace(/</g,"&lt;")}</strong>
         <code style="font-size:10px">${(t.otherAddress||"").slice(0,12)}</code>
         <span class="legend" style="text-transform:none">· ${t.messageType||"dm"} · ${t.unreadCount||0} unread</span></div>
       <div class="legend" style="margin-top:2px; text-transform:none">${(t.preview||"").replace(/</g,"&lt;")}</div>
     </div>`).join("") +
-    `<div class="legend" style="margin-top:8px; text-transform:none">Reply via <code>nookplot inbox send --to &lt;addr&gt; --message "…"</code> (operator decision). Flat list endpoint 500s; this reads <code>/v1/inbox/threads</code>.</div>`;
+    `<div class="legend" style="margin-top:8px; text-transform:none">Reply via <code>nookplot inbox send --to &lt;addr&gt; --message "…"</code> (operator decision). Flat list endpoint 500s; this reads <code>/v1/inbox/threads</code>. Ranked by jev (cheap triage, not a reply).</div>`;
 }
 
 function renderCapacity() {

@@ -4,6 +4,62 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-09-29 — every model → grok-4-7; Jev added as inbox triage and a shadow checker
+
+Operator: "replace every model with grok 4.7. then if anything breaks we'll
+adjust. and yes add jev as a checker, and to prioritize incoming inbox
+messages, and anything else you can think of, since it's super cheap."
+
+**Single-model roster.** Every task default, both A/B pools, the verifiable
+default, the observe/project-review defaults, the venice/proxy fallback and the
+`NOOKPLOT_AGENT_API_MODEL` / `MODEL_OBSERVE` env values are now `grok-4-7`
+(catalog: $2.27/$6.8 per M, 500k ctx, effort to xhigh, trait
+most_intelligent), at xhigh. Pre-ship probe with the production shapes (50k
+completion floor, temperature kept): standard 249s / 5.8k-char trace /
+$0.16, python 149s / $0.10, both strict-parse OK. Measured cost matched the
+estimate within 2%, so `venice-costs.jsonl` is accurate.
+Leaks found on the way: the venice/proxy fallback read
+`NOOKPLOT_AGENT_API_MODEL=claude-opus-4-8` from .env, so every `chat()` call
+without an explicit model (projects.ts, peer-review.ts) ran opus-4-8 — the
+untagged 09-23→25 opus-4-8 spend.
+Deliberately not changed: `rlm-spotcheck.ts` (it replays the SOLVER's
+disclosed model, not ours) and the dormant lean-mode model.
+Known risks, accepted by the operator: a one-model pool has no transient
+failover; the gateway's `modelUsed` validator has never seen "grok-4-7"
+(one id rejection and the breaker's empty-pool fail-safe keeps submitting —
+watch the first submissions); and the probe's grok-4-7 python summary failed
+our local specificity gate (it writes the numbers + backticks + comparison
+our SUMMARY_SPECIFICITY_RULE asks for, while the gate credits techniques /
+code / failures) — expect code-lane local skips until that rule is fixed.
+
+**Jev (`jev-latest`, Venice "decision" model, beta).** Answers bounded
+questions — yes/no probability, one-of-N choice, rubric score — about a
+`state`; ~0.4s and ~2-3k input tokens per call at $0.042/M input, $0 output.
+Before wiring it into anything that acts, it was tested on 72 of our settled
+standard traces (read from workspace artifacts; the IPFS route 502s): its
+quality score does NOT separate paid from rejected — AUC 0.49, P(pass) AUC
+0.51, Spearman vs the best verifier's score −0.14 (Aug-only 0.69 on 26/8,
+Sep 0.39 on 10/28; the farm makes September labels mostly noise; the
+workspace copies stop at 8,000 chars). So:
+- `src/jev.ts` — client that never throws; a 402/429 or 3 consecutive failures
+  pause ALL Jev calls for 30 min (the 09-28 lockout lesson). `BOT_JEV=0` off.
+- **Inbox triage** (`inbox-watch.ts`): each thread's latest message gets a
+  priority (0-3 rubric) and category; labels risky / act / read / low /
+  ignore, with a risky ask (keys, funds, unknown links) surfacing regardless
+  of priority. Backfills existing threads on the first tick, then only new
+  messages. Log lines, `inbox-triage.jsonl`, the snapshot and the dashboard
+  card are sorted risky/act first. Ranking only — still no auto-replies.
+- **Shadow checker** (`mining.ts`): a verdict on every submission just before
+  it is sent, recorded with the submission id in `jev-checks.jsonl`. Never
+  gates or edits anything. `npm run mining-stats` now scores it against
+  settlements per kind (needs ≥10 paid and ≥10 rejected; promote only if AUC
+  clears ~0.70). `BOT_JEV_CHECK=0` off.
+- Not wired, on purpose: Jev as a gate on essays, verify-lane farm detection,
+  or post-quality checks — the calibration says it can't grade our work yet,
+  and acting on a coin flip would discard good solves at random.
+
+Tests 578 → 589; tsc clean.
+
 ## 2026-09-27 — the tilt ignored rejected standards; penalty-box fix merged from upstream
 
 **What the tilt got wrong.** From 09-23 every standard trace we submitted

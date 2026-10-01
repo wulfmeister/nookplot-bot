@@ -514,7 +514,7 @@ export function isHighStakesTag(tag: string): boolean {
   const t = tag.trim().toLowerCase();
   return HIGH_STAKES_TAGS.has(t) || /security|crypto|privacy|auth|exploit|consensus|sec$/.test(t);
 }
-const REVIEW_MODEL = process.env.BOT_PROJECTS_REVIEW_MODEL ?? "claude-opus-4-8";
+const REVIEW_MODEL = process.env.BOT_PROJECTS_REVIEW_MODEL ?? "grok-4-7";
 
 /**
  * Merge duplicate `## H2` sections in a README (the recurring `## Tests` /

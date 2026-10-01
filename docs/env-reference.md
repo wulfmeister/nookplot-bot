@@ -71,7 +71,9 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `MODEL_FIT_EVALUATE` | `grok-4-3` | Bounty fit gate. |
 | `MODEL_OBSERVE` | `claude-opus-4-8` | Self-observation/introspection tick (`src/observe.ts` — separate from the task registry). |
 | `BOT_VERIFIABLE_MODEL` | unset | Force a specific model for verifiable code kinds (`python_tests` / `javascript_tests` / `exact_answer`); still subject to the parse-fail circuit breaker (`src/mining.ts`). |
-| `BOT_VERIFIABLE_MODEL_OVERRIDE` | on (`0` disables) | Route non-code A/B picks to a code-strong model on verifiable kinds (default target `claude-opus-4-8`); `0` keeps the raw A/B pick (`src/mining.ts`). |
+| `BOT_VERIFIABLE_MODEL_OVERRIDE` | on (`0` disables) | Route non-code A/B picks to a code-strong model on verifiable kinds (default target `grok-4-7` since 2026-09-29, the single-model roster); `0` keeps the raw A/B pick (`src/mining.ts`). |
+| `BOT_JEV` | on (`0` disables) | Every call to Venice's Jev decision model (`jev-latest`): inbox triage and the shadow submission check. A 402/429 or 3 consecutive failures pause all Jev calls for 30 min (`src/jev.ts`). |
+| `BOT_JEV_CHECK` | on (`0` disables) | Shadow-check each mining submission with Jev and record the verdict to `jev-checks.jsonl`. Never gates or edits a submission; `npm run mining-stats` scores it against settlements (`src/mining.ts`). |
 | `BOT_MODEL_PARSE_FAIL_THRESHOLD` | `0.30` | Parse-failure rate at which a model is sidelined from the A/B pool and the verifiable override (`src/models.ts`). The bench expires 24h after the arm's last `mining_solve` call, giving it one probe a day; model-id rejections do not expire. |
 | `BOT_MODEL_PARSE_FAIL_MIN_ATTEMPTS` | `5` | Minimum attempts before the parse-fail breaker can sideline a model (`src/models.ts`). |
 
@@ -232,7 +234,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `BOT_VOTE_LOOP` | on (`0` disables) | Upvote quality peer content (`src/social-engagement.ts`). |
 | `BOT_FOLLOW_LOOP` | on (`0` disables) | Follow productive agents (`src/social-engagement.ts`). |
 | `BOT_COMMENT_LOOP` | on (`0` disables) | Substantive comments on peer work (`src/social-engagement.ts`). |
-| `BOT_INBOX_WATCH` | on (`0` disables) | Surface new DM threads via `/v1/inbox/threads` (the flat inbox endpoint is broken server-side). Never auto-replies (`src/inbox-watch.ts`). |
+| `BOT_INBOX_WATCH` | on (`0` disables) | Surface new DM threads via `/v1/inbox/threads` (the flat inbox endpoint is broken server-side), ranked by a Jev triage (risky / act / read / low / ignore) in the log, `inbox-triage.jsonl` and the dashboard. Never auto-replies (`src/inbox-watch.ts`). |
 | `BOT_ENDORSE_THRESHOLD` | `0.70` | Minimum average verification score before endorsing a solver (plus a substantive-insight check) (`src/social.ts`). |
 | `BOT_ATTENTION_LOOP` | on (`0` disables) | Poll + ack gateway attention signals (work matching our profile) (`src/attention-signals.ts`). |
 | `BOT_COLLAB_FINDER` | on (`0` disables) | Geometric-matching search for collaborator agents in our domains (`src/attention-signals.ts`). |

@@ -16,6 +16,9 @@
  *   - dashboard-web:   blocker scoring (via importing computeBlockers — exported below)
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
+import {
+  parseJevAnswers, jevDecide, _resetJevForTests, jevPausedUntil, triageFromAnswers, compareTriage, checkFromAnswers, aucOf, jevCheckReport, JEV_PAUSE_MS,
+} from "../jev.js";
 import assert from "node:assert/strict";
 
 import { pickModel, pickModelAB, effortFor } from "../models.js";
@@ -155,10 +158,12 @@ describe("models", () => {
       // by the incumbent failing a gate the cheaper model cleared). Prose/
       // volume tasks stay on grok-4-3. Verification moved to grok-4-6 since
       // 2026-08-13 (grok-4-5 before that, from 07-30).
-      assert.equal(pickModel("mining_solve"), process.env.MODEL_MINING_SOLVE ?? "deepseek-v4-1-flash");
-      assert.equal(pickModel("verification_score"), process.env.MODEL_VERIFICATION_SCORE ?? "grok-4-6");
-      assert.equal(pickModel("verification_comprehension"), process.env.MODEL_VERIFICATION_COMPREHENSION ?? "grok-4-6");
-      assert.equal(pickModel("knowledge_body"), process.env.MODEL_KNOWLEDGE_BODY ?? "grok-4-3");
+      // 2026-09-29: single-model roster (operator) — every task defaults to grok-4-7.
+      assert.equal(pickModel("mining_solve"), process.env.MODEL_MINING_SOLVE ?? "grok-4-7");
+      assert.equal(pickModel("verification_score"), process.env.MODEL_VERIFICATION_SCORE ?? "grok-4-7");
+      assert.equal(pickModel("verification_comprehension"), process.env.MODEL_VERIFICATION_COMPREHENSION ?? "grok-4-7");
+      assert.equal(pickModel("knowledge_body"), process.env.MODEL_KNOWLEDGE_BODY ?? "grok-4-7");
+      assert.equal(pickModel("bounty_draft"), process.env.MODEL_BOUNTY_DRAFT ?? "grok-4-7");
     } finally {
       if (savedLean === undefined) delete process.env.BOT_LEAN;
       else process.env.BOT_LEAN = savedLean;
@@ -176,12 +181,9 @@ describe("models", () => {
     // correctness+security harness clean) and standard 113s/$0.024 (parses
     // via salvageMarkdownTrace, spec pass). Effort is "high" — at "max" it
     // returns empty content with the whole budget spent on reasoning.
-    const allowed = new Set([
-      "grok-4-6",
-      "deepseek-v4-1-flash",
-      "openai-gpt-56-terra",
-      "gemini-3-8-flash",
-    ]);
+    // 2026-09-29: the pool is grok-4-7 alone (operator: "replace every model
+    // with grok 4.7"). The 09-20 four-arm pool's evidence is in the CHANGELOG.
+    const allowed = new Set(["grok-4-7"]);
     try {
       const seen = new Set<string>();
       for (let i = 0; i < 40; i++) {
@@ -214,7 +216,8 @@ describe("models", () => {
       // it (low..max, default medium). Both current claims live-probed
       // 2026-09-02 with solve-shaped requests at xhigh: 200 OK, full output.
       assert.equal(effortFor("claude-opus-5"), "xhigh");
-      assert.equal(effortFor("claude-opus-5-5"), "xhigh"); // python_tests lane since 2026-09-24
+      assert.equal(effortFor("claude-opus-5-5"), "xhigh"); // python_tests lane 2026-09-24 → 09-29
+      assert.equal(effortFor("grok-4-7"), "xhigh"); // whole roster since 2026-09-29
       assert.equal(effortFor("openai-gpt-56-terra"), "xhigh");
       // deepseek-v4-1-flash joined 2026-09-20 at "high" (catalog default).
       // NOT its "max" tier: probed 09-20 the python solve shape at max spent
@@ -583,12 +586,11 @@ describe("mining.maybeOverrideModelForVerifiable (route weak-for-code models off
     if (saved.m === undefined) delete process.env.BOT_VERIFIABLE_MODEL; else process.env.BOT_VERIFIABLE_MODEL = saved.m;
   };
 
-  it("routes a weak-code A/B pick → deepseek on a verifiable (python_tests) challenge", () => {
+  it("routes a weak-code A/B pick → the default on a verifiable (python_tests) challenge", () => {
     clean();
-    // Default is claude-opus-5-5 since 2026-09-24 (deepseek-v4-1-flash held
-    // it 09-20→09-24 and was worse on the lane than the opus-5 it replaced:
-    // 12/24 attempt errors, 9/12 verified vs 23/25; opus-5 09-02→09-20).
-    try { assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3")).model, "claude-opus-5-5"); }
+    // Default is grok-4-7 since 2026-09-29 (single-model roster). History:
+    // claude-opus-5-5 09-24→09-29, deepseek-v4-1-flash 09-20→09-24, opus-5 09-02→09-20.
+    try { assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3")).model, "grok-4-7"); }
     finally { restore(); }
   });
   it("leaves an already code-strong A/B pick (opus / gpt-55) unchanged on verifiable; deepseek is rerouted", () => {
@@ -597,9 +599,10 @@ describe("mining.maybeOverrideModelForVerifiable (route weak-for-code models off
       assert.equal(maybeOverrideModelForVerifiable(py, AB("claude-opus-4-8")).model, "claude-opus-4-8");
       assert.equal(maybeOverrideModelForVerifiable(py, AB("openai-gpt-55")).model, "openai-gpt-55");
       assert.equal(maybeOverrideModelForVerifiable(py, AB("claude-opus-5-5")).model, "claude-opus-5-5");
+      assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-7")).model, "grok-4-7");
       // deepseek-v4-1-flash left VERIFIABLE_CODE_MODELS on 2026-09-24 — as an
       // A/B pick it no longer keeps python_tests; every attempt routes to the default.
-      assert.equal(maybeOverrideModelForVerifiable(py, AB("deepseek-v4-1-flash")).model, "claude-opus-5-5");
+      assert.equal(maybeOverrideModelForVerifiable(py, AB("deepseek-v4-1-flash")).model, "grok-4-7");
     } finally { restore(); }
   });
   it("does NOT touch standard (non-verifiable) challenges — keeps grok in the A/B pool", () => {
@@ -619,7 +622,7 @@ describe("mining.maybeOverrideModelForVerifiable (route weak-for-code models off
   it("won't force a parse-fail-sidelined default model", () => {
     clean();
     try {
-      const rates = { "claude-opus-5-5": { attempts: 10, failures: 8, rate: 0.8 } };
+      const rates = { "grok-4-7": { attempts: 10, failures: 8, rate: 0.8 } };
       assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates).model, "grok-4-3");
     } finally { restore(); }
   });
@@ -632,11 +635,11 @@ describe("mining.maybeOverrideModelForVerifiable (route weak-for-code models off
     const H = 3_600_000;
     // Default is claude-opus-5-5 since 2026-09-24 (this test predates that swap).
     const rates = (ageMs: number) => ({
-      "claude-opus-5-5": { attempts: 10, failures: 8, rate: 0.8, lastCallMs: now - ageMs },
+      "grok-4-7": { attempts: 10, failures: 8, rate: 0.8, lastCallMs: now - ageMs },
     });
     try {
       assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates(H), now).model, "grok-4-3");
-      assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates(25 * H), now).model, "claude-opus-5-5");
+      assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates(25 * H), now).model, "grok-4-7");
     } finally { restore(); }
   });
 });
@@ -5477,5 +5480,146 @@ describe("2026-09-27 tilt: rejected standards are losses; reward multiple measur
       standardLossShare: 14 / 21, verifiableSurvival: 34 / 39, todaySubmitted: 0, todayVerifiable: 0,
     });
     assert.equal(t.active, false);
+  });
+});
+
+describe("2026-09-29 single-model roster pricing", () => {
+  it("prices grok-4-7 and jev-latest from the real table, not the default", () => {
+    const def = estimateCallCost("some-unknown-model", 12000, 8000);
+    const grok47 = estimateCallCost("grok-4-7", 12000, 8000);
+    assert.notEqual(grok47.toFixed(6), def.toFixed(6), "grok-4-7 is falling back to DEFAULT_PRICING");
+    assert.equal(grok47.toFixed(6), estimateCallCost("grok-4-6", 12000, 8000).toFixed(6), "same catalog price as grok-4-6");
+    // Jev bills input only: 2,800 input tokens at $0.042/M.
+    assert.ok(Math.abs(estimateCallCost("jev-latest", 2800, 0) - 2800 * 0.042 / 1e6) < 1e-12);
+  });
+});
+
+describe("jev (Venice decision model) client + triage + shadow-check report", () => {
+  const savedKey = process.env.VENICE_API_KEY;
+  const savedJev = process.env.BOT_JEV;
+  const setup = () => { _resetJevForTests(); process.env.VENICE_API_KEY = "test-key"; delete process.env.BOT_JEV; };
+  const teardown = () => {
+    _resetJevForTests();
+    if (savedKey === undefined) delete process.env.VENICE_API_KEY; else process.env.VENICE_API_KEY = savedKey;
+    if (savedJev === undefined) delete process.env.BOT_JEV; else process.env.BOT_JEV = savedJev;
+  };
+  const reply = (status: number, body: unknown) =>
+    (async () => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })) as unknown as typeof fetch;
+  const OK_BODY = {
+    model: "jev-latest",
+    answers: {
+      priority: { type: "score", score: 2.6, confidence: 0.7, probabilities: { "0": 0, "1": 0.1, "2": 0.2, "3": 0.7 } },
+      category: { type: "choice", choice: "collaboration", confidence: 0.8, probabilities: { collaboration: 0.8 } },
+    },
+    usage: { input_tokens: 420, output_tokens: 60 },
+  };
+
+  it("parseJevAnswers keeps typed fields and rejects malformed bodies", () => {
+    const a = parseJevAnswers(OK_BODY)!;
+    assert.equal(a.priority.score, 2.6);
+    assert.equal(a.category.choice, "collaboration");
+    assert.equal(parseJevAnswers({}), null);
+    assert.equal(parseJevAnswers({ answers: "nope" }), null);
+    assert.equal(parseJevAnswers(null), null);
+  });
+
+  it("returns answers and reports input tokens to the cost sink on success", async () => {
+    setup();
+    let costed = -1;
+    try {
+      const r = await jevDecide({ message: "hi" }, {}, { fetchImpl: reply(200, OK_BODY), onCost: (n) => { costed = n; } });
+      assert.equal(r?.answers.priority.score, 2.6);
+      assert.equal(r?.inputTokens, 420);
+      assert.equal(costed, 420);
+    } finally { teardown(); }
+  });
+
+  it("BOT_JEV=0 disables without calling the network", async () => {
+    setup();
+    process.env.BOT_JEV = "0";
+    let called = false;
+    try {
+      const r = await jevDecide({}, {}, { fetchImpl: (async () => { called = true; return new Response("{}"); }) as unknown as typeof fetch, onCost: () => {} });
+      assert.equal(r, null);
+      assert.equal(called, false);
+    } finally { teardown(); }
+  });
+
+  it("a 402 pauses ALL calls for 30 min — never retries through a spend limit (2026-09-28)", async () => {
+    setup();
+    let calls = 0;
+    const now = Date.parse("2026-09-29T12:00:00Z");
+    const f = (async () => { calls++; return new Response(JSON.stringify({ error: "API key USD spend limit exceeded" }), { status: 402 }); }) as unknown as typeof fetch;
+    try {
+      assert.equal(await jevDecide({}, {}, { fetchImpl: f, onCost: () => {}, nowMs: now }), null);
+      assert.equal(jevPausedUntil(), now + JEV_PAUSE_MS);
+      assert.equal(await jevDecide({}, {}, { fetchImpl: f, onCost: () => {}, nowMs: now + 60_000 }), null);
+      assert.equal(calls, 1, "the paused call must not hit the network");
+      // After the pause it may try again.
+      await jevDecide({}, {}, { fetchImpl: reply(200, OK_BODY), onCost: () => {}, nowMs: now + JEV_PAUSE_MS + 1 });
+    } finally { teardown(); }
+  });
+
+  it("3 consecutive non-402 failures also pause (stays far below Venice's 50-failure lockout)", async () => {
+    setup();
+    let calls = 0;
+    const now = Date.parse("2026-09-29T12:00:00Z");
+    const f = (async () => { calls++; return new Response("boom", { status: 500 }); }) as unknown as typeof fetch;
+    try {
+      for (let i = 0; i < 3; i++) await jevDecide({}, {}, { fetchImpl: f, onCost: () => {}, nowMs: now });
+      assert.ok(jevPausedUntil() > now);
+      await jevDecide({}, {}, { fetchImpl: f, onCost: () => {}, nowMs: now + 1000 });
+      assert.equal(calls, 3);
+    } finally { teardown(); }
+  });
+
+  it("triageFromAnswers maps priority to labels, and a risky ask overrides priority", () => {
+    const t = (score: number, choice = "question", confidence = 0.9) =>
+      triageFromAnswers({ priority: { type: "score", score }, category: { type: "choice", choice, confidence } })!;
+    assert.equal(t(2.6).label, "act");
+    assert.equal(t(1.8).label, "read");
+    assert.equal(t(1.0).label, "low");
+    assert.equal(t(0.2).label, "ignore");
+    assert.equal(t(0.2, "risky").label, "risky", "asks for keys/funds must surface even at low priority");
+    assert.equal(t(2.6, "risky", 0.3).label, "act", "a low-confidence risky call does not override");
+    assert.equal(triageFromAnswers(null), null);
+  });
+
+  it("compareTriage sorts risky, then act, then by raw priority; untriaged last", () => {
+    const mk = (label: any, priority: number) => ({ label, priority, category: "x", categoryConfidence: 1 });
+    const items = [mk("low", 1.0), null, mk("act", 2.3), mk("risky", 0.4), mk("act", 2.9), mk("read", 1.6)];
+    const sorted = items.slice().sort(compareTriage).map((x) => (x ? `${x.label}:${x.priority}` : "none"));
+    assert.deepEqual(sorted, ["risky:0.4", "act:2.9", "act:2.3", "read:1.6", "low:1", "none"]);
+  });
+
+  it("checkFromAnswers needs both the score and the pass probability", () => {
+    assert.deepEqual(checkFromAnswers({ quality: { type: "score", score: 2.1, confidence: 0.5 }, passes: { type: "noul", noul: 0.4 } }), { score: 2.1, pPass: 0.4, confidence: 0.5 });
+    assert.equal(checkFromAnswers({ quality: { type: "score", score: 2.1 } }), null);
+  });
+
+  it("aucOf: 1 = perfect separation, 0.5 = coin flip", () => {
+    assert.equal(aucOf([3, 2], [1, 0]), 1);
+    assert.equal(aucOf([1, 0], [3, 2]), 0);
+    assert.equal(aucOf([1, 2], [1, 2]), 0.5);
+    assert.ok(Number.isNaN(aucOf([], [1])));
+  });
+
+  it("jevCheckReport joins checks to the LATEST settlement status per kind; pending rows are ignored", () => {
+    const checks = [
+      { submissionId: "a", kind: "standard", score: 2.8, pPass: 0.7 },
+      { submissionId: "b", kind: "standard", score: 1.2, pPass: 0.2 },
+      { submissionId: "c", kind: "standard", score: 2.0, pPass: 0.5 },
+      { submissionId: "d", kind: "python_tests", score: 2.5, pPass: 0.9 },
+    ];
+    const settlements = [
+      { submissionId: "a", status: "submitted" }, { submissionId: "a", status: "verified" },
+      { submissionId: "b", status: "rejected" },
+      { submissionId: "c", status: "expired" },
+      { submissionId: "d", status: "verified" },
+    ];
+    const r = jevCheckReport(checks, settlements);
+    assert.deepEqual(r.standard, { paid: 1, rejected: 1, aucScore: 1, aucPass: 1 });
+    assert.equal(r.python_tests.paid, 1);
+    assert.ok(Number.isNaN(r.python_tests.aucScore), "no rejected rows → AUC undefined");
   });
 });

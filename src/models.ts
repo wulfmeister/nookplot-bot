@@ -40,11 +40,22 @@ export type Task =
 // High-VOLUME prose tasks stay on grok-4-3 ($1.42/$2.83 — far cheaper on
 // output). Verification moved OFF grok-4-3 to grok-4-5 on 2026-07-30 at the
 // operator's direction; see the note on those rows below.
+// 2026-09-29 — SINGLE-MODEL ROSTER (operator: "replace every model with grok
+// 4.7. then if anything breaks we'll adjust"). Every task default and both A/B
+// pools are grok-4-7 (live catalog: $2.27/$6.8 per M, 500k ctx, effort
+// low..xhigh, trait most_intelligent). Pre-ship probe with the production
+// shapes (50k completion floor, temperature kept): standard 249s / 5.8k-char
+// trace / $0.16, python 149s / $0.10, both strict-parse OK; measured balance
+// drop matched the estimate within 2%. Known trade-off: a one-arm pool means
+// no transient failover (pickAlternateModel returns null) and the parse-fail
+// breaker's empty-pool fail-safe keeps the arm running. The per-task history
+// in the comments below is kept as the record of why each earlier pick was
+// made. Revert per task with MODEL_<TASK> env overrides.
 const DEFAULTS: Record<Task, string> = {
-  bounty_draft: "claude-opus-4-8",
-  bounty_work: "claude-opus-4-8",
-  bounty_critique: "claude-opus-4-8",
-  bounty_revise: "claude-opus-4-8",
+  bounty_draft: "grok-4-7",
+  bounty_work: "grok-4-7",
+  bounty_critique: "grok-4-7",
+  bounty_revise: "grok-4-7",
   // mining_solve default → claude-opus-5 (operator, 2026-09-02): opus-4-8
   // failed the gateway's traceSummary specificity gate on 12/16 mining
   // attempts since 08-28 (chronic near-misses, 30-34 vs threshold 35);
@@ -77,8 +88,8 @@ const DEFAULTS: Record<Task, string> = {
   // Also observed 09-20: opus-5 uniquely trips Venice's content_filter on our
   // standard-trace system prompt (finish_reason=content_filter, 0 tokens, 1s) —
   // grok-4-6 / terra / gemini / deepseek / even opus-4-8 did not.
-  mining_solve: "deepseek-v4-1-flash",
-  mining_learning: "grok-4-3",
+  mining_solve: "grok-4-7",
+  mining_learning: "grok-4-7",
   // Verification moved to grok-4-5 on 2026-07-30 (operator). NOTE: this is
   // NOT a cost saving — grok-4-5 lists $2.27/$6.80 per M vs grok-4-3's
   // $1.42/$2.83, so it roughly doubles verification inference; the operator
@@ -88,14 +99,14 @@ const DEFAULTS: Record<Task, string> = {
   // verification-stats.jsonl for a step change in mean scores.
   // grok-4-5 → grok-4-6 on 2026-08-13 (operator): same price, same 500k ctx,
   // NOT beta, and it restores the xhigh effort tier 4-5 dropped.
-  verification_score: "grok-4-6",
-  verification_comprehension: "grok-4-6",
-  crowd_jury_score: "grok-4-3",
-  knowledge_topic: "grok-4-3",
-  knowledge_body: "grok-4-3",
-  research_extract: "grok-4-3",
-  action_suggest: "grok-4-3",
-  fit_evaluate: "grok-4-3",
+  verification_score: "grok-4-7",
+  verification_comprehension: "grok-4-7",
+  crowd_jury_score: "grok-4-7",
+  knowledge_topic: "grok-4-7",
+  knowledge_body: "grok-4-7",
+  research_extract: "grok-4-7",
+  action_suggest: "grok-4-7",
+  fit_evaluate: "grok-4-7",
 };
 
 const A_B_POOL: Record<Task, string[] | undefined> = {
@@ -104,7 +115,8 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   // thinking, see XHIGH_THINKING_MODELS below).
   // gpt-55-pro is excluded — significantly more expensive per call without
   // a confirmed quality delta worth the cost on bounty drafts.
-  bounty_draft: ["grok-4-3", "claude-opus-4-8", "openai-gpt-55"],
+  // 2026-09-29: single-model roster — see the DEFAULTS header.
+  bounty_draft: ["grok-4-7"],
   bounty_work: undefined,
   bounty_critique: undefined,
   bounty_revise: undefined,
@@ -179,12 +191,10 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   // in the pool (not just the verifiable default) so the standard-trace lane
   // generates real verifier-score data on it — n≥5/arm is what mining-stats
   // needs to confirm or reject the arm, and at 12 solves/day that is ~4 days.
-  mining_solve: [
-    "grok-4-6",
-    "deepseek-v4-1-flash",
-    "openai-gpt-56-terra",
-    "gemini-3-8-flash",
-  ],
+  // 2026-09-29: single-model roster (operator) — see the DEFAULTS header. The
+  // 09-20 → 09-28 four-arm pool (grok-4-6 / deepseek-v4-1-flash / terra /
+  // gemini-3-8-flash) and its measured results are in CHANGELOG 2026-09-29.
+  mining_solve: ["grok-4-7"],
   mining_learning: undefined,
   verification_score: undefined,
   verification_comprehension: undefined,
@@ -219,6 +229,9 @@ const MODEL_EFFORT: Record<string, ReasoningEffort> = {
   // grok-4-6 DOES list xhigh (catalog 2026-08-13: low|medium|high|xhigh,
   // default high) — operator wants it at xhigh, and this time it's supported.
   "grok-4-6": "xhigh",
+  // grok-4-7 at "xhigh" (catalog 2026-09-29: low|medium|high|xhigh). The whole
+  // roster since 09-29; probed at xhigh on both solve shapes before shipping.
+  "grok-4-7": "xhigh",
   "openai-gpt-55": "high",
   // Sol at "xhigh" (probed OK 09-02) — out of the roster since 09-03 (terra
   // took the 5.6 slot); entry kept so any residual call site has a sane value.
