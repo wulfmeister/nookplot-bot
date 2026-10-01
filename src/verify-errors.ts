@@ -40,6 +40,7 @@
  */
 import { isDiversityBlockError, isFinalizedError, isReciprocalVerificationError } from "./skip-caches.js";
 import { isVerifyCapError } from "./quotas.js";
+import { STAND_DOWN_PREFIX } from "./venice-breaker.js";
 
 /** 422 "complete the comprehension challenge before verifying" or ARTIFACT_INSPECTION_REQUIRED. */
 export function isComprehensionGateError(msg: string): boolean {
@@ -47,9 +48,17 @@ export function isComprehensionGateError(msg: string): boolean {
     || /ARTIFACT_INSPECTION_REQUIRED/i.test(msg);
 }
 
-/** Venice key-level budget exhaustion. Both production bodies are 402s. */
+/**
+ * Venice key-level budget exhaustion. Both production bodies are 402s. Also a
+ * refused call during a process-wide stand-down (venice-breaker.ts): chat()
+ * throws "Venice stand-down (...) ...; no request sent" when ANOTHER loop
+ * tripped the breaker while this verify pass sat between its two Venice calls.
+ * That says nothing about the submission, so it must not strike it or feed
+ * the streak (found merging seven/standdown + seven/verifymark, 2026-10-01).
+ */
 export function isVeniceBudgetError(msg: string): boolean {
-  return /Venice API 402\b/.test(msg)
+  return msg.startsWith(STAND_DOWN_PREFIX)
+    || /Venice API 402\b/.test(msg)
     || /DIEM spend limit exceeded/i.test(msg)
     || /Insufficient USD or Diem balance/i.test(msg);
 }
