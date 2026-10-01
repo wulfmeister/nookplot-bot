@@ -25,8 +25,26 @@
  * new pause, so a limit that does not reset at 00:00Z costs one failed call a
  * day.
  *
+ * Early lift (review fix, 2026-10-01): a refill-bound pause used to hold until
+ * 00:02Z even after the operator fixed the cause, so a 04:00Z dry-out topped up
+ * at 05:00Z still skipped mining/verify/posting for ~19h. Before the breaker, a
+ * top-up worked on the very next call. The 30-min balance watch
+ * (venice-balance.ts) now feeds each reading to noteVeniceBalanceReading():
+ *   - `insufficient-balance` lifts when a reading SENT AFTER the refusal shows
+ *     at least LIFT_MIN_SPENDABLE. A lift that the next call refuses again
+ *     raises the bar to that balance, so a balance Venice still won't spend
+ *     can't produce a lift→402→lift cycle every 30 min; the bar clears once a
+ *     reading shows the balance going down (calls were billed).
+ *   - `key-spend-limit` is set on the KEY, which the balance watch cannot see.
+ *     It lifts only when Venice's `accessPermitted` flips false → true within
+ *     the pause. On 2026-09-28 rate_limits read `accessPermitted: false` while
+ *     the key 402'd; whether it flips back when the key's limit is RAISED is
+ *     UNVERIFIED. If it doesn't, the pause holds to the refill, and the trip
+ *     log line tells the operator to restart after raising the limit.
+ *   - The 30-min pauses (lockout, unrecognised 402) just expire.
+ *
  * Side-effect free: in-memory state only, no disk or network. The only output
- * is one console line per new pause, and one per loop per pause from
+ * is one console line per new pause or lift, and one per loop per pause from
  * standDownSkip(). The state does not survive a restart; the first call after
  * a restart re-trips it if the key is still refused.
  *
@@ -45,6 +63,17 @@ export const REFILL_GRACE_MS = 2 * 60_000;
 export const REFILL_LAG_WINDOW_MS = 15 * 60_000;
 /** A nextEpochBegins further out than this is ignored (bad data). */
 const MAX_EPOCH_LOOKAHEAD_MS = 48 * 3600_000;
+/**
+ * The smallest spendable balance that lifts an `insufficient-balance` pause.
+ * Residues are real: the watch read 0.22 spendable on 2026-09-28, shortly
+ * before the bot's first 402 that day. The refusal says "Insufficient ... to
+ * complete request", so a residue may not fund a call (whether Venice refuses
+ * above $0 is UNVERIFIED). $1 is roughly four grok-4-7 xhigh calls, and well
+ * under any manual top-up.
+ */
+export const LIFT_MIN_SPENDABLE = 1;
+/** Restart command for the launchd-owned daemon (scripts/install-launchd.sh, label com.nookplot.bot). */
+export const RESTART_HINT = "launchctl kickstart -k gui/$(id -u)/com.nookplot.bot";
 
 export type StandDownKind = "key-spend-limit" | "insufficient-balance" | "payment-required" | "failed-attempt-lockout";
 
@@ -135,6 +164,17 @@ let kind: StandDownKind | null = null;
 let pauseId = 0;
 let knownNextEpoch: string | null = null;
 const loggedPauseByLoop = new Map<string, number>();
+/** When the current pause began (its first refusal). Readings sent earlier may predate it. */
+let pauseStartedMs = 0;
+/** A reading sent during the current pause reported `accessPermitted: false`. */
+let sawAccessDenied = false;
+/**
+ * Spendable balance at the last balance-triggered lift. A later
+ * insufficient-balance lift needs MORE than this, so a balance Venice refuses
+ * to spend lifts at most once. Cleared when a reading shows the balance went
+ * down, i.e. the lift funded billed calls.
+ */
+let liftBar: number | null = null;
 
 function enabled(): boolean {
   return process.env.BOT_VENICE_STANDDOWN !== "0";
@@ -148,6 +188,24 @@ export function _resetVeniceBreakerForTests(): void {
   pauseId = 0;
   knownNextEpoch = null;
   loggedPauseByLoop.clear();
+  pauseStartedMs = 0;
+  sawAccessDenied = false;
+  liftBar = null;
+}
+
+/** Pure: what the operator can do about a pause of this kind (appended to the trip log line). */
+export function standDownRemedy(k: StandDownKind): string {
+  switch (k) {
+    case "insufficient-balance":
+      return `A top-up lifts it at the next balance check (every 30 min); or restart: ${RESTART_HINT}.`;
+    case "key-spend-limit":
+      return (
+        `This limit is set on the API key, which the balance watch cannot see: after raising it, restart ` +
+        `(${RESTART_HINT}) or the pause holds until the refill.`
+      );
+    default:
+      return `It expires by itself; or restart: ${RESTART_HINT}.`;
+  }
 }
 
 /**
@@ -193,18 +251,88 @@ export function noteVeniceError(
   untilMs = newUntil;
   reason = err.label;
   kind = err.kind;
-  if (!wasActive) pauseId++;
+  if (!wasActive) {
+    pauseId++;
+    pauseStartedMs = nowMs;
+    sawAccessDenied = false;
+  }
   const iso = new Date(newUntil).toISOString();
   const hours = ((newUntil - nowMs) / 3600_000).toFixed(1);
   const log = opts.log ?? ((line: string) => console.warn(line));
   log(
     wasActive
-      ? `🛑 Venice stand-down extended: ${err.label} (HTTP ${err.status}) — now until ${iso} (${hours}h)`
+      ? `🛑 Venice stand-down extended: ${err.label} (HTTP ${err.status}) — now until ${iso} (${hours}h). ${standDownRemedy(err.kind)}`
       : `🛑 Venice stand-down: ${err.label} (HTTP ${err.status}) — pausing ALL Venice calls until ${iso} (${hours}h). ` +
-          `Mining, verify, posting, observe, knowledge, learnings and crowd-jury ticks skip until then; ` +
-          `restart or BOT_VENICE_STANDDOWN=0 to override.`,
+          `Mining, verify, posting, observe, knowledge, learnings and crowd-jury ticks skip until then. ` +
+          `${standDownRemedy(err.kind)} BOT_VENICE_STANDDOWN=0 (+ restart) disables the stand-down.`,
   );
   return veniceStandingDown(nowMs);
+}
+
+/**
+ * End the current pause now. Logs one line naming why. Returns false when
+ * nothing was standing down. The next refusal starts a new pause as usual.
+ */
+export function liftVeniceStandDown(
+  why: string,
+  nowMs = Date.now(),
+  log: (line: string) => void = (line) => console.warn(line),
+): boolean {
+  const s = veniceStandingDown(nowMs);
+  if (!s.active) return false;
+  untilMs = 0;
+  reason = null;
+  kind = null;
+  sawAccessDenied = false;
+  log(`✅ Venice stand-down lifted early (${s.reason}; was until ${s.until}): ${why}`);
+  return true;
+}
+
+/** One 30-min balance reading, as the breaker needs it (built in venice-balance.ts). */
+export interface VeniceBalanceReading {
+  /** DIEM plus any positive USD (venice-balance.ts spendableBalance). */
+  spendable: number;
+  /** rate_limits' `accessPermitted`; null/undefined when the response omits it. */
+  accessPermitted?: boolean | null;
+  /** When the balance request was SENT. A reading sent before the refusal can predate it. */
+  fetchedAtMs: number;
+}
+
+/**
+ * Feed a balance reading in; lifts a refill-bound pause when the reading shows
+ * the cause is fixed (rules in the module header). Returns true when it lifted.
+ */
+export function noteVeniceBalanceReading(
+  r: VeniceBalanceReading,
+  nowMs = Date.now(),
+  log: (line: string) => void = (line) => console.warn(line),
+): boolean {
+  if (!Number.isFinite(r.spendable)) return false;
+  // The balance went down since the last balance lift: calls were billed, so
+  // that lift worked. A later dry-out must not be held to its bar.
+  if (liftBar !== null && r.spendable < liftBar) liftBar = null;
+  const s = veniceStandingDown(nowMs);
+  if (!s.active) return false;
+  if (r.fetchedAtMs < pauseStartedMs) return false;
+  if (r.accessPermitted === false) {
+    sawAccessDenied = true;
+    return false;
+  }
+  if (s.kind === "insufficient-balance") {
+    if (r.spendable < LIFT_MIN_SPENDABLE) return false;
+    if (liftBar !== null && r.spendable <= liftBar) return false;
+    liftBar = r.spendable;
+    return liftVeniceStandDown(`balance now reads ${r.spendable.toFixed(2)} spendable (topped up)`, nowMs, log);
+  }
+  if (s.kind === "key-spend-limit") {
+    if (!sawAccessDenied || r.accessPermitted !== true) return false;
+    return liftVeniceStandDown(
+      `Venice's rate_limits now reports accessPermitted=true (it read false earlier in this pause)`,
+      nowMs,
+      log,
+    );
+  }
+  return false;
 }
 
 /** Thrown by chat() while standing down. No request was sent. */
