@@ -10,7 +10,9 @@ import {
   parseBaseRewardField,
   rankChallengesByEv,
   loadChallengeEvInputs,
+  loadStarvationGuard,
   formatEvTop,
+  formatEvShadow,
   formatKindFactors,
   challengeRankerMode,
 } from "./challenge-ev.js";
@@ -1184,13 +1186,17 @@ async function runSandboxSmokeTest(
  */
 /**
  * LEGACY ORDERING (2026-10-01): everything from here through
- * compareChallengePriority — the value tier, the verifiable tilt, kind-EV —
- * now runs ONLY under BOT_CHALLENGE_EV_RANK=0 or when the default ranker
- * can't read its state. The default is per-challenge EV in challenge-ev.ts:
- * realized = composite × baseReward × R with R shared by every kind and
- * difficulty in a settlement epoch, so a kind-level multiple (which folds
- * difficulty into "kind") misranks individual challenges. Kept intact as
- * the kill switch, with its tests.
+ * compareChallengePriority (the value tier, the verifiable tilt, kind-EV) is
+ * still the ACTIVE order by default. The per-challenge EV ranker in
+ * challenge-ev.ts runs in shadow next to it and becomes active only with
+ * BOT_CHALLENGE_EV_RANK=1. EV uses realized = composite × baseReward × R,
+ * with R shared by every kind and difficulty in a settlement epoch. A
+ * kind-level multiple folds difficulty into "kind" and so misranks
+ * individual challenges. But EV's "R cancels" premise fails in epochs that hit
+ * the 1,575,000/epoch solving cap (most days since 09-17, see settlements.ts
+ * EPOCH_SOLVING_CAP), and this order is just as blind to the cap, since its K
+ * is cap-scaled. Which one earns more is unmeasured. The bounded starvation
+ * guard (challenge-ev.ts) cancels preferVerifiable here while it holds.
  *
  * Competition-aware challenge ordering (2026-06-11, from operator-playbook
  * research). Solve rewards are share-of-pool per challenge: the first mover
@@ -1714,35 +1720,70 @@ export function composePostSolveLearning(reasoning: string, traceSummary: string
 }
 
 /**
- * Default ordering: per-challenge EV (see challenge-ev.ts for the derivation
- * and the measurements behind it). Sorts `eligible` in place and logs two
- * lines per poll: the per-kind factors with their evidence (plus R-hat and
- * how many settlement epochs carry baseReward), and the top 3 challenges
- * with every EV component. Returns false when local state can't be read, so
- * the caller falls back to the legacy ordering.
+ * Per-challenge EV ordering (see challenge-ev.ts for the derivation, the
+ * measurements behind it, and the epoch-cap caveat). Computes the EV ranking
+ * and logs two lines per poll: per-kind factors with their evidence (R-hat,
+ * capped epochs flagged, and the cap tally), and the top 3 challenges with
+ * every EV component plus what the ranker could see (pages, max base).
+ *
+ * `apply` (BOT_CHALLENGE_EV_RANK=1) sorts `eligible` in place. Otherwise
+ * (shadow, the default) it leaves `eligible` alone and logs what EV would
+ * attempt next to what the active order attempts. Returns false when local
+ * state can't be read; in apply mode the caller then falls back to legacy.
  */
-function orderEligibleByEv(eligible: Challenge[], targets: string[]): boolean {
+function orderEligibleByEv(
+  eligible: Challenge[],
+  targets: string[],
+  opts: { apply: boolean; pages: number; take: number },
+): boolean {
   try {
     const nowMs = Date.now();
     const ev = loadChallengeEvInputs(nowMs);
     const specMatch = targets.length > 0 ? (c: Challenge) => passesSpecializationFilter(c) : undefined;
     const ranked = rankChallengesByEv(eligible, ev.table, { guardActive: ev.guard.active, specMatch });
-    eligible.splice(0, eligible.length, ...ranked.map((r) => r.challenge));
-    console.log(formatKindFactors(ev.table, ev.windowDays, ev.rHat));
-    console.log(formatEvTop(ranked, ev.guard));
+    if (opts.apply) eligible.splice(0, eligible.length, ...ranked.map((r) => r.challenge));
+    console.log(formatKindFactors(ev.table, ev.windowDays, ev.rHat, ev.caps));
+    console.log(formatEvTop(ranked, ev.guard, 3, { pages: opts.pages }));
+    if (!opts.apply) console.log(formatEvShadow(ranked, eligible, opts.take));
     return true;
   } catch (err) {
-    console.warn(`   ⚠ EV ranking unavailable (${(err as Error).message.slice(0, 120)}) — using the legacy ordering`);
+    console.warn(
+      `   ⚠ EV ranking unavailable (${(err as Error).message.slice(0, 120)})` +
+        (opts.apply ? " — using the legacy ordering" : " — shadow log skipped"),
+    );
     return false;
   }
 }
 
 /**
- * LEGACY ordering (BOT_CHALLENGE_EV_RANK=0, or the EV ranker's fallback):
- * kind-EV from kHatByKind + the verifiable tilt. Kept as the kill switch; it
- * misranks across difficulties because kHat folds baseReward into the kind.
+ * Pure: the bounded starvation guard applied to the legacy tilt. While the
+ * guard holds, the poll must not PREFER verifiable (item 6 as specified).
+ * The kind-EV order then decides, which is not necessarily "standard first".
+ */
+export function applyStarvationGuardToTilt(tilt: TiltState, guard: { active: boolean; reason: string } | undefined): TiltState {
+  if (!guard?.active || !tilt.preferVerifiable) return tilt;
+  return {
+    ...tilt,
+    preferVerifiable: false,
+    reason: `${tilt.reason} → overridden by the starvation guard (${guard.reason})`,
+  };
+}
+
+/**
+ * LEGACY ordering: kind-EV from kHatByKind + the verifiable tilt. This is the
+ * ACTIVE order by default (shadow mode) and with BOT_CHALLENGE_EV_RANK=0,
+ * and the fallback when EV can't read its state under
+ * BOT_CHALLENGE_EV_RANK=1. It misranks across difficulties because kHat
+ * folds baseReward into the kind. The bounded starvation guard cancels
+ * preferVerifiable while it holds (BOT_VERIFIABLE_STARVATION_N=0 disables it).
  */
 async function orderEligibleLegacy(eligible: Challenge[], targets: string[]): Promise<void> {
+  let guard: { active: boolean; reason: string } | undefined;
+  try {
+    guard = loadStarvationGuard(Date.now());
+  } catch (err) {
+    console.warn(`   ⚠ starvation guard state unavailable (${(err as Error).message.slice(0, 120)}) — guard off this poll`);
+  }
   // Kind-EV from our own paid settlements (trailing 14d). Best-effort — an
   // empty/young ledger just means the static tier order ranks kinds. Read
   // BEFORE the tilt: the tilt's reward multiple is measured from it.
@@ -1759,6 +1800,11 @@ async function orderEligibleLegacy(eligible: Challenge[], targets: string[]): Pr
     // healthy-network ordering rather than blocking the poll.
     console.warn(`   ⚠ tilt state unavailable (${(err as Error).message}) — using default ordering`);
   }
+  const guarded = applyStarvationGuardToTilt(tilt, guard);
+  if (guard?.active && guarded === tilt) {
+    console.log(`   🛑 starvation guard ON (no verifiable preference to cancel this poll): ${guard.reason}`);
+  }
+  tilt = guarded;
   eligible.sort((a, b) => compareChallengePriority(a, b, targets, { ...tilt, kindEv }));
   // Logged either way: the 09-23→27 misranking was invisible because only an
   // ACTIVE tilt printed anything.
@@ -1842,14 +1888,24 @@ async function discoverAndSolveMiningChallengesInner(
 
   let challenges: Challenge[] = [];
   let scanTruncated = false;
+  let pagesScanned = 0;
   try {
     // limit=100 (observed gateway max), NOT 25: the list is newest-first and
     // templated python challenges arrive in batches that bury standard
     // challenges below a 25-item cutoff — which silently flipped our cap mix to 68% python at
     // ~8k NOOK/slot while standard (~41-52k/slot, 5-6.5x) sat unseen at #26+.
-    // The EV sort below ranks by baseReward (difficulty); it just needs to SEE them.
     // DEEP PAGING (2026-08-13): the same bury bug recurred at the next scale;
     // see fetchOpenChallengesPaged for the mechanics + evidence.
+    // VISIBILITY GAP (review, 2026-10-01): paging stops as soon as pollNeed
+    // (3) eligible items are visible, and page 1 is newest-first python. So
+    // high-base standards one page deeper never reach the ranker, legacy or
+    // EV. Live 10-01: 23 eligible on page 1 (20 python medium, 3 standard
+    // hard) vs 68 standard expert (500k, 'open', 0/20 subs) on page 2, never
+    // fetched. The 'open' status gate in challengeFitsBudget is NOT what hid
+    // them. Fetching deeper (e.g. ≥2 pages, +1 GET per poll, when EV is
+    // active) is an eligibility decision for the operator. It is proposed,
+    // not done, and should be weighed together with the epoch cap
+    // (settlements.ts EPOCH_SOLVING_CAP).
     const paged = await fetchOpenChallengesPaged(
       async (offset) => {
         const res = (await runtime.connection.request(
@@ -1863,6 +1919,7 @@ async function discoverAndSolveMiningChallengesInner(
     );
     challenges = paged.challenges;
     scanTruncated = Boolean(paged.stoppedEarly);
+    pagesScanned = paged.pages;
     if (paged.stoppedEarly) {
       console.warn(`   ⚠ discover paging stopped early (${challenges.length} scanned): ${paged.stoppedEarly.slice(0, 120)}`);
     }
@@ -1890,12 +1947,17 @@ async function discoverAndSolveMiningChallengesInner(
   }
 
   const targets = specializeDomains();
-  // Per-challenge EV is the default ranker (2026-10-01, src/challenge-ev.ts);
-  // BOT_CHALLENGE_EV_RANK=0 restores the legacy kind-EV + verifiable tilt.
-  // An EV failure (unreadable state) falls back to legacy rather than
-  // blocking the poll.
-  if (!(challengeRankerMode() === "ev" && orderEligibleByEv(eligible, targets))) {
+  // Ranker mode (src/challenge-ev.ts challengeRankerMode). By default (shadow)
+  // the legacy kind-EV + tilt order is ACTIVE and per-challenge EV is only
+  // logged next to it: EV's "R cancels" premise fails in epochs that hit the
+  // per-epoch solving cap, which is most days since 09-17. Making EV active
+  // (BOT_CHALLENGE_EV_RANK=1) is the operator's call. In ev mode, an EV
+  // failure (unreadable state) falls back to legacy rather than blocking the
+  // poll. BOT_CHALLENGE_EV_RANK=0 skips EV entirely.
+  const rankerMode = challengeRankerMode();
+  if (!(rankerMode === "ev" && orderEligibleByEv(eligible, targets, { apply: true, pages: pagesScanned, take: pollNeed }))) {
     await orderEligibleLegacy(eligible, targets);
+    if (rankerMode === "shadow") orderEligibleByEv(eligible, targets, { apply: false, pages: pagesScanned, take: pollNeed });
   }
 
   const matched = targets.length > 0 ? eligible.filter((c) => passesSpecializationFilter(c)).length : 0;

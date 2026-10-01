@@ -314,9 +314,11 @@ describe("challenge-ev: the comparator is a total order", () => {
 });
 
 describe("challenge-ev: kill switch + log lines", () => {
-  it("BOT_CHALLENGE_EV_RANK=0 selects the legacy ordering; anything else is EV", () => {
+  it("BOT_CHALLENGE_EV_RANK=0 selects legacy, =1 makes EV active, anything else is shadow (legacy active)", () => {
+    // Default flipped ev → shadow in review (2026-10-01): the per-epoch
+    // solving cap breaks "R cancels" on most days; activation is the operator's.
     assert.equal(challengeRankerMode({ BOT_CHALLENGE_EV_RANK: "0" }), "legacy");
-    assert.equal(challengeRankerMode({}), "ev");
+    assert.equal(challengeRankerMode({}), "shadow");
     assert.equal(challengeRankerMode({ BOT_CHALLENGE_EV_RANK: "1" }), "ev");
   });
   it("the top-3 line carries every EV component and the guard state", () => {

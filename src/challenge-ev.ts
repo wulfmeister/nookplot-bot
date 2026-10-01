@@ -1,7 +1,7 @@
 /**
- * Per-challenge expected value — the default mining ranker (2026-10-01).
+ * Per-challenge expected value. Mining ranker, SHADOW by default (2026-10-01).
  *
- * Why this replaced the kind-level ranking: realized payout is
+ * Why it exists: realized payout is
  *
  *     realized = compositeScore × baseReward(challenge) × R(settlement epoch)
  *
@@ -20,7 +20,27 @@
  *
  *     EV = submitRate(kind) × survival(kind) × compHat(kind) × baseReward(challenge)
  *
- * and R cancels (every candidate in one poll settles under the same future R).
+ * and R cancels (every candidate in one poll settles under the same future
+ * R), but ONLY IF THAT EPOCH IS UNCAPPED. Review correction, same day: our
+ * epoch_solving total is capped at exactly 1,575,000 NOOK per settlement
+ * epoch (evidence and caveats in settlements.ts EPOCH_SOLVING_CAP). The cap
+ * bound on 8 of the 13 non-zero claims since 09-17, including the last 4.
+ * Two of the four epochs measured above are capped (09-18, 09-27). Inside a
+ * capped epoch the cap scales every solve pro rata, which is why R is still
+ * shared across kinds there. But R is not exogenous there: R̂ = cap /
+ * Σ(comp × base) of OUR solves, and one more solve adds ~0 NOOK while still
+ * costing a slot plus inference. Base-proportional EV therefore overstates
+ * high-base picks on capped days. How much that changes income relative to
+ * the legacy order is unmeasured (legacy is just as blind to the cap).
+ *
+ * Hence the mode switch (challengeRankerMode): by default the legacy order
+ * stays ACTIVE and this ranker runs in SHADOW, logging what it would pick
+ * next to what was picked plus the per-epoch cap tally. BOT_CHALLENGE_EV_RANK=1
+ * makes it active and is the operator's call to make after weighing the cap.
+ * A cap-aware version would project the open epoch's committed
+ * Σ comp×base×R from pending rows and, when that is projected capped, rank by
+ * P(settle) and inference cost instead of base. It is not built.
+ *
  *   - submitRate: trailing LOCAL accepted / attempts for the kind, with
  *     infrastructure and availability failures excluded (Venice 402/429/5xx,
  *     spend caps, fetch failed, aborts, gateway 5xx, IPFS, epoch cap,
@@ -37,22 +57,45 @@
  * All three rates are Beta-shrunk toward a fixed prior so a kind with no
  * evidence still gets a finite, middling EV and a single row cannot swing it.
  *
- * Plus the acute guard (verifiableStarvationGuard): if the last 4 verifiable
- * attempts in the rolling 24h ALL failed locally for non-infrastructure
- * reasons, every standard outranks every verifiable on the next poll.
+ * Plus the acute guard (verifiableStarvationGuard). It fires when the last 4
+ * verifiable attempts in the rolling 24h ALL failed locally for
+ * non-infrastructure reasons, and it is BOUNDED (review fix, 2026-10-01). It
+ * holds only while the newest of those failures is under
+ * BOT_VERIFIABLE_STARVATION_HOLD_MIN (default 120) minutes old, and it counts
+ * only attempts made since this process started. The first version latched:
+ * while active it demoted every verifiable below every standard, so no new
+ * verifiable attempt could clear it, and it was rebuilt from the log on
+ * restart. A routine streak of 4 python failures could then keep verifiables
+ * below every open standard for up to ~24h. At the 14-day 61% local submit
+ * rate (73/119) such streaks come ~1.7× per 14 days if failures are
+ * independent. Now one probe gets through after the hold, and a failed probe
+ * re-arms it for another hold. While it holds, the EV ranker demotes
+ * verifiables below standards, and the legacy order only cancels
+ * preferVerifiable (what item 6 asked for).
  *
  * The comparator is a lexicographic order over scalar keys computed ONCE per
  * challenge (guard demotion, EV, competition bucket, submission count,
  * specialization), so it is a total preorder — transitive by construction.
  * A past mixed-axis version cycled (Array.sort over a cycle is unspecified).
  *
- * Kill switch: BOT_CHALLENGE_EV_RANK=0 restores the legacy kind-EV + verifiable
- * tilt ordering (compareChallengePriority / computeVerifiableTilt in mining.ts).
+ * Modes (BOT_CHALLENGE_EV_RANK): unset = shadow (legacy active, EV logged),
+ * 1 = EV active, 0 = legacy with no EV computation at all. The legacy order
+ * is compareChallengePriority / computeVerifiableTilt in mining.ts.
+ *
+ * Visibility caveat (review, 2026-10-01): this ranker only orders what
+ * discovery returns. fetchOpenChallengesPaged stops paging once pollNeed (3)
+ * eligible items are visible, and page 1 is newest-first python. A live
+ * check on 10-01 found 23 eligible on page 1 (20 python medium, 3 standard
+ * hard) and 68 standard expert (500k) one page deeper, never fetched. Over
+ * page 1 alone EV's top 5 were all python mediums (17.8k·R each). Over pages
+ * 1+2 they were all standard experts (57.8k·R). It is the PAGING DEPTH that
+ * hides the experts, not the 'open' status gate. The scope note in
+ * formatEvTop ("saw N eligible on P pages, max base X") shows this every poll.
  */
 import { join } from "node:path";
 import type { Challenge } from "./mining.js";
 import { NOOK_DIR, readJsonlTail } from "./util.js";
-import { readSettlements, rHatByEpoch } from "./settlements.js";
+import { readSettlements, rHatByEpoch, epochPayoutTotals, EPOCH_SOLVING_CAP, type RHatEpoch } from "./settlements.js";
 
 export const VERIFIABLE_KINDS = new Set(["python_tests", "javascript_tests", "exact_answer"]);
 
@@ -243,34 +286,67 @@ export function kindFactors(
 // ── acute starvation guard ─────────────────────────────────────────────────
 
 export const STARVATION_WINDOW_MS = 24 * 3_600_000;
+/** How long the guard holds after the NEWEST of the n failures. Two hours is
+ *  ~8 polls at the 15-min cadence: enough to cover the next poll even when a
+ *  long solve makes the re-entrancy guard skip one, while the old latch could
+ *  hold until the OLDEST failure aged out of 24h. */
+export const STARVATION_HOLD_MS_DEFAULT = 120 * 60_000;
+
+export interface StarvationGuardState {
+  active: boolean;
+  reason: string;
+}
 
 /**
  * Pure: true when the last `n` verifiable attempts inside the rolling 24h
- * (infra/availability failures excluded) ALL failed locally. While true,
- * verifiable must not outrank standard on the next poll — a sort, not a
- * filter, so a verifiable challenge is still taken when no standard is open.
+ * (infra/availability failures excluded) ALL failed locally AND the newest
+ * of them is under `holdMs` old. While true, verifiable must not outrank
+ * standard. It is a sort, not a filter, so a verifiable challenge is still
+ * taken when no standard is open.
+ *
+ * Bounded so it cannot latch (review fix, 2026-10-01). It clears by itself
+ * `holdMs` after the newest failure with no new verifiable attempt. After
+ * that, one verifiable probe competes normally: a success clears the
+ * condition, a failure re-arms it for another `holdMs`. `sinceMs` (the shell
+ * passes process start) ignores attempts made before it, so a restart after
+ * a fix starts clean rather than inheriting the log's streak.
  * n <= 0 disables the guard.
  */
 export function verifiableStarvationGuard(
   miningRows: MiningAttemptRow[],
   nowMs: number,
   n = 4,
-): { active: boolean; reason: string } {
+  opts: { holdMs?: number; sinceMs?: number } = {},
+): StarvationGuardState {
   if (!(n > 0)) return { active: false, reason: "disabled" };
+  const holdMs = opts.holdMs !== undefined && opts.holdMs > 0 ? opts.holdMs : STARVATION_HOLD_MS_DEFAULT;
+  const floorMs = Math.max(nowMs - STARVATION_WINDOW_MS, opts.sinceMs ?? -Infinity);
   const recent = miningRows
     .filter((r) => {
       if (!r.verifierKind || !VERIFIABLE_KINDS.has(r.verifierKind)) return false;
       const t = Date.parse(r.ts ?? "");
-      return Number.isFinite(t) && t <= nowMs && nowMs - t <= STARVATION_WINDOW_MS && classifyAttempt(r) !== "excluded";
+      return Number.isFinite(t) && t <= nowMs && t >= floorMs && classifyAttempt(r) !== "excluded";
     })
     .sort((a, b) => Date.parse(a.ts ?? "") - Date.parse(b.ts ?? ""));
   const last = recent.slice(-n);
-  if (last.length < n) return { active: false, reason: `${last.length}/${n} verifiable attempts in 24h` };
+  const scope = opts.sinceMs !== undefined && opts.sinceMs > nowMs - STARVATION_WINDOW_MS ? "since restart" : "in 24h";
+  if (last.length < n) return { active: false, reason: `${last.length}/${n} verifiable attempts ${scope}` };
   const failed = last.filter((r) => classifyAttempt(r) === "failed").length;
-  if (failed === n) {
-    return { active: true, reason: `last ${n} verifiable attempts all failed locally — standards first this poll` };
+  if (failed !== n) return { active: false, reason: `${failed}/${n} of the last verifiable attempts failed` };
+  const newestMs = Date.parse(last[last.length - 1].ts ?? "");
+  const ageMin = Math.round((nowMs - newestMs) / 60_000);
+  const holdMin = Math.round(holdMs / 60_000);
+  if (nowMs - newestMs > holdMs) {
+    return {
+      active: false,
+      reason: `last ${n} verifiable attempts failed, but the newest is ${ageMin}m old (> ${holdMin}m hold) — verifiables compete again; one more failure re-arms`,
+    };
   }
-  return { active: false, reason: `${failed}/${n} of the last verifiable attempts failed` };
+  const until = new Date(newestMs + holdMs).toISOString().slice(11, 16);
+  return {
+    active: true,
+    reason: `last ${n} verifiable attempts all failed locally (newest ${ageMin}m ago) — verifiables yield to standards until ${until}Z`,
+  };
 }
 
 // ── scoring + total order ──────────────────────────────────────────────────
@@ -343,9 +419,22 @@ export function rankChallengesByEv(
 
 const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 100_000 ? 0 : 1)}k` : n.toFixed(0));
 
+/** What the ranker could see this poll (paging stops once pollNeed eligible
+ *  items are visible, so high-base challenges one page deeper never reach
+ *  it; see the visibility caveat in the header). */
+export interface EvScope {
+  pages: number;
+}
+
 /** One line: the top N challenges with every EV component. EV is in NOOK per
- *  unit of R (multiply by the settlement epoch's R for realized NOOK). */
-export function formatEvTop(ranked: ScoredChallenge[], guard: { active: boolean; reason: string }, topN = 3): string {
+ *  unit of R (multiply by the settlement epoch's R for realized NOOK; in a
+ *  CAPPED epoch the realized marginal value is ~0 whatever this says). */
+export function formatEvTop(
+  ranked: ScoredChallenge[],
+  guard: StarvationGuardState,
+  topN = 3,
+  scope?: EvScope,
+): string {
   const parts = ranked.slice(0, topN).map((s, i) => {
     const diff = s.challenge.difficulty ?? "?";
     const src = s.baseRewardSource === "field" ? "" : `(${s.baseRewardSource})`;
@@ -355,35 +444,104 @@ export function formatEvTop(ranked: ScoredChallenge[], guard: { active: boolean;
       (s.demoted ? " [demoted]" : "")
     );
   });
-  return `   🏁 EV top${Math.min(topN, ranked.length)}: ${parts.join(" | ")} — starvation guard ${guard.active ? "ON" : "off"} (${guard.reason})`;
+  const seen = scope
+    ? ` — saw ${ranked.length} eligible on ${scope.pages} page${scope.pages === 1 ? "" : "s"}, max base ${k(ranked.reduce((m, s) => Math.max(m, s.baseReward), 0))}`
+    : "";
+  return `   🏁 EV top${Math.min(topN, ranked.length)}: ${parts.join(" | ")}${seen} — starvation guard ${guard.active ? "ON" : "off"} (${guard.reason})`;
 }
 
-/** One line: per-kind factors with their evidence counts, plus R-hat and the
- *  number of settlement epochs behind it. */
+/** Cap tally over the window's paid epochs. */
+export interface CapSummary {
+  capped: number;
+  epochs: number;
+  cap: number;
+}
+
+export function summarizeCaps(totals: Array<{ capped: boolean }>, cap = EPOCH_SOLVING_CAP): CapSummary {
+  return { capped: totals.filter((t) => t.capped).length, epochs: totals.length, cap };
+}
+
+const fmtR = (r: number) => r.toFixed(r < 10 ? 3 : 1);
+
+/** One line: per-kind factors with their evidence counts, R-hat for the newest
+ *  epoch, and how often the per-epoch solving cap bound. A capped epoch's
+ *  R-hat is printed as "≥" and labelled: it is cap / Σ ours, not a network
+ *  rate. */
 export function formatKindFactors(
   table: KindFactorTable,
   windowDays: number,
-  rHat?: Array<{ epoch: string; r: number; n: number }>,
+  rHat?: RHatEpoch[],
+  caps?: CapSummary,
 ): string {
   const kinds = Object.values(table).filter((f) => f.attempts > 0 || f.resolved > 0);
   const parts = kinds.map(
     (f) =>
       `${f.kind} sub ${f.submitRate.toFixed(2)} (${f.accepted}/${f.attempts}) surv ${f.survival.toFixed(2)} (${f.verified}/${f.resolved}) comp ${f.compHat.toFixed(2)} (n${f.compN})`,
   );
-  const r = rHat && rHat.length > 0
-    ? `R̂ ${rHat[0].r.toFixed(rHat[0].r < 10 ? 3 : 1)} @${rHat[0].epoch} (n${rHat[0].n}; ${rHat.length} epoch${rHat.length === 1 ? "" : "s"} with baseReward)`
-    : "R̂ n/a (no settled rows carry baseReward yet)";
-  return `   📐 EV factors (${windowDays}d): ${parts.length > 0 ? parts.join(" | ") : "no evidence — priors only"} | ${r}`;
+  let r = "R̂ n/a (no settled rows carry baseReward yet)";
+  if (rHat && rHat.length > 0) {
+    const top = rHat[0];
+    const epochs = `${rHat.length} epoch${rHat.length === 1 ? "" : "s"} with baseReward`;
+    if (top.capped) {
+      r = `R̂ ≥${fmtR(top.r)} @${top.epoch} (n${top.n}; CAPPED: R̂ = cap/Σ ours, not a network rate; ${epochs})`;
+      const uncapped = rHat.find((e) => e.capped === false);
+      if (uncapped) r += `; newest uncapped R̂ ${fmtR(uncapped.r)} @${uncapped.epoch}`;
+    } else {
+      r = `R̂ ${fmtR(top.r)} @${top.epoch} (n${top.n}; ${epochs})`;
+    }
+  }
+  const capPart = caps && caps.epochs > 0
+    ? ` | solving cap ${k(caps.cap)}/epoch hit ${caps.capped}/${caps.epochs} paid epochs` +
+      (caps.capped > 0 ? " (in a capped epoch one more solve adds ~0; EV ∝ base holds only uncapped)" : "")
+    : "";
+  return `   📐 EV factors (${windowDays}d): ${parts.length > 0 ? parts.join(" | ") : "no evidence — priors only"} | ${r}${capPart}`;
+}
+
+/** Shadow mode, one line: what the EV ranker would attempt first next to what
+ *  the active legacy order attempts. Compares the first `take` ids. */
+export function formatEvShadow(ranked: ScoredChallenge[], active: Challenge[], take: number): string {
+  const n = Math.max(1, take);
+  const evIds = ranked.slice(0, n).map((s) => s.challenge.id);
+  const activeIds = active.slice(0, n).map((c) => c.id);
+  const byId = new Map(ranked.map((s) => [s.challenge.id, s]));
+  const label = (id: string) => {
+    const s = byId.get(id);
+    return `${id.slice(0, 8)}(${s ? `${s.kind}/${s.challenge.difficulty ?? "?"}` : "?"})`;
+  };
+  const same = evIds.length === activeIds.length && evIds.every((id, i) => id === activeIds[i]);
+  const overlap = evIds.filter((id) => activeIds.includes(id)).length;
+  return (
+    `   🕶 EV shadow (inactive; BOT_CHALLENGE_EV_RANK=1 activates): would take ${evIds.map(label).join(" ")}` +
+    ` vs active ${activeIds.map(label).join(" ")}` +
+    ` — ${same ? "same" : `differs (${overlap}/${n} shared)`}`
+  );
 }
 
 // ── impure shell ───────────────────────────────────────────────────────────
 
 const MINING_LOG = join(NOOK_DIR, "mining-submissions.jsonl");
 
-/** Kill switch: BOT_CHALLENGE_EV_RANK=0 restores the legacy kind-EV +
- *  verifiable-tilt ordering. Anything else (including unset) = per-challenge EV. */
-export function challengeRankerMode(env: NodeJS.ProcessEnv = process.env): "ev" | "legacy" {
-  return env.BOT_CHALLENGE_EV_RANK === "0" ? "legacy" : "ev";
+/** Process start, approximately (module load). The starvation guard ignores
+ *  attempts made before it, so a restart after a fix starts clean. */
+const PROCESS_START_MS = Date.now();
+
+export type ChallengeRankerMode = "ev" | "shadow" | "legacy";
+
+/**
+ * BOT_CHALLENGE_EV_RANK:
+ *   "1"           → ev: per-challenge EV is the ACTIVE order;
+ *   "0"           → legacy: kind-EV + verifiable tilt, EV not computed;
+ *   unset / other → shadow (DEFAULT): legacy is active, EV is computed and
+ *                   logged next to it.
+ * The default is shadow, not ev, because the EV premise (R cancels) fails in
+ * capped epochs, which is most days since 09-17 (header +
+ * settlements.ts EPOCH_SOLVING_CAP). Flipping to ev is the operator's call.
+ */
+export function challengeRankerMode(env: NodeJS.ProcessEnv = process.env): ChallengeRankerMode {
+  const v = env.BOT_CHALLENGE_EV_RANK;
+  if (v === "1") return "ev";
+  if (v === "0") return "legacy";
+  return "shadow";
 }
 
 export function evWindowDays(): number {
@@ -398,11 +556,32 @@ export function starvationGuardN(): number {
   return Number.isFinite(n) && n >= 0 ? n : 4;
 }
 
+/** BOT_VERIFIABLE_STARVATION_HOLD_MIN: minutes the guard holds after the
+ *  newest failure. Default 120; non-positive or garbage → default. */
+export function starvationGuardHoldMs(): number {
+  const n = Number(process.env.BOT_VERIFIABLE_STARVATION_HOLD_MIN);
+  return Number.isFinite(n) && n > 0 ? n * 60_000 : STARVATION_HOLD_MS_DEFAULT;
+}
+
+function guardFromRows(miningRows: MiningAttemptRow[], nowMs: number): StarvationGuardState {
+  return verifiableStarvationGuard(miningRows, nowMs, starvationGuardN(), {
+    holdMs: starvationGuardHoldMs(),
+    sinceMs: PROCESS_START_MS,
+  });
+}
+
+/** The guard alone, for the legacy order (which cancels preferVerifiable
+ *  while it is active). Missing log reads as empty → off. */
+export function loadStarvationGuard(nowMs: number): StarvationGuardState {
+  return guardFromRows(readJsonlTail<MiningAttemptRow>(MINING_LOG, 4000), nowMs);
+}
+
 /** Read local state for one poll. Missing files read as empty (priors). */
 export function loadChallengeEvInputs(nowMs: number): {
   table: KindFactorTable;
-  guard: { active: boolean; reason: string };
-  rHat: Array<{ epoch: string; r: number; n: number }>;
+  guard: StarvationGuardState;
+  rHat: RHatEpoch[];
+  caps: CapSummary;
   windowDays: number;
 } {
   const windowDays = evWindowDays();
@@ -410,8 +589,9 @@ export function loadChallengeEvInputs(nowMs: number): {
   const settlements = readSettlements();
   return {
     table: kindFactors(settlements, miningRows, nowMs, windowDays),
-    guard: verifiableStarvationGuard(miningRows, nowMs, starvationGuardN()),
+    guard: guardFromRows(miningRows, nowMs),
     rHat: rHatByEpoch(settlements, nowMs, windowDays),
+    caps: summarizeCaps(epochPayoutTotals(settlements, nowMs, windowDays)),
     windowDays,
   };
 }

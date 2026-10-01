@@ -148,16 +148,113 @@ function median(xs: number[]): number {
 }
 
 /**
- * Pro-rata rate R per settlement epoch from PAID rows that carry baseReward
- * (R = realized / (compositeScore × baseReward)). Diagnostics only — R is
- * exogenous and cancels out of the per-challenge ranking. Newest first.
+ * Our epoch_solving payout is CAPPED per settlement epoch at exactly this
+ * many NOOK. Found in review 2026-10-01, after the per-challenge EV ranker
+ * had been written on the premise that R is exogenous:
+ *   - mining-claims.jsonl: epoch_solving = 1,575,000 on 8 of the 13 non-zero
+ *     claims since 09-17 (09-17, 19, 21, 22, 26, 28, 29, 30, the last 4
+ *     included);
+ *   - mining-settlements.jsonl: Σ realizedNook per settlement epoch
+ *     (verifiedAt, 02:00Z) is 1,575,000 to within 1e-4 NOOK for 09-04, 09-15,
+ *     09-18, 09-20, 09-21, 09-25, 09-27, 09-28 and 09-29. Every uncapped
+ *     epoch sits 500k+ below it. Inside a capped epoch the solves are scaled
+ *     pro rata to fit: 09-20 paid 11 × 143,182; 09-29 paid 7 × 225,000; 09-28
+ *     paid ONE python medium the whole 1,575,000.
+ * No epoch before 09-04 reached it, so we can't tell when it started. The
+ * mechanism is UNVERIFIED: no SDK or doc text describes a cap.
+ * 1,575,000 = 900,000 × 1.75 (our tier-3 multiplier), so a per-agent cap
+ * scaled by stake tier would fit, but that is inference. If the gateway
+ * changes the number, `capped` stops firing; the per-epoch totals in the
+ * log line make that visible.
  */
-export function rHatByEpoch(
-  rows: Array<{ ts?: string; verifiedAt?: string; status?: string; realizedNook?: number; compositeScore?: number; baseReward?: number }>,
+export const EPOCH_SOLVING_CAP = 1_575_000;
+/** |Σ paid − cap| below this counts as capped. Measured distance is <1e-4
+ *  NOOK in capped epochs and >500k in uncapped ones. */
+const CAP_TOLERANCE_NOOK = 1;
+
+export interface EpochPayoutTotal {
+  epoch: string;
+  key: number;
+  /** Σ realizedNook over our PAID verified rows that settled in this epoch. */
+  total: number;
+  n: number;
+  /** total equals EPOCH_SOLVING_CAP: one more solve here would have added ~0. */
+  capped: boolean;
+}
+
+/**
+ * Pure: our paid solving total per settlement epoch (verifiedAt, 02:00Z
+ * boundary), latest row per submission, newest first. It counts every paid
+ * row, including rows WITHOUT baseReward, because the cap applies to the
+ * whole epoch total.
+ */
+export function epochPayoutTotals(
+  rows: Array<{ submissionId?: string; ts?: string; verifiedAt?: string; status?: string; realizedNook?: number }>,
   nowMs: number,
   windowDays = 14,
-): Array<{ epoch: string; r: number; n: number }> {
+  cap = EPOCH_SOLVING_CAP,
+): EpochPayoutTotal[] {
   const cutoff = nowMs - windowDays * 86_400_000;
+  const latest = new Map<string, (typeof rows)[number]>();
+  const anonymous: typeof rows = [];
+  for (const r of rows) {
+    if (r.submissionId) latest.set(r.submissionId, r);
+    else anonymous.push(r);
+  }
+  const byEpoch = new Map<number, { total: number; n: number }>();
+  for (const r of [...latest.values(), ...anonymous]) {
+    if (r.status !== "verified" || r.realizedNook === undefined || !Number.isFinite(r.realizedNook)) continue;
+    const t = Date.parse(r.verifiedAt ?? r.ts ?? "");
+    if (!Number.isFinite(t) || t < cutoff || t > nowMs) continue;
+    const key = settlementEpochKey(t);
+    const b = byEpoch.get(key) ?? { total: 0, n: 0 };
+    b.total += r.realizedNook;
+    b.n++;
+    byEpoch.set(key, b);
+  }
+  return [...byEpoch.entries()]
+    .sort((a, b) => b[0] - a[0])
+    .map(([key, b]) => ({
+      epoch: settlementEpochLabel(key),
+      key,
+      total: b.total,
+      n: b.n,
+      capped: cap > 0 && Math.abs(b.total - cap) < CAP_TOLERANCE_NOOK,
+    }));
+}
+
+export interface RHatEpoch {
+  epoch: string;
+  /** Median realized / (comp × baseReward) over rows that carry baseReward. */
+  r: number;
+  n: number;
+  /** The epoch hit EPOCH_SOLVING_CAP. Then `r` = cap / Σ(comp × base × …) of
+   *  OUR solves: a LOWER BOUND on the uncapped rate, and it falls when we
+   *  solve more. It is not a network rate. */
+  capped?: boolean;
+  /** Σ paid in the epoch (all our paid rows, with or without baseReward). */
+  paidTotal?: number;
+}
+
+/**
+ * Pro-rata rate R per settlement epoch from PAID rows that carry baseReward
+ * (R = realized / (compositeScore × baseReward)). Diagnostics only. Newest
+ * first.
+ *
+ * R is shared by every kind and difficulty in an epoch, and that holds in
+ * capped epochs too, because the cap scales everyone pro rata. What fails in
+ * a capped epoch is the premise that R is EXOGENOUS (see
+ * EPOCH_SOLVING_CAP): there it is the cap divided by our own volume. Such
+ * epochs are tagged `capped` so nobody reads them as the network's rate.
+ */
+export function rHatByEpoch(
+  rows: Array<{ submissionId?: string; ts?: string; verifiedAt?: string; status?: string; realizedNook?: number; compositeScore?: number; baseReward?: number }>,
+  nowMs: number,
+  windowDays = 14,
+  cap = EPOCH_SOLVING_CAP,
+): RHatEpoch[] {
+  const cutoff = nowMs - windowDays * 86_400_000;
+  const totals = new Map(epochPayoutTotals(rows, nowMs, windowDays, cap).map((t) => [t.key, t]));
   const byEpoch = new Map<number, number[]>();
   for (const r of rows) {
     if (r.status !== "verified" || r.realizedNook === undefined || !r.compositeScore) continue;
@@ -171,7 +268,15 @@ export function rHatByEpoch(
   }
   return [...byEpoch.entries()]
     .sort((a, b) => b[0] - a[0])
-    .map(([key, rs]) => ({ epoch: settlementEpochLabel(key), r: median(rs), n: rs.length }));
+    .map(([key, rs]) => {
+      const tot = totals.get(key);
+      return {
+        epoch: settlementEpochLabel(key),
+        r: median(rs),
+        n: rs.length,
+        ...(tot ? { capped: tot.capped, paidTotal: tot.total } : {}),
+      };
+    });
 }
 
 export interface KHatEntry {
@@ -181,7 +286,8 @@ export interface KHatEntry {
   n: number;
   /** Distinct settlement epochs (independent draws of R), NOT distinct K. */
   batches: number;
-  /** Median R = K / baseReward over rows that carry baseReward (diagnostic). */
+  /** Median R = K / baseReward over rows that carry baseReward (diagnostic).
+   *  Mixes capped epochs, where R is cap / Σ ours (see EPOCH_SOLVING_CAP). */
   rHat?: number;
   rN?: number;
 }
@@ -208,11 +314,19 @@ export interface KHatEntry {
  * kind gap).
  *
  * LEGACY CAVEAT: kHat still mixes difficulties (a standard expert's K is
- * 3.3x a standard hard's in the same epoch), so this kind-level EV is only
- * the input for the legacy ordering (BOT_CHALLENGE_EV_RANK=0). The default
- * ranker (src/challenge-ev.ts) ranks each challenge by its own baseReward,
- * where R cancels. `rHat` (median R over rows that carry baseReward) is
- * reported for diagnostics.
+ * 3.3x a standard hard's in the same epoch). This kind-level EV feeds the
+ * legacy ordering, which is still the ACTIVE one by default (see
+ * challengeRankerMode). The per-challenge ranker (src/challenge-ev.ts) ranks
+ * each challenge by its own baseReward. R cancels there only in uncapped
+ * epochs (see EPOCH_SOLVING_CAP). `rHat` (median R over rows that carry
+ * baseReward) is reported for diagnostics.
+ *
+ * CAP CAVEAT (2026-10-01): in an epoch that hit EPOCH_SOLVING_CAP, K is
+ * cap-scaled, i.e. K = base × cap / Σ(comp × base) of our own solves that
+ * epoch. Both kinds scale by the same factor inside one epoch, so the
+ * within-epoch ratio survives. Across epochs, though, a kind we solved a lot
+ * of in capped epochs shows a lower K. 09-20 paid 11 python mediums at
+ * 143,182 each, while 09-28 paid one at 1,575,000.
  */
 export function kHatByKind(
   rows: Array<{ ts?: string; verifiedAt?: string; verifierKind?: string; status?: string; realizedNook?: number; compositeScore?: number; baseReward?: number }>,
