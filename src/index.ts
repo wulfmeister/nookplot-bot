@@ -745,7 +745,8 @@ async function fetchSubmissionTrace(
   let cidStatus: CidStatus = traceCid ? "transient" : "none";
   if (traceCid) {
     if (!isWellFormedCid(traceCid)) {
-      // Truncated/placeholder CID — don't even spend the round-trip. Warn once
+      // Truncated/placeholder, hex-digest or fake-multihash-header CID (see
+      // isWellFormedCid) — don't even spend the round-trip. Warn once
       // per CID: the spam pool re-surfaces the same fakes every poll and each
       // one was a fresh log line (475 in 5 days).
       cidStatus = "permanent";
