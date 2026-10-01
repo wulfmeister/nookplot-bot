@@ -93,6 +93,22 @@ export function maybeWarnDiversitySaturation(): void {
  */
 export const reciprocalVerifierSkipUntil = new SkipCache();
 
+/**
+ * Verify path — submission id that failed for a TEMPORARY reason (Venice
+ * 402/429, gateway 5xx/429, transport). Short TTL so the poll doesn't hot-retry
+ * it, without the never-evicted `verifiedSubmissions` mark that used to drop
+ * the candidate until restart. Classification: src/verify-errors.ts.
+ */
+export const verifyTransientSkip = new SkipCache();
+
+/**
+ * Verify path — whole-loop pause after a key-level Venice 402 (spend limit /
+ * balance). Single key: every candidate would 402 the same way, so retrying
+ * the next one only burns IPFS fetches and comprehension requests.
+ */
+export const verifyBudgetPause = new SkipCache();
+export const VERIFY_BUDGET_PAUSE_KEY = "venice-budget";
+
 /** Mining path — challenge id we've already submitted, gateway 409 told us. */
 export const alreadySubmittedChallenges = new SkipCache();
 
