@@ -46,12 +46,13 @@ import {
 import {
   buildVerifiableReasoning,
   buildSubmitSolutionBody,
-  planReasoningRetry,
-  withReasoning,
+  decideReasoningRetry,
+  rewritePlan,
   summaryRejectionKind,
   clipAtBoundary,
   REASONING_MIN_CHARS,
   REASONING_MAX_CHARS,
+  type ReasoningRetryPlan,
   type SubmitSolutionBody,
 } from "./verifiable-reasoning.js";
 
@@ -1009,16 +1010,20 @@ export function discountStaleIdRejections<
 }
 
 /**
- * Last-resort rewrite of a verifiable solve's `reasoning` (the field the
- * gateway scores on /submit-solution) after the gateway 400'd it AND nothing
- * extractable was left to append. One cheap call, given the code and the
- * categories the gateway itself reported at +0 — cheaper than the paid solve
- * it saves. Returns null on any failure; the caller then cools the challenge.
+ * Rewrite of a verifiable solve's `reasoning` (the field the gateway scores
+ * on /submit-solution) after the gateway 400'd it — the FIRST retry step, told
+ * the categories the gateway itself reported at +0. One call (at the model's
+ * default effort, so not cheap, but far cheaper than the paid solve it saves;
+ * ~36 code-kind text 400s in the 30 days from 09-01). Returns null on any
+ * failure; the caller then falls back to the gated extractive revision, else
+ * cools the challenge.
  *
  * HISTORY: until 2026-10-01 this was regenerateVerifiableSummary, run BEFORE
  * submit whenever the local mirror failed the traceSummary — a field the
  * gateway ignores on this route — and its failure skipped the submit (11
- * paid solves skipped since 09-01). It now runs only on a real 400.
+ * paid solves skipped since 09-01). It then ran only on a real 400 and only
+ * when nothing was extractable; the same day's review moved it first
+ * (verifiable-reasoning.ts decideReasoningRetry).
  */
 export async function regenerateVerifiableReasoning(
   current: string,
@@ -2185,23 +2190,30 @@ async function discoverAndSolveMiningChallengesInner(
           // the reasoning. Revise THAT text (read back from the body that was
           // sent) and retry ONCE. A 400 does not burn an epoch slot, so this
           // only risks a request; giving up throws away the paid solve.
-          if (!rejection) throw subErr;
-          let plan = planReasoningRetry(solutionBody, smsg, [codeText, ch.description], ch);
-          let how = "enriched";
-          if (!plan) {
-            // Nothing extractable left for the missing categories — one cheap
-            // rewrite told what the gateway scored zero, before giving up.
-            const missing = rejection === "specificity" ? parseMissingCategories(smsg) : [];
-            const answerText = typeof s.artifact?.text === "string" ? s.artifact.text : undefined;
-            const rewritten = await regenerateVerifiableReasoning(solutionBody.reasoning, codeText ?? answerText, ch, modelUsed, missing);
-            if (rewritten && rewritten !== solutionBody.reasoning) {
-              plan = { body: withReasoning(solutionBody, rewritten), kind: rejection, missing, before: solutionBody.reasoning, after: rewritten };
+          // The model rewrite goes FIRST (it is told what the gateway scored
+          // zero); a gated extractive revision is the fallback only when the
+          // rewrite returns nothing — see decideReasoningRetry for why.
+          const decision = rejection ? decideReasoningRetry(solutionBody, smsg, codeText, ch) : null;
+          if (!decision) throw subErr;
+          let plan: ReasoningRetryPlan | null = null;
+          let how = "";
+          for (const step of decision.order) {
+            if (step === "rewrite") {
+              const answerText = typeof s.artifact?.text === "string" ? s.artifact.text : undefined;
+              const rewritten = await regenerateVerifiableReasoning(solutionBody.reasoning, codeText ?? answerText, ch, modelUsed, decision.missing);
+              plan = rewritePlan(solutionBody, decision, rewritten);
               how = "rewritten";
+            } else {
+              plan = decision.extract;
+              how = "enriched";
             }
+            if (plan) break;
           }
           if (!plan) {
             specificityRejectedChallenges.markFor(ch.id, ALREADY_SUBMITTED_TTL_MS);
-            console.warn(`   🔬 ${rejection} 400 on reasoning and nothing to add — cooling ${idShort} for 24h`);
+            console.warn(
+              `   🔬 ${decision.kind} 400 on reasoning: rewrite returned nothing, extraction refused (${decision.extractRefusal ?? "-"}) — cooling ${idShort} for 24h`,
+            );
             throw subErr;
           }
           console.warn(

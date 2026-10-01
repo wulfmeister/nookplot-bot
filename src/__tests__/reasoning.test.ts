@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import {
   buildVerifiableReasoning,
   buildSubmitSolutionBody,
+  decideReasoningRetry,
   planReasoningRetry,
   withReasoning,
   summaryRejectionKind,
@@ -149,7 +150,7 @@ describe("verifiable-reasoning.planReasoningRetry (regression: revise the field 
     assert.equal(summaryRejectionKind(SPEC_400), "specificity");
     assert.equal(summaryRejectionKind(MIN100_400), "length");
     assert.equal(summaryRejectionKind(CAP_429), null);
-    assert.equal(planReasoningRetry(body(ACCEPTED_REASONINGS[0]), CAP_429, [CODE], CH), null);
+    assert.equal(planReasoningRetry(body(ACCEPTED_REASONINGS[0]), CAP_429, CODE, CH), null);
   });
 
   it("on a specificity 400 it reads body.reasoning — NOT a divergent traceSummary — and writes both fields", () => {
@@ -161,7 +162,14 @@ describe("verifiable-reasoning.planReasoningRetry (regression: revise the field 
     const ignoredSummary =
       'The counter calls `subprocess.run` with an argv list and shell disabled, using "os.path.normpath" to confine the user path before spawn. It fails closed with an error on \'..\' segments.';
     const sent: SubmitSolutionBody = { ...body(sentReasoning), traceSummary: ignoredSummary };
-    const plan = planReasoningRetry(sent, SPEC_400, [CODE, CH.description], CH);
+    // The extractive fallback is gated on ≥2 new categories (2026-10-01
+    // review), so this case needs a solution whose own comments carry them.
+    const commentedCode = [
+      "# A '..' segment fails closed and returns -1 instead of reaching the shell",
+      "# One subprocess call per path, under 5 ms for a 10000 line file",
+      CODE,
+    ].join("\n");
+    const plan = planReasoningRetry(sent, SPEC_400, commentedCode, CH);
     assert.ok(plan, "something extractable for the missing categories");
     assert.equal(plan.before, sent.reasoning, "the revision starts from the text sent as reasoning");
     assert.ok(plan.after.startsWith(sentReasoning), "the sent reasoning is extended, not replaced");
@@ -173,22 +181,28 @@ describe("verifiable-reasoning.planReasoningRetry (regression: revise the field 
     assert.ok(plan.missing.includes("techniques") && plan.missing.includes("numbers"));
   });
 
-  it("trusts the gateway's +0 over the local mirror (snake_case reads as a technique locally)", () => {
+  it("where the mirror and the gateway disagree (snake_case read as a technique locally), the REWRITE is chosen — no fragment is appended", () => {
+    // CHANGED 2026-10-01 (review): this used to assert that a `technique "…"`
+    // fragment was appended here (trusting the gateway's +0 over the mirror).
+    // On snake_case Python that fragment was a bare literal the mirror itself
+    // scores zero, and its mere existence skipped the rewrite.
     const sentReasoning = "Implements `line_total` by normalizing the user path with os normpath and running the wc binary via subprocess argv.";
     assert.equal(specificityCategories(sentReasoning).techniques, true, "the mirror credits snake_case");
-    // Without trust the enricher would skip techniques entirely:
     assert.equal(
       enrichSummarySpecificity(sentReasoning, [CODE], ["techniques"]),
       sentReasoning,
       "default behavior (standard path) unchanged",
     );
-    const plan = planReasoningRetry(body(sentReasoning), SPEC_400, [CODE], CH);
-    assert.ok(plan && /technique "/.test(plan.after), `a technique fragment is added: ${plan?.after}`);
+    const decision = decideReasoningRetry(body(sentReasoning), SPEC_400, CODE, CH);
+    assert.ok(decision);
+    assert.deepEqual(decision.order, ["rewrite"], "the model rewrite, told what scored zero, is the only step");
+    assert.equal(decision.extract, null);
+    assert.equal(planReasoningRetry(body(sentReasoning), SPEC_400, CODE, CH), null, "no technique fragment is appended");
   });
 
   it("on a 'minimum 100 characters' 400 it lifts the sent reasoning over 100 chars", () => {
     const sent = body("Counts lines with wc via an argv list.");
-    const plan = planReasoningRetry(sent, MIN100_400, [CODE, CH.description], CH);
+    const plan = planReasoningRetry(sent, MIN100_400, CODE, CH);
     assert.ok(plan);
     assert.equal(plan.kind, "length");
     assert.ok(plan.after.startsWith("Counts lines with wc via an argv list."));
@@ -202,7 +216,7 @@ describe("verifiable-reasoning.planReasoningRetry (regression: revise the field 
       /Missing categories:[^.]*\./,
       "Missing categories: comparisons (no 'X vs Y' phrasing).",
     );
-    assert.equal(planReasoningRetry(sent, onlyComparisons, ["no comparative phrasing anywhere in here"], {}), null);
+    assert.equal(planReasoningRetry(sent, onlyComparisons, "no comparative phrasing anywhere in here", {}), null);
   });
 });
 
@@ -238,7 +252,7 @@ describe("mining.ts wiring pin (the pipeline posts and revises the same body)", 
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("../mining.ts", import.meta.url), "utf8");
     assert.match(src, /\/submit-solution`,\s*\n\s*solutionBody,\s*\n/);
-    assert.match(src, /planReasoningRetry\(solutionBody, /);
+    assert.match(src, /decideReasoningRetry\(solutionBody, /);
     assert.match(src, /buildSubmitSolutionBody\(\{[\s\S]{0,200}reasoning: sv\.reasoning/);
     // The old split (traceSummary from a separate variable) must not come back on this route.
     const route = src.slice(src.indexOf("/submit-solution`"), src.indexOf("/submit-solution`") + 200);
