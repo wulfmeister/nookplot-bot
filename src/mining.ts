@@ -41,9 +41,19 @@ import {
   enrichSummarySpecificity,
   passesSpecificityGate,
   countSpecificity,
-  isSummaryLengthError,
   specificityCategories,
 } from "./specificity-gate.js";
+import {
+  buildVerifiableReasoning,
+  buildSubmitSolutionBody,
+  planReasoningRetry,
+  withReasoning,
+  summaryRejectionKind,
+  clipAtBoundary,
+  REASONING_MIN_CHARS,
+  REASONING_MAX_CHARS,
+  type SubmitSolutionBody,
+} from "./verifiable-reasoning.js";
 
 type RuntimeLike = Pick<NookplotRuntime, "connection" | "tools">;
 
@@ -153,8 +163,15 @@ const VERIFIABLE_FIX_RETRIES = Number(process.env.BOT_VERIFIABLE_FIX_RETRIES ?? 
 // repair them ("enriched 4→4"). The five bullets now name each scoring
 // category with wording the local mirror and the gateway's own "Missing
 // categories" text both credit. A test pins the rule's examples to the gate.
+// 2026-10-01 (later): the rule above was applied to the WRONG FIELD. On
+// /submit-solution the gateway stores and scores `reasoning`, not the
+// "summary" this rule shaped (see verifiable-reasoning.ts) — both 10-01
+// rejections passed the local mirror 5/6 and 6/6 on the summary and still
+// scored 33/100 (code +3 only) on the reasoning beside it, which the prompt
+// asked for as a bare "50-200 char explanation". The rule now shapes
+// "reasoning" (100-400 chars) and the solver no longer asks for a summary.
 export const SUMMARY_SPECIFICITY_RULE = `
-- The "summary" is scored for specificity by an automated grader and REJECTED below threshold. Write 2-3 sentences, under 450 characters, containing ALL FIVE of these, each in a clause that says what it does:
+- The "reasoning" is the text the grader stores, scores for specificity and shows to verifiers; it is REJECTED below threshold. Write 2-3 sentences, 100-400 characters, containing ALL FIVE of these, each in a clause that says what it does:
   • an identifier in backticks — \`bisect_right\`, \`urlsplit\`, \`subprocess.run\`;
   • a method or technique named in DOUBLE QUOTES, dotted or camelCase — "os.path.commonpath", "json.loads", "readIndex" (a bare word like "http" does NOT count);
   • a failure mode or edge case, using the word fails, error, or edge case — "fails closed with an error on '..' segments", "the empty-list edge case returns -1";
@@ -481,7 +498,7 @@ async function solvePythonTests(
 
 Constraints:
 - Output JSON ONLY, no prose, no code fences outside the JSON value.
-- Schema (emit "solution" FIRST): {"solution":"complete Python source code as a single string","reasoning":"50-200 char explanation","summary":"100+ char description of approach + key steps"}
+- Schema (emit "solution" FIRST): {"solution":"complete Python source code as a single string","reasoning":"100-400 chars: the algorithm + key steps, written to the rules below"}
 ${SUMMARY_SPECIFICITY_RULE}
 - Your solution.py must export the function(s) named in the challenge description.
 - Handle edge cases (empty inputs, negatives, zero, large numbers, off-by-one boundaries).
@@ -505,15 +522,20 @@ ${SUMMARY_SPECIFICITY_RULE}
     logParseFail("python_tests", model, res.content, "solution");
     return null;
   }
-  const reasoning = parsed.reasoning ?? `Python solution for ${ch.title ?? ch.id.slice(0, 8)}.`;
+  // HISTORY (kept): this was `parsed.reasoning ?? \`Python solution for
+  // ${title}.\`` with traceSummary = padTraceSummary(parsed.summary || reasoning).
+  // The c3c6001 note here blamed the 09-21 "minimum 100 characters" 400s on
+  // deepseek's empty "summary" and moved `||` onto traceSummary. CORRECTED
+  // 2026-10-01: the gateway length-checks `reasoning` on this route, so the
+  // culprit was the `??` keeping "" (or a 50-99 char in-spec reasoning) and
+  // the ~65-char stub — padTraceSummary always emitted ≥100. The reasoning is
+  // now the one scored text, and traceSummary is sent identical to it.
+  const reasoning = buildVerifiableReasoning(parsed, ch);
   return {
     artifact: { files: { "solution.py": parsed.value } },
     artifactType: "code",
     reasoning,
-    // `||` not `??`: deepseek-v4-1-flash returns "summary": "" on some solves
-    // (3 gateway 400s "minimum 100 characters" on 2026-09-21) and an empty
-    // string is not nullish, so the reasoning fallback never engaged.
-    traceSummary: padTraceSummary(parsed.summary || reasoning, ch, parsed.value),
+    traceSummary: reasoning,
   };
 }
 
@@ -534,7 +556,7 @@ async function solveJsTests(
   const sys = `You are an expert JavaScript engineer. Solve the challenge by producing a single solution.js file (ESM).${domainHint}
 
 Constraints:
-- Output JSON ONLY (emit "solution" FIRST): {"solution":"complete JS source as a string","reasoning":"50-200 chars","summary":"100+ chars approach + edges handled"}
+- Output JSON ONLY (emit "solution" FIRST): {"solution":"complete JS source as a string","reasoning":"100-400 chars: approach + edges handled, written to the rules below"}
 ${SUMMARY_SPECIFICITY_RULE}
 - Use ESM exports (export function foo() {}). The runner uses "type": "module".
 - No top-level await. No console.log. No imports of node:fs etc unless explicitly required.
@@ -557,12 +579,12 @@ ${SUMMARY_SPECIFICITY_RULE}
     logParseFail("javascript_tests", model, res.content, "solution");
     return null;
   }
-  const reasoning = parsed.reasoning ?? `JS solution for ${ch.title ?? ch.id.slice(0, 8)}.`;
+  const reasoning = buildVerifiableReasoning(parsed, ch); // see solvePythonTests
   return {
     artifact: { files: { "solution.js": parsed.value } },
     artifactType: "code",
     reasoning,
-    traceSummary: padTraceSummary(parsed.summary || reasoning, ch, parsed.value),
+    traceSummary: reasoning,
   };
 }
 
@@ -579,7 +601,8 @@ async function solveExactAnswer(
   const sys = `You will produce the exact answer to a verifiable question. The grader compares your answer string verbatim (trimmed) to the expected answer.${domainHint}
 
 Constraints:
-- Output JSON ONLY (emit "answer" FIRST): {"answer":"the answer string ONLY — no units, no extra words, no quotes","reasoning":"50-200 chars","summary":"100+ chars: how you derived it + checks"}
+- Output JSON ONLY (emit "answer" FIRST): {"answer":"the answer string ONLY — no units, no extra words, no quotes","reasoning":"100-400 chars: how you derived it + the check you ran, written to the rules below"}
+${SUMMARY_SPECIFICITY_RULE}
 - If the challenge expects a LaTeX-formatted math answer (MATH dataset), preserve LaTeX exactly (e.g. "\\\\frac{1}{2}", not "0.5").
 - If numeric: no units, no commas, no thousands separators unless the problem requires them.
 - If string: trim and case-sensitive — match the expected form.${formatHint}`;
@@ -598,12 +621,12 @@ Constraints:
     logParseFail("exact_answer", model, res.content, "answer");
     return null;
   }
-  const reasoning = parsed.reasoning ?? `Exact answer for ${ch.title ?? ch.id.slice(0, 8)}.`;
+  const reasoning = buildVerifiableReasoning(parsed, ch); // see solvePythonTests
   return {
     artifact: { text: String(parsed.value).trim() },
     artifactType: "static_text",
     reasoning,
-    traceSummary: padTraceSummary(parsed.summary || reasoning, ch, parsed.value),
+    traceSummary: reasoning,
   };
 }
 
@@ -845,6 +868,12 @@ export function padTraceSummary(s: string, ch: Challenge, context?: string): str
   // never the problem (that tail is ~150 chars). Ground a near-empty summary
   // in the challenge itself — title, then a slice of the description — never
   // more filler.
+  // CORRECTED 2026-10-01: those 09-21 400s were python_tests, where the
+  // gateway length-checks `reasoning`, not traceSummary — so this diagnosis
+  // (and the grounding below) never touched the rejected field. padTraceSummary
+  // is now used only on the standard path, where traceSummary IS scored; the
+  // grounding stays as a harmless guard there. The code path composes its
+  // text in verifiable-reasoning.ts:buildVerifiableReasoning.
   if (original.length < 40) {
     const grounding = [ch.title ?? "", (ch.description ?? "").slice(0, 200)]
       .map((t) => t.replace(/\s+/g, " ").trim())
@@ -980,40 +1009,49 @@ export function discountStaleIdRejections<
 }
 
 /**
- * Last-resort summary rewrite for a verifiable solve whose summary can't clear
- * the specificity gate by extraction alone. One cheap call, given the code and
- * the exact categories the gateway scores — cheaper than the paid solve it
- * saves. Returns null on any failure; the caller then skips the submit rather
- * than sending something we predict will 400.
+ * Last-resort rewrite of a verifiable solve's `reasoning` (the field the
+ * gateway scores on /submit-solution) after the gateway 400'd it AND nothing
+ * extractable was left to append. One cheap call, given the code and the
+ * categories the gateway itself reported at +0 — cheaper than the paid solve
+ * it saves. Returns null on any failure; the caller then cools the challenge.
+ *
+ * HISTORY: until 2026-10-01 this was regenerateVerifiableSummary, run BEFORE
+ * submit whenever the local mirror failed the traceSummary — a field the
+ * gateway ignores on this route — and its failure skipped the submit (11
+ * paid solves skipped since 09-01). It now runs only on a real 400.
  */
-export async function regenerateVerifiableSummary(
+export async function regenerateVerifiableReasoning(
   current: string,
   code: string | undefined,
   ch: Challenge,
   model: string,
+  missing: string[] = [],
 ): Promise<string | null> {
   try {
+    const missingLine = missing.length > 0
+      ? `\nThe grader scored these categories ZERO on the current text — add at least two of them: ${missing.join(", ")}.`
+      : "";
     const res = await chat(
       [
         {
           role: "system",
           content:
-            `Rewrite a solution summary so it passes an automated specificity grader. Output the rewritten summary as PLAIN TEXT only — no JSON, no quotes around the whole thing, no preamble.\n${SUMMARY_SPECIFICITY_RULE}\n- 150-450 characters. Describe only what the code actually does; invent no measurements.`,
+            `Rewrite the "reasoning" of a code solution so it passes an automated specificity grader. Output the rewritten reasoning as PLAIN TEXT only — no JSON, no quotes around the whole thing, no preamble.\n${SUMMARY_SPECIFICITY_RULE}\n- Describe only what the code actually does; invent no measurements.${missingLine}`,
         },
         {
           role: "user",
           content:
-            `Challenge: ${ch.title ?? "(untitled)"}\n\nCurrent summary (too vague):\n${current}\n\n` +
+            `Challenge: ${ch.title ?? "(untitled)"}\n\nCurrent reasoning (rejected as too vague):\n${current}\n\n` +
             (code ? `Solution code:\n\`\`\`\n${code.slice(0, 4000)}\n\`\`\`\n\n` : "") +
             `Rewrite it now.`,
         },
       ],
       { model, max_tokens: 4000, temperature: 0.3, timeoutMs: 90_000 },
     );
-    const out = (res.content ?? "").trim().replace(/^["'`]+|["'`]+$/g, "").trim();
-    return out.length >= 100 ? out : null;
+    const out = (res.content ?? "").replace(/\s+/g, " ").trim().replace(/^["'`]+|["'`]+$/g, "").trim();
+    return out.length >= REASONING_MIN_CHARS ? clipAtBoundary(out, REASONING_MAX_CHARS) : null;
   } catch (err) {
-    console.warn(`   ⚠ summary regeneration failed: ${(err as Error).message.slice(0, 120)}`);
+    console.warn(`   ⚠ reasoning regeneration failed: ${(err as Error).message.slice(0, 120)}`);
     return null;
   }
 }
@@ -2006,58 +2044,32 @@ async function discoverAndSolveMiningChallengesInner(
         continue;
       }
 
-      // Specificity pre-gate: a 400-rejected submission still burns one of
-      // the 12 daily epoch slots (~10-20k NOOK each at emission-pool rates),
-      // so never send a summary that fails the local mirror. Enrich from the
-      // trace body / reasoning — always richer than the LLM's summary.
+      // Specificity pre-gate — STANDARD traces only, where traceSummary is the
+      // scored field. Enrich from the trace body / reasoning — always richer
+      // than the LLM's summary.
+      // HISTORY: this comment used to justify the gate with "a 400-rejected
+      // submission still burns one of the 12 daily epoch slots". Measured
+      // 2026-10-01 it does not (see the specificity-gate.ts header), so on the
+      // standard path the gate is cheap upside, not slot protection.
+      //
+      // Code kinds (python_tests / javascript_tests / exact_answer) skip it.
+      // Until 2026-10-01 this gate (plus a regeneration + local-skip block
+      // that sat here) ran on their traceSummary — a field the gateway ignores
+      // on /submit-solution — and threw away 11 paid solves since 09-01. It
+      // must not move onto `reasoning` either: the local mirror rejects 205
+      // of 232 gateway-ACCEPTED reasonings, so it would tail or skip texts
+      // that pass. Code kinds are submitted as composed and revised only on a
+      // real 400 (catch below; verifiable-reasoning.ts).
       const s = solved;
-      // For verifiable (code) solves there is no traceContent — the richest
-      // source of specificity fragments (identifiers, numbers, .ext refs) is the
-      // solution code itself, so feed it to the enricher too. No-op for standard
-      // traces (empty artifact).
+      // The solution code is the richest source of extractable fragments
+      // (identifiers, quoted literals, .ext refs) for the code-kind on-400
+      // retry, and the Jev shadow check reads it. Undefined for standard traces.
       const codeFiles = (s.artifact?.files ?? {}) as Record<string, unknown>;
       const codeText = Object.values(codeFiles).filter((v): v is string => typeof v === "string").join("\n") || undefined;
-      if (s.traceSummary && !passesSpecificityGate(s.traceSummary)) {
+      if (s.traceContent && s.traceSummary && !passesSpecificityGate(s.traceSummary)) {
         const before = countSpecificity(s.traceSummary);
         s.traceSummary = enrichSummarySpecificity(s.traceSummary, [s.traceContent, codeText, s.reasoning, ch.description]);
         console.log(`   🔬 summary enriched pre-submit (${before}→${countSpecificity(s.traceSummary)} specificity categories)`);
-      }
-      // Enrichment is extractive — on the verifiable path there is often
-      // nothing in the source material to extract (snake_case code has no
-      // camelCase names, no unit-bearing numbers, no comparisons), so it can
-      // return a summary that still fails. Submitting anyway is how 39 paid
-      // solves died at the gateway. Regenerate instead: one cheap targeted
-      // call, told exactly which categories are missing.
-      if (s.traceSummary && !s.traceContent && !passesSpecificityGate(s.traceSummary)) {
-        const rewritten = await regenerateVerifiableSummary(s.traceSummary, codeText, ch, modelUsed);
-        if (rewritten && passesSpecificityGate(rewritten)) {
-          console.log(`   ✍ summary regenerated to clear the specificity gate`);
-          s.traceSummary = rewritten;
-        } else {
-          console.warn(`   ⛔ summary still below the specificity gate after regeneration — skipping submit to save the solve`);
-          // Local skips are calibration data too (2026-10-01): log the summary
-          // that failed, with the local verdict, next to the gateway 400s.
-          const skipped = rewritten ?? s.traceSummary ?? "";
-          appendJsonl(SUMMARY_REJECTIONS_LOG, {
-            ts: new Date().toISOString(),
-            challengeId: ch.id,
-            verifierKind: kind,
-            model: modelUsed,
-            gateway: "local-skip (not submitted)",
-            summary: skipped.slice(0, 600),
-            local: specificityCategories(skipped),
-          });
-          appendJsonl(MINING_LOG, {
-            ts: new Date().toISOString(),
-            challengeId: ch.id,
-            verifierKind: kind,
-            outcome: "error" as const,
-            notes: "specificity gate: summary unfixable locally (submit skipped)",
-            model: modelUsed,
-          });
-          specificityRejectedChallenges.markFor(ch.id, ALREADY_SUBMITTED_TTL_MS);
-          continue;
-        }
       }
 
       let sub: {
@@ -2098,8 +2110,23 @@ async function discoverAndSolveMiningChallengesInner(
         traceHash = sha256Hex(s.traceContent);
       }
 
+      // The SCORED text differs by route: traceSummary on /submit (standard
+      // traces); `reasoning` on /submit-solution (code kinds), where the
+      // gateway stores it as the traceSummary — see verifiable-reasoning.ts.
+      // The code path therefore carries the whole body, built in one place, so
+      // the on-400 retry revises exactly the field that was sent.
       let submitSummary = s.traceSummary;
       const gatewayModel = gatewayModelName(modelUsed);
+      const makeSolutionBody = (sv: SolveResult): SubmitSolutionBody =>
+        buildSubmitSolutionBody({
+          artifactType: sv.artifactType,
+          artifact: sv.artifact,
+          reasoning: sv.reasoning,
+          modelUsed: gatewayModel,
+          selfReportedWallMs: wallMs,
+          guildId: opts.guildId,
+        });
+      let solutionBody: SubmitSolutionBody | null = s.traceContent ? null : makeSolutionBody(s);
       const doSubmit = async (): Promise<typeof sub> => {
         if (s.traceContent) {
           return (await runtime.connection.request(
@@ -2119,70 +2146,119 @@ async function discoverAndSolveMiningChallengesInner(
         return (await runtime.connection.request(
           "POST",
           `/v1/mining/challenges/${encodeURIComponent(ch.id)}/submit-solution`,
-          {
-            artifactType: s.artifactType,
-            artifact: s.artifact,
-            reasoning: s.reasoning,
-            traceSummary: submitSummary,
-            modelUsed: gatewayModel,
-            selfReportedWallMs: wallMs,
-            ...(opts.guildId ? { guildId: opts.guildId } : {}),
-          },
+          solutionBody,
         )) as typeof sub;
+      };
+      // Keep the REJECTED scored text (nothing else stores it — the error row
+      // in mining-submissions.jsonl carries only the gateway message). The
+      // 2026-09-21 deepseek rejections could only be diagnosed by inference
+      // because of that gap; this file is the calibration set for the local
+      // specificity mirror. `field` says which text the gateway judged: until
+      // 2026-10-01 code-kind rows logged traceSummary, a field the gateway
+      // ignores on /submit-solution — those older rows are not evidence about
+      // the text that was scored.
+      const logTextRejection = (gatewayMsg: string, attempt: number): void => {
+        const field = solutionBody ? "reasoning" : "traceSummary";
+        const text = (solutionBody ? solutionBody.reasoning : submitSummary) ?? "";
+        console.warn(`   📝 rejected ${field} (${text.length} chars, ${modelUsed}, attempt ${attempt}): ${text.slice(0, 220)}`);
+        appendJsonl(SUMMARY_REJECTIONS_LOG, {
+          ts: new Date().toISOString(),
+          challengeId: ch.id,
+          verifierKind: kind,
+          model: modelUsed,
+          gateway: gatewayMsg.slice(0, 400),
+          field,
+          attempt,
+          ...(solutionBody ? { reasoning: text.slice(0, 600) } : { summary: text.slice(0, 600) }),
+          local: specificityCategories(text),
+        });
       };
 
       try {
         sub = await doSubmit();
       } catch (subErr) {
         const smsg = (subErr as Error).message;
-        // Keep the REJECTED summary text (nothing else stores it — the error
-        // row in mining-submissions.jsonl carries only the gateway message).
-        // The 2026-09-21 deepseek rejections could only be diagnosed by
-        // inference because of that gap; this file is the calibration set
-        // for the local specificity mirror.
-        if (isSpecificityError(smsg) || isSummaryLengthError(smsg)) {
-          const text = submitSummary ?? "";
-          console.warn(`   📝 rejected summary (${text.length} chars, ${modelUsed}): ${text.slice(0, 220)}`);
-          appendJsonl(SUMMARY_REJECTIONS_LOG, {
-            ts: new Date().toISOString(),
-            challengeId: ch.id,
-            verifierKind: kind,
-            model: modelUsed,
-            gateway: smsg.slice(0, 400),
-            summary: text.slice(0, 600),
-            local: specificityCategories(text),
-          });
-        }
-        if (!isSpecificityError(smsg)) throw subErr;
-        // The gateway enumerates exactly which categories scored zero —
-        // enrich those from the trace and retry ONCE. (Operator playbooks
-        // warn that some 400s shadow-mask rate limits — never loop.)
-        const missing = parseMissingCategories(smsg);
-        const beforeRetry = submitSummary ?? "";
-        submitSummary = enrichSummarySpecificity(
-          beforeRetry,
-          [s.traceContent, codeText, s.reasoning, ch.description],
-          missing.length > 0 ? missing : undefined,
-        );
-        if (submitSummary === beforeRetry) {
-          // Nothing extractable for the missing categories — a retry would
-          // fail identically and burn another slot. Cool down 24h.
-          specificityRejectedChallenges.markFor(ch.id, ALREADY_SUBMITTED_TTL_MS);
-          console.warn(`   🔬 specificity 400 and nothing extractable to enrich — cooling ${idShort} for 24h`);
-          throw subErr;
-        }
-        console.warn(`   🔬 specificity 400 (missing: ${missing.join(",") || "?"}) — retrying with enriched summary`);
-        try {
-          sub = await doSubmit();
-        } catch (subErr2) {
-          if (isSpecificityError((subErr2 as Error).message)) {
-            specificityRejectedChallenges.markFor(ch.id, ALREADY_SUBMITTED_TTL_MS);
-            console.warn(`   🔬 enriched retry also failed specificity — cooling ${idShort} for 24h`);
+        const rejection = summaryRejectionKind(smsg);
+        if (rejection) logTextRejection(smsg, 1);
+        if (solutionBody) {
+          // Code kinds: a specificity OR "minimum 100 characters" 400 judged
+          // the reasoning. Revise THAT text (read back from the body that was
+          // sent) and retry ONCE. A 400 does not burn an epoch slot, so this
+          // only risks a request; giving up throws away the paid solve.
+          if (!rejection) throw subErr;
+          let plan = planReasoningRetry(solutionBody, smsg, [codeText, ch.description], ch);
+          let how = "enriched";
+          if (!plan) {
+            // Nothing extractable left for the missing categories — one cheap
+            // rewrite told what the gateway scored zero, before giving up.
+            const missing = rejection === "specificity" ? parseMissingCategories(smsg) : [];
+            const answerText = typeof s.artifact?.text === "string" ? s.artifact.text : undefined;
+            const rewritten = await regenerateVerifiableReasoning(solutionBody.reasoning, codeText ?? answerText, ch, modelUsed, missing);
+            if (rewritten && rewritten !== solutionBody.reasoning) {
+              plan = { body: withReasoning(solutionBody, rewritten), kind: rejection, missing, before: solutionBody.reasoning, after: rewritten };
+              how = "rewritten";
+            }
           }
-          throw subErr2;
+          if (!plan) {
+            specificityRejectedChallenges.markFor(ch.id, ALREADY_SUBMITTED_TTL_MS);
+            console.warn(`   🔬 ${rejection} 400 on reasoning and nothing to add — cooling ${idShort} for 24h`);
+            throw subErr;
+          }
+          console.warn(
+            `   🔬 ${rejection} 400 on reasoning (missing: ${plan.missing.join(",") || "-"}) — retrying once with ${how} reasoning (${plan.before.length}→${plan.after.length} chars)`,
+          );
+          solutionBody = plan.body;
+          try {
+            sub = await doSubmit();
+          } catch (subErr2) {
+            const m2 = (subErr2 as Error).message;
+            if (summaryRejectionKind(m2)) {
+              logTextRejection(m2, 2);
+              specificityRejectedChallenges.markFor(ch.id, ALREADY_SUBMITTED_TTL_MS);
+              console.warn(`   🔬 revised reasoning also rejected — cooling ${idShort} for 24h`);
+            }
+            throw subErr2;
+          }
+        } else {
+          // Standard traces: traceSummary is the scored field. Unchanged.
+          if (!isSpecificityError(smsg)) throw subErr;
+          // The gateway enumerates exactly which categories scored zero —
+          // enrich those from the trace and retry ONCE. (Operator playbooks
+          // warn that some 400s shadow-mask rate limits — never loop.)
+          const missing = parseMissingCategories(smsg);
+          const beforeRetry = submitSummary ?? "";
+          submitSummary = enrichSummarySpecificity(
+            beforeRetry,
+            [s.traceContent, codeText, s.reasoning, ch.description],
+            missing.length > 0 ? missing : undefined,
+          );
+          if (submitSummary === beforeRetry) {
+            // Nothing extractable for the missing categories — a retry would
+            // fail identically. Cool down 24h.
+            specificityRejectedChallenges.markFor(ch.id, ALREADY_SUBMITTED_TTL_MS);
+            console.warn(`   🔬 specificity 400 and nothing extractable to enrich — cooling ${idShort} for 24h`);
+            throw subErr;
+          }
+          console.warn(`   🔬 specificity 400 (missing: ${missing.join(",") || "?"}) — retrying with enriched summary`);
+          try {
+            sub = await doSubmit();
+          } catch (subErr2) {
+            if (isSpecificityError((subErr2 as Error).message)) {
+              logTextRejection((subErr2 as Error).message, 2);
+              specificityRejectedChallenges.markFor(ch.id, ALREADY_SUBMITTED_TTL_MS);
+              console.warn(`   🔬 enriched retry also failed specificity — cooling ${idShort} for 24h`);
+            }
+            throw subErr2;
+          }
         }
       }
-      s.traceSummary = submitSummary;
+      if (solutionBody) {
+        // Record what was actually sent (the vault note and workspace read these).
+        s.reasoning = solutionBody.reasoning;
+        s.traceSummary = solutionBody.traceSummary;
+      } else {
+        s.traceSummary = submitSummary;
+      }
 
       if (sub.error) {
         console.warn(`   ✗ submit error: ${sub.error}`);
@@ -2224,8 +2300,8 @@ async function discoverAndSolveMiningChallengesInner(
           s.artifact = reSolved.artifact;
           s.artifactType = reSolved.artifactType;
           s.reasoning = reSolved.reasoning;
-          s.traceSummary = reSolved.traceSummary;
-          submitSummary = reSolved.traceSummary;
+          s.traceSummary = reSolved.reasoning;
+          solutionBody = makeSolutionBody(s);
           try {
             sub = await doSubmit();
           } catch (retryErr) {
@@ -2238,7 +2314,6 @@ async function discoverAndSolveMiningChallengesInner(
             break;
           }
         }
-        s.traceSummary = submitSummary;
       }
 
       const outcome = sub.verification_outcome;

@@ -7,6 +7,27 @@
  * rates each lost slot is ~10-20k NOOK. We hit 3 of these in the 36h before
  * 2026-06-11.
  *
+ * CORRECTED 2026-10-01 (measured, kept next to the claim above): a 400 does
+ * NOT burn an epoch slot. In mining-submissions.jsonl, 205 accepted
+ * submissions landed while the trailing 24h already held ≥13 accepted +
+ * specificity/min-100-rejected rows (60 of them in September, e.g. 09-21
+ * 13:28 with 11 accepted + 10 rejected), and every "Maximum 12 regular" 429
+ * fired at 12 accepted regardless of how many 400s sat in the window. The
+ * logged rejections are a LOWER bound (a rejection rescued by the enriched
+ * retry leaves no error row), which only strengthens this. What a 400 does
+ * cost is the paid solve behind it if we give up on the challenge — so
+ * submit-then-enrich beats skipping locally. The playbook claim was never
+ * verified here.
+ *
+ * WHICH FIELD (2026-10-01): on /submit-solution (python_tests /
+ * javascript_tests / exact_answer) the gateway stores and length-checks
+ * `reasoning`, not `traceSummary` — per the 2026-10-01 review, 51/51 accepted
+ * code submissions' stored traceSummary equals the reasoning we sent (not
+ * re-fetched for this change). The mirror below was fitted to
+ * traceSummary rejections and rejects ~88% of gateway-ACCEPTED reasonings
+ * (205 of 232 vault rows), so it must not gate the code path; see
+ * verifiable-reasoning.ts.
+ *
  * The gateway's rejection body is actionable: it lists exactly which
  * categories scored zero ("Missing categories: numbers (...); technique
  * names (...)..."). This module:
@@ -194,20 +215,30 @@ const ENRICH_PRIORITY: SpecificityCategory[] = [
  *
  * Hard cap 500 chars (gateway summary limit). Idempotent-ish: categories
  * already present in the summary are never re-added.
+ *
+ * `opts.trustWanted` (2026-10-01): when the gateway itself named `wanted` as
+ * scoring +0, do NOT drop a category just because the LOCAL mirror thinks the
+ * text already has it — the gateway's verdict on the text it scored outranks
+ * our guess. Used by the code-kind reasoning retry, where the mirror is known
+ * to disagree with the gateway (it credits snake_case `task_func` as a
+ * technique; the gateway scored techniques +0 on exactly that kind of text).
+ * Default off, so the standard-trace retry behaves as before.
  */
 export function enrichSummarySpecificity(
   summary: string,
   sources: Array<string | undefined>,
   wanted?: SpecificityCategory[],
+  opts: { trustWanted?: boolean } = {},
 ): string {
   let out = summary.trim();
   const have = specificityCategories(out);
+  const trust = Boolean(opts.trustWanted && wanted && wanted.length > 0);
   // Always walk in gateway-value order, whether we chose the categories or the
   // gateway's missing-list did — the +4/+3 categories must land before the
   // 500-char budget or the stop-condition can cut enrichment short.
   const candidates: SpecificityCategory[] = ENRICH_PRIORITY
     .filter((c) => (wanted ? wanted.includes(c) : true))
-    .filter((c) => !have[c as keyof typeof have]);
+    .filter((c) => trust || !have[c as keyof typeof have]);
 
   const sourceText = sources.filter(Boolean).join("\n\n");
   const additions: string[] = [];
