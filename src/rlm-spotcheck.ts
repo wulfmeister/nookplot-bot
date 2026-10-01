@@ -22,6 +22,7 @@ import { join } from "node:path";
 import type { NookplotRuntime } from "@nookplot/runtime";
 import { chat } from "./venice.js";
 import { NOOK_DIR, appendJsonl, sleep } from "./util.js";
+import { fallbackGateways } from "./ipfs-fetch.js";
 
 type RuntimeLike = Pick<NookplotRuntime, "connection">;
 
@@ -61,7 +62,7 @@ function pick<T>(obj: Record<string, unknown>, ...keys: string[]): T | undefined
 
 /**
  * Fetch the prompt text from IPFS. Try the gateway's content-by-cid helper
- * first, fall back to ipfs.io public gateway. Returns null on all-fail.
+ * first, fall back to the shared public-gateway list (ipfs-fetch.ts). Returns null on all-fail.
  */
 async function fetchPromptFromCid(runtime: RuntimeLike, cid: string): Promise<string | null> {
   // Path A: gateway helper if available
@@ -74,16 +75,20 @@ async function fetchPromptFromCid(runtime: RuntimeLike, cid: string): Promise<st
     const text = res.content ?? res.text ?? res.data?.content ?? res.data?.prompt;
     if (typeof text === "string" && text.length > 0) return text;
   } catch { /* fall through */ }
-  // Path B: public IPFS gateway
-  try {
-    const r = await fetch(`https://ipfs.io/ipfs/${encodeURIComponent(cid)}`, {
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (r.ok) {
-      const text = await r.text();
-      if (text && text.length > 0) return text;
-    }
-  } catch { /* skip */ }
+  // Path B: public IPFS gateways — the shared fallback list (Pinata since
+  // 2026-10-01; the hardcoded ipfs.io here now answers 429 to everything).
+  for (const base of fallbackGateways()) {
+    try {
+      const r = await fetch(`${base}${encodeURIComponent(cid)}`, {
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (r.ok) {
+        const text = await r.text();
+        // An HTML body is a gateway error/interstitial page, never a prompt.
+        if (text && text.length > 0 && !/^\s*<(?:!doctype|html|head|body)\b/i.test(text)) return text;
+      }
+    } catch { /* try the next gateway */ }
+  }
   return null;
 }
 

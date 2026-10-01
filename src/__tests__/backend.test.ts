@@ -1236,7 +1236,8 @@ describe("ipfs-fetch (public-gateway fallback for 502'd verify trace fetches)", 
     const prev = process.env.BOT_IPFS_FALLBACK_GATEWAYS;
     try {
       delete process.env.BOT_IPFS_FALLBACK_GATEWAYS;
-      assert.ok(fallbackGateways().some((g) => g.includes("ipfs.io")));
+      // Default is Pinata only since 2026-10-01 (ipfs.io/dweb.link answer 429 to everything).
+      assert.deepEqual(fallbackGateways(), ["https://gateway.pinata.cloud/ipfs/"]);
       process.env.BOT_IPFS_FALLBACK_GATEWAYS = "https://my.gw/ipfs/, https://other.gw/ipfs/";
       assert.deepEqual(fallbackGateways(), ["https://my.gw/ipfs/", "https://other.gw/ipfs/"]);
     } finally {

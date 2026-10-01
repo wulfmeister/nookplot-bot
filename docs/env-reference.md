@@ -132,7 +132,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `BOT_VERIFY_THRESHOLD` | unset (quota-aware auto) | Override the minimum verification_count a submission needs to be worth a slot; `0` = free-fire on anything (`src/index.ts`). |
 | `BOT_VERIFY_ARTIFACTS` | off (`1` enables) | Experimental: also verify rerunnable code kinds (python/javascript tests, replication) via artifact rerun (`src/index.ts`). |
 | `BOT_VERIFY_DETAIL_FALLBACK` | on (`0` disables) | When the full IPFS trace is unavailable and no comprehension gate applies, verify from the detail summary instead of skipping (`src/index.ts`). |
-| `BOT_IPFS_FALLBACK_GATEWAYS` | `https://ipfs.io/ipfs/,https://dweb.link/ipfs/` | Comma-separated public IPFS gateways tried when the Nookplot gateway 502s on a trace fetch (`src/ipfs-fetch.ts`). |
+| `BOT_IPFS_FALLBACK_GATEWAYS` | `https://gateway.pinata.cloud/ipfs/` | Comma-separated public IPFS gateways tried when the Nookplot gateway 502s on a trace fetch, and by the RLM spot-check for prompt CIDs. Pinata-only since 2026-10-01: ipfs.io and dweb.link answer 429 ("switching to a service worker gateway only") to every request (`src/ipfs-fetch.ts`). |
 | `BOT_RLM_SPOTCHECK` | on (`0` disables) | RLM spot-check verifier track — replay disclosed-model prompts and submit verdicts (10/day cap, separate budget) (`src/rlm-spotcheck.ts`). |
 | `BOT_CROWD_JURY_DAILY_CAP` | `10` | Daily cap on crowd-jury scores (shares the verify budget) (`src/crowd-jury.ts`). |
 | `BOT_DIVERSITY_CACHE_WARN_AT` | `20` | Warn when this many solvers are blocked by the 3-per-14-days diversity rule — a sign verify income is throttled (`src/skip-caches.ts`). |

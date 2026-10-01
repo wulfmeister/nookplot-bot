@@ -16,9 +16,15 @@
  */
 import { traceTextFromIpfsPayload } from "./trace-payload.js";
 
+// 2026-10-01: Pinata only. ipfs.io and dweb.link now answer 429 "This IPFS
+// gateway is switching to a service worker gateway only" to every request — the
+// log shows ZERO successful fallbacks ever — while gateway.pinata.cloud served
+// one of our own genuine trace CIDs (200, ~7s) on 2026-09-28. Meanwhile the
+// Nookplot gateway's own /v1/ipfs route 502s even for genuine CIDs (since
+// ~2026-08-25), so this fallback is the verify lane's only read path.
+// Override with BOT_IPFS_FALLBACK_GATEWAYS.
 const DEFAULT_FALLBACK_GATEWAYS = [
-  "https://ipfs.io/ipfs/",
-  "https://dweb.link/ipfs/",
+  "https://gateway.pinata.cloud/ipfs/",
 ];
 
 /** Ordered list of public gateway bases to try. Override via BOT_IPFS_FALLBACK_GATEWAYS (comma-separated). */
