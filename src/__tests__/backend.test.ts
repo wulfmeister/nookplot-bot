@@ -1189,8 +1189,11 @@ describe("trace-payload.cidRejectReason (spam vs truncation — kills the phanto
     assert.equal(isWellFormedCid(fake), false);
     assert.match(cidRejectReason(fake), /pure lowercase hex/i);
     assert.match(cidRejectReason(fake), /correct skip/);
-    // A single non-hex base58 char anywhere makes it plausible again.
-    const plausible = "Qm" + "g" + "1a2b3c4d5e6f".repeat(4).slice(0, 43);
+    // A single non-hex base58 char makes it plausible again as far as the hex
+    // rule goes. The char must be one that keeps the multihash header at
+    // 0x1220: the old "g" here decodes to 0x1221, which the header check
+    // (2026-10-01) now rejects; "P" decodes to 0x1220.
+    const plausible = "Qm" + "P" + "1a2b3c4d5e6f".repeat(4).slice(0, 43);
     assert.equal(isWellFormedCid(plausible), true);
   });
 
