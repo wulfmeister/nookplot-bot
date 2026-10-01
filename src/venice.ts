@@ -1,7 +1,8 @@
 import "dotenv/config";
 import { Agent, fetch as undiciFetch } from "undici";
 import { effortFor } from "./models.js";
-import { recordVeniceCall, shouldFireDailyAlert, veniceSpentToday } from "./venice-cost.js";
+import { recordFailedVeniceCall, recordVeniceCall, shouldFireDailyAlert, veniceSpentToday } from "./venice-cost.js";
+import { VeniceStandDownError, classifyVeniceBillingError, noteVeniceError, veniceStandingDown } from "./venice-breaker.js";
 
 export interface VeniceParameters {
   include_venice_system_prompt?: boolean;
@@ -159,16 +160,56 @@ export function classifyChatError(err: unknown, elapsedMs: number): { error: Err
   return { error, causeCode, isAbort, transient };
 }
 
+/**
+ * Pure: the `cause` written on a failed-call ledger row. The transport code
+ * when there is one, else "http <status>" (with the billing label for a
+ * 402/lockout), else a short form of the message.
+ */
+export function failureCause(err: Error, causeCode?: string): string {
+  if (causeCode) return causeCode;
+  const status = /Venice API (\d{3})\b/.exec(err.message)?.[1];
+  if (status) {
+    const billing = classifyVeniceBillingError(err.message);
+    return billing ? `http ${status} (${billing.label})` : `http ${status}`;
+  }
+  if (/aborted/i.test(err.message)) return "aborted";
+  return err.message.slice(0, 120);
+}
+
 /** Pure: the timeout a chat() call actually gets. */
 export function effectiveTimeoutMs(requested?: number, floor = MIN_CALL_TIMEOUT_MS): number {
   return Math.max(requested ?? 180_000, floor);
 }
 
 export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
+  // Stand-down first, before the key check and before any request: a call
+  // refused here sends nothing, so it cannot count toward Venice's
+  // failed-attempt lockout. See venice-breaker.ts.
+  const standDown = veniceStandingDown();
+  if (standDown.active) throw new VeniceStandDownError(standDown);
   assertVeniceKey();
   const maxAttempts = 3;
   let lastErr: Error | null = null;
   const model = opts.model ?? DEFAULT_MODEL;
+  const callStart = Date.now();
+  let attemptsMade = 0;
+  // A call that finally throws leaves a zero-usage ledger row, so spend
+  // forensics can see it. A 429 already wrote its "rate-limited" row below.
+  const fail = (err: Error, isAbort: boolean, causeCode?: string): Error => {
+    if (!err.message.includes("Venice API 429")) {
+      try {
+        recordFailedVeniceCall({
+          model,
+          outcome: isAbort ? "timeout" : "other-error",
+          elapsedMs: Date.now() - callStart,
+          attempts: attemptsMade,
+          cause: failureCause(err, causeCode),
+        });
+      } catch { /* telemetry must never break the call */ }
+    }
+    return err;
+  };
+  let lastCls: { isAbort: boolean; causeCode?: string } = { isAbort: false };
   // Floored, but retryable downward: some providers 400 when max_tokens
   // exceeds the model's completion limit — on that specific error we halve
   // and retry rather than failing the call.
@@ -178,7 +219,17 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
   // (server default) and retry rather than failing the call.
   let effectiveTemperature = opts.temperature;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // A concurrent call may have tripped the stand-down while this one waited
+    // to retry. Don't spend the retry on a key that is refusing everything.
+    if (attempt > 0) {
+      const sd = veniceStandingDown();
+      if (sd.active) {
+        if (lastErr) fail(lastErr, lastCls.isAbort, lastCls.causeCode);
+        throw new VeniceStandDownError(sd);
+      }
+    }
     const attemptStart = Date.now();
+    attemptsMade++;
     try {
       const ctrl = new AbortController();
       const timeoutId = setTimeout(() => ctrl.abort(), effectiveTimeoutMs(opts.timeoutMs));
@@ -245,6 +296,13 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
     } catch (err) {
       const cls = classifyChatError(err, Date.now() - attemptStart);
       lastErr = cls.error;
+      lastCls = { isAbort: cls.isAbort, causeCode: cls.causeCode };
+      // A 402 spend-limit/balance refusal or a failed-attempt lockout stands
+      // ALL Venice use down (venice-breaker.ts). The 402 itself is not
+      // transient, so this attempt throws below.
+      try {
+        noteVeniceError(lastErr.message);
+      } catch { /* the breaker must never break the call */ }
       // Capacity telemetry: a 429 means we hit the provider's rate limit for
       // this model. Recorded per-model so the dashboard can show whether
       // we're starting to max out inference capacity (veniceRateLimited429Today).
@@ -282,9 +340,10 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
       // 3×timeoutMs before the caller's cross-model failover (which is the
       // productive path) ever fires. One same-model retry max for aborts.
       const { isAbort, transient } = cls;
-      if (!transient || attempt === maxAttempts - 1 || (isAbort && attempt >= 1)) throw lastErr;
+      if (!transient || attempt === maxAttempts - 1 || (isAbort && attempt >= 1)) throw fail(lastErr, isAbort, cls.causeCode);
       await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
     }
   }
-  throw lastErr ?? new Error("chat failed");
+  // Reached when a max_tokens/temperature downgrade `continue`d on the last attempt.
+  throw fail(lastErr ?? new Error("chat failed"), lastCls.isAbort, lastCls.causeCode);
 }

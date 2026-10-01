@@ -23,12 +23,15 @@
  * calls — 30 min, doubling per consecutive trip up to 24h, reset on success —
  * because on 2026-09-28 a test loop that retried through a spend limit
  * tripped Venice's ">50 failed attempts" lockout on the key the whole bot
- * depends on. An HTTP 400/401/403/404 latches Jev off until restart.
+ * depends on. A 402 spend limit or a 429 lockout also trips the process-wide
+ * Venice stand-down (venice-breaker.ts), and Jev respects that stand-down when
+ * another caller trips it. An HTTP 400/401/403/404 latches Jev off until restart.
  * BOT_JEV=0 disables every call site.
  */
 import { NOOK_DIR } from "./util.js";
 import { join } from "node:path";
 import { recordVeniceCall } from "./venice-cost.js";
+import { _resetVeniceBreakerForTests, noteVeniceError, veniceStandingDown } from "./venice-breaker.js";
 
 const BASE = process.env.VENICE_BASE_URL ?? "https://api.venice.ai/api/v1";
 export const JEV_MODEL = "jev-latest";
@@ -60,12 +63,13 @@ let pauseStreak = 0;
 let latchedOff = false;
 export const JEV_PAUSE_CAP_MS = 24 * 3600_000;
 
-/** Test hook: clear the breaker state. */
+/** Test hook: clear the breaker state, Jev's own and the shared Venice stand-down it feeds. */
 export function _resetJevForTests(): void {
   pausedUntil = 0;
   consecutiveFailures = 0;
   pauseStreak = 0;
   latchedOff = false;
+  _resetVeniceBreakerForTests();
 }
 
 /** Pure: pause length for the Nth consecutive trip (1-based). */
@@ -121,6 +125,9 @@ export async function jevDecide(
   if (process.env.BOT_JEV === "0" || latchedOff) return null;
   const now = opts.nowMs ?? Date.now();
   if (now < pausedUntil) return null;
+  // The process-wide stand-down (venice-breaker.ts): a spend limit or lockout
+  // seen by ANY Venice caller pauses Jev too. Same key, same refusal.
+  if (veniceStandingDown(now).active) return null;
   const key = process.env.VENICE_API_KEY;
   if (!key) return null;
   const doFetch = opts.fetchImpl ?? fetch;
@@ -139,6 +146,16 @@ export async function jevDecide(
       signal: AbortSignal.timeout(opts.timeoutMs ?? 20_000),
     });
     if (r.status === 402 || r.status === 429) {
+      // Feed the shared breaker: a key-level spend limit on /decisions is the
+      // same limit chat() would hit. An unreadable body still trips a 402
+      // (as "unrecognised"), and an ordinary 429 does not trip it.
+      let body = "";
+      try {
+        body = (await r.text()).slice(0, 400);
+      } catch { /* body optional */ }
+      try {
+        noteVeniceError(`Venice API ${r.status}: ${body}`, now);
+      } catch { /* the breaker must never break a caller */ }
       pause(`HTTP ${r.status}`);
       return null;
     }

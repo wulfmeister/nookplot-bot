@@ -26,7 +26,7 @@ export interface DaySpend {
  * earnings series never drop days. Pure — testable.
  */
 export function dailySpendSeries(
-  entries: Array<{ ts?: string; estCost?: number }>,
+  entries: Array<{ ts?: string; estCost?: number; outcome?: string }>,
   days: number,
   nowMs: number,
 ): DaySpend[] {
@@ -36,6 +36,9 @@ export function dailySpendSeries(
   }
   for (const e of entries) {
     if (!e.ts || typeof e.estCost !== "number" || !Number.isFinite(e.estCost)) continue;
+    // Zero-cost rows for calls that threw (2026-10-01) are not calls that
+    // returned; keep "calls" meaning what it meant before they existed.
+    if (e.outcome === "timeout" || e.outcome === "other-error") continue;
     const d = byDate.get(e.ts.slice(0, 10));
     if (!d) continue; // outside window
     d.spendUsd += e.estCost;
@@ -45,5 +48,5 @@ export function dailySpendSeries(
 }
 
 export function readDailySpend(days = 30, nowMs = Date.now()): DaySpend[] {
-  return dailySpendSeries(readJsonl<{ ts?: string; estCost?: number }>(VENICE_COSTS), days, nowMs);
+  return dailySpendSeries(readJsonl<{ ts?: string; estCost?: number; outcome?: string }>(VENICE_COSTS), days, nowMs);
 }

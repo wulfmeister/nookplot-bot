@@ -6,6 +6,7 @@ import { writeNote } from "./vault.js";
 import { NOOK_DIR, readJsonl, appendJsonl } from "./util.js";
 import { canVerifyNow, recordCrowdScore, recordVerifyLimitHit, isVerifyCapError } from "./quotas.js";
 import { recordAudit } from "./audit.js";
+import { standDownSkip } from "./venice-breaker.js";
 import {
   finalizedSubmissionSkip,
   FINALIZED_TTL_MS,
@@ -108,6 +109,8 @@ export async function scoreCrowdJurySubmissions(
     console.log("🎭 (DRY_RUN — skipping crowd-jury poll)");
     return;
   }
+  // Scoring needs Venice; skip the 200-row pool fetch too.
+  if (standDownSkip("crowd-jury")) return;
   const { seen, todayCount } = loadSeen();
   if (todayCount >= DAILY_CAP) {
     console.log(`🎭 crowd-jury daily cap hit (${todayCount}/${DAILY_CAP})`);
@@ -147,6 +150,9 @@ export async function scoreCrowdJurySubmissions(
 
   for (const sub of candidates.slice(0, Math.min(3, DAILY_CAP - todayCount))) {
     const idShort = sub.id.slice(0, 8);
+    // A 402 on the previous candidate trips the stand-down: stop before the
+    // next comprehension POST.
+    if (standDownSkip("crowd-jury")) break;
     if (finalizedSubmissionSkip.isSkipped(sub.id)) continue;
     // Honor the shared gateway cap (verifies + crowd-jury combined).
     if (!canVerifyNow()) {

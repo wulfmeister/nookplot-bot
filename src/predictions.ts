@@ -3,6 +3,7 @@ import type { NookplotRuntime } from "@nookplot/runtime";
 import { chat } from "./venice.js";
 import { pickModel } from "./models.js";
 import { NOOK_DIR, readJsonl, appendJsonl } from "./util.js";
+import { standDownSkip } from "./venice-breaker.js";
 
 type RuntimeLike = Pick<NookplotRuntime, "connection">;
 
@@ -110,6 +111,7 @@ export async function submitPredictions(
     console.log("🔮 (DRY_RUN — skipping predictions)");
     return;
   }
+  if (standDownSkip("predictions")) return;
   const { attempted, todayCount } = loadCaches();
   if (todayCount >= DAILY_CAP) return;
 
@@ -130,6 +132,7 @@ export async function submitPredictions(
 
   console.log(`🔮 ${eligible.length} prediction challenges`);
   for (const ch of eligible.slice(0, DAILY_CAP - todayCount)) {
+    if (standDownSkip("predictions")) break;
     try {
       const detail = (await runtime.connection.request("GET", `/v1/mining/challenges/${encodeURIComponent(ch.id)}`)) as Challenge;
       const scoringType = detail.scoringConfig?.type ?? "log_loss";

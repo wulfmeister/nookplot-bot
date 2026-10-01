@@ -6,6 +6,7 @@ import { pickModel } from "./models.js";
 import { writeNote, VAULT_DIR } from "./vault.js";
 import { descriptionSimilarity, titleBigrams } from "./challenge-posting.js";
 import { NOOK_DIR, readJsonl, appendJsonl } from "./util.js";
+import { isVeniceBillingError, standDownSkip, veniceStandingDown } from "./venice-breaker.js";
 
 type RuntimeLike = Pick<NookplotRuntime, "connection">;
 
@@ -356,6 +357,10 @@ async function analyzeRejection(
     ], { max_tokens: 600, temperature: 0.3, model: pickModel("mining_learning") });
     analysis = res.content.trim().slice(0, 1200);
   } catch (err) {
+    // A billing refusal: rethrow so the caller leaves this rejection unmarked
+    // and retries the post-mortem after the refill, instead of filing a note
+    // that only says the generation failed.
+    if (veniceStandingDown().active || isVeniceBillingError((err as Error).message)) throw err;
     analysis = `(analysis generation failed: ${(err as Error).message.slice(0, 100)})`;
   }
 
@@ -383,6 +388,23 @@ async function analyzeRejection(
   });
 }
 
+/**
+ * Pure: submission ids the learnings loop treats as done. Any row marks its
+ * submission done EXCEPT an "error" row caused by a Venice billing refusal:
+ * the key couldn't pay, so the learning is still owed. Before 2026-10-01 a
+ * 402 wrote such a row and dropped the learning for good (5 of them: 1 on
+ * 09-28, 4 on 10-01); skipping those rows retries them after the refill.
+ */
+export function learningLogDoneIds(entries: Array<{ submissionId?: string; status?: string; notes?: string }>): Set<string> {
+  const done = new Set<string>();
+  for (const e of entries) {
+    if (!e.submissionId) continue;
+    if (e.status === "error" && isVeniceBillingError(e.notes)) continue;
+    done.add(e.submissionId);
+  }
+  return done;
+}
+
 export async function publishPostSolveLearnings(
   runtime: RuntimeLike,
   opts: { dryRun?: boolean } = {},
@@ -398,9 +420,13 @@ export async function publishPostSolveLearnings(
     console.log("🧠 (DRY_RUN — skipping learnings poll)");
     return;
   }
+  // Venice stand-down: both terminal branches (rejection post-mortem, verified
+  // learning) generate through Venice. Outcome recording is not lost: the
+  // settlements tick backfills it via recordMiningOutcomeOnce.
+  if (standDownSkip("learnings")) return;
 
   const mining = readJsonl<MiningEntry>(MINING_LOG);
-  const posted = new Set(readJsonl<LearningEntry>(LEARNING_LOG).map((e) => e.submissionId));
+  const posted = learningLogDoneIds(readJsonl<LearningEntry>(LEARNING_LOG));
 
   const candidates = mining.filter((m) => m.submissionId && (m.outcome === "pass" || m.outcome === "deferred") && !posted.has(m.submissionId!));
   if (candidates.length === 0) return;
@@ -571,8 +597,17 @@ export async function publishPostSolveLearnings(
         summary: learning.summary,
       });
     } catch (err) {
-      console.warn(`   ⚠ learning ${subId.slice(0, 8)}: ${(err as Error).message}`);
-      appendJsonl(LEARNING_LOG, { ts: new Date().toISOString(), submissionId: subId, challengeId: m.challengeId, status: "error", notes: (err as Error).message.slice(0, 200) });
+      const msg = (err as Error).message;
+      console.warn(`   ⚠ learning ${subId.slice(0, 8)}: ${msg}`);
+      // Any LEARNING_LOG row marks the submission done for good. A billing
+      // refusal is not the submission's fault: leave it unmarked so it is
+      // retried after the refill, and stop the tick (4 learnings were dropped
+      // this way on 2026-10-01, 1 on 09-28).
+      if (veniceStandingDown().active || isVeniceBillingError(msg)) {
+        console.warn(`   ⏸ learnings: Venice is refusing calls — ${subId.slice(0, 8)} left unmarked for retry`);
+        break;
+      }
+      appendJsonl(LEARNING_LOG, { ts: new Date().toISOString(), submissionId: subId, challengeId: m.challengeId, status: "error", notes: msg.slice(0, 200) });
     }
   }
 }
