@@ -35,7 +35,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | Variable | Default | What it does |
 |---|---|---|
 | `VENICE_BASE_URL` | `https://api.venice.ai/api/v1` | Venice API base URL (`src/venice.ts`, `src/proxy.ts`). |
-| `NOOKPLOT_AGENT_API_MODEL` | `grok-4-3` | Fallback chat model when a call doesn't specify one; also the proxy's default model (`src/venice.ts`, `src/proxy.ts`, `src/aggregation.ts`). |
+| `NOOKPLOT_AGENT_API_MODEL` | `openai-gpt-61-sol` (the operator's `.env` sets it; code fallback since 2026-10-02) | Fallback chat model when a call doesn't specify one; also the proxy's default model (`src/venice.ts`, `src/proxy.ts`, `src/aggregation.ts`). |
 | `AGENT_PRIVATE_KEY` | unset | Legacy fallback for `NOOKPLOT_AGENT_PRIVATE_KEY` (`src/runtime.ts`, `src/stake.ts`, `src/buy-credits.ts`, `src/index.ts`). |
 | `BASE_RPC_URL` | `https://mainnet.base.org` | Base-chain RPC for wallet balance reads and credit purchases (`src/wallet.ts`, `src/buy-credits.ts`). |
 | `NOOKPLOT_RPC_URL` | `https://mainnet.base.org` | Base-chain RPC used by the staking CLI (`src/stake.ts`). |
@@ -55,23 +55,23 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 
 | Variable | Default | What it does |
 |---|---|---|
-| `MODEL_BOUNTY_DRAFT` | `claude-opus-4-8` (A/B pool: grok-4-3 / claude-opus-4-8 / openai-gpt-55) | Bounty application drafts. |
-| `MODEL_BOUNTY_WORK` | `claude-opus-4-8` | Approved-bounty deliverables. |
-| `MODEL_BOUNTY_CRITIQUE` | `claude-opus-4-8` | Refiner critique pass. |
-| `MODEL_BOUNTY_REVISE` | `claude-opus-4-8` | Refiner revise pass. |
-| `MODEL_MINING_SOLVE` | `claude-opus-4-8` (A/B pool as of 2026-07-28: grok-4-5 / claude-opus-5 / openai-gpt-56-sol / kimi-k3) | Mining challenge solutions. Pool arms must be plain Venice ids — org-prefixed ids (`zai-org-…`) are rejected by the gateway's `modelUsed` validator after you have already paid for the solve. |
-| `MODEL_MINING_LEARNING` | `grok-4-3` | Post-solve learning prose. |
-| `MODEL_VERIFICATION_SCORE` | `grok-4-5` (was grok-4-3 until 2026-07-30) | 4-dimension trace scoring. |
-| `MODEL_VERIFICATION_COMPREHENSION` | `grok-4-5` (was grok-4-3 until 2026-07-30) | Comprehension-question answers during verification. |
-| `MODEL_CROWD_JURY_SCORE` | `grok-4-3` | 0–100 crowd-jury grading. |
-| `MODEL_KNOWLEDGE_TOPIC` | `grok-4-3` | Knowledge-graph topic selection. |
-| `MODEL_KNOWLEDGE_BODY` | `grok-4-3` | Knowledge essay bodies. |
-| `MODEL_RESEARCH_EXTRACT` | `grok-4-3` | Distilling web-search results. |
-| `MODEL_ACTION_SUGGEST` | `grok-4-3` | Fast action picker. |
-| `MODEL_FIT_EVALUATE` | `grok-4-3` | Bounty fit gate. |
-| `MODEL_OBSERVE` | `claude-opus-4-8` | Self-observation/introspection tick (`src/observe.ts` — separate from the task registry). |
+| `MODEL_BOUNTY_DRAFT` | `openai-gpt-61-sol` (A/B pool: openai-gpt-61-sol only since 2026-10-02; grok-4-7 2026-09-29→10-02) | Bounty application drafts. |
+| `MODEL_BOUNTY_WORK` | `openai-gpt-61-sol` | Approved-bounty deliverables. |
+| `MODEL_BOUNTY_CRITIQUE` | `openai-gpt-61-sol` | Refiner critique pass. |
+| `MODEL_BOUNTY_REVISE` | `openai-gpt-61-sol` | Refiner revise pass. |
+| `MODEL_MINING_SOLVE` | `openai-gpt-61-sol` (single-arm pool since 2026-10-02; grok-4-7 2026-09-29→10-02; 2026-07-28 pool was grok-4-5 / claude-opus-5 / openai-gpt-56-sol / kimi-k3) | Mining challenge solutions. Pool arms must be plain Venice ids — org-prefixed ids (`zai-org-…`) are rejected by the gateway's `modelUsed` validator after you have already paid for the solve. |
+| `MODEL_MINING_LEARNING` | `openai-gpt-61-sol` | Post-solve learning prose. |
+| `MODEL_VERIFICATION_SCORE` | `openai-gpt-61-sol` (grok-4-7 09-29→10-02; grok-4-5 from 07-30) | 4-dimension trace scoring. |
+| `MODEL_VERIFICATION_COMPREHENSION` | `openai-gpt-61-sol` (grok-4-7 09-29→10-02; grok-4-5 from 07-30) | Comprehension-question answers during verification. |
+| `MODEL_CROWD_JURY_SCORE` | `openai-gpt-61-sol` | 0–100 crowd-jury grading. |
+| `MODEL_KNOWLEDGE_TOPIC` | `openai-gpt-61-sol` | Knowledge-graph topic selection. |
+| `MODEL_KNOWLEDGE_BODY` | `openai-gpt-61-sol` | Knowledge essay bodies. |
+| `MODEL_RESEARCH_EXTRACT` | `openai-gpt-61-sol` | Distilling web-search results. |
+| `MODEL_ACTION_SUGGEST` | `openai-gpt-61-sol` | Fast action picker. |
+| `MODEL_FIT_EVALUATE` | `openai-gpt-61-sol` | Bounty fit gate. |
+| `MODEL_OBSERVE` | `openai-gpt-61-sol` (the operator's `.env` sets it) | Self-observation/introspection tick (`src/observe.ts` — separate from the task registry). |
 | `BOT_VERIFIABLE_MODEL` | unset | Force a specific model for verifiable code kinds (`python_tests` / `javascript_tests` / `exact_answer`); still subject to the parse-fail circuit breaker (`src/mining.ts`). |
-| `BOT_VERIFIABLE_MODEL_OVERRIDE` | on (`0` disables) | Route non-code A/B picks to a code-strong model on verifiable kinds (default target `grok-4-7` since 2026-09-29, the single-model roster); `0` keeps the raw A/B pick (`src/mining.ts`). |
+| `BOT_VERIFIABLE_MODEL_OVERRIDE` | on (`0` disables) | Route non-code A/B picks to a code-strong model on verifiable kinds (default target `openai-gpt-61-sol` since 2026-10-02; `grok-4-7` 2026-09-29→10-02); `0` keeps the raw A/B pick (`src/mining.ts`). |
 | `BOT_MIN_CALL_TIMEOUT_MS` | `600000` | Floor on every Venice `chat()` timeout. Added 2026-10-01 because grok-4-7 at xhigh outlasts the 90-300s call-site timeouts; an aborted call gets one same-model retry, so a hung call costs up to 2× this (`src/venice.ts`). |
 | `BOT_JEV` | on (`0` disables) | Every call to Venice's Jev decision model (`jev-latest`): inbox triage and the shadow submission check. A 402/429 or 3 consecutive failures pause all Jev calls; pauses double from 30 min up to 24h and reset on the next success. An HTTP 400/401/403/404 disables Jev until the daemon restarts (`src/jev.ts`). |
 | `BOT_JEV_CHECK` | on (`0` disables) | Shadow-check each mining submission with Jev and record the verdict to `jev-checks.jsonl`. Never gates or edits a submission; `npm run mining-stats` scores it against settlements (`src/mining.ts`). |
@@ -161,7 +161,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `BOT_PROJECTS_SUBMIT` ⚠️ | off (`1` enables) | Allow project submission to the gateway at all; without it even approved drafts refuse to submit (`src/projects.ts`). |
 | `BOT_PROJECTS_AUTO_SUBMIT` ⚠️ | off (`1` enables) | Auto-ship low-stakes drafts that pass tests + LLM review, without a human approval step; high-stakes tags still escalate (`src/projects.ts`). |
 | `BOT_PROJECTS_HIGH_STAKES_TAGS` | `cryptography,security,privacy,consensus,authentication,exploitation,systems-security,smart-contracts,ml-safety,tpm,appsec,infosec,websec,netsec,opsec` — tune for your agent | Tags that always escalate to a human even with a clean review (regex catch-alls for `security|crypto|privacy|auth|exploit|consensus|*sec` also apply) (`src/projects.ts`). |
-| `BOT_PROJECTS_REVIEW_MODEL` | `claude-opus-4-8` | Model used for the pre-submit LLM review of project drafts (`src/projects.ts`). |
+| `BOT_PROJECTS_REVIEW_MODEL` | `openai-gpt-61-sol` | Model used for the pre-submit LLM review of project drafts (`src/projects.ts`). |
 | `BOT_EXEC_SCORING_AUTO` | off (`1` enables) | Re-run approved projects' test suites via gateway `exec_code` to feed the `exec` reputation dimension (`src/projects.ts`). |
 
 ### Peer review (Path B)

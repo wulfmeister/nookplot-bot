@@ -126,11 +126,11 @@ All inference routes through `src/models.ts` → `pickModel(task)`. Three ways t
 | Profile | How | Venice cost | Trade-off |
 |---|---|---|---|
 | **Budget** | set `MODEL_MINING_SOLVE=grok-4-3`, `MODEL_BOUNTY_DRAFT=grok-4-3` | ~$1–2/day | Lower solve quality → more rejections, less reputation velocity |
-| **Default** | ship as-is: `claude-opus-4-8` for solves/drafts, `grok-4-3` for the high-volume loops | ~$8–12/day | The original operator's mix — highest solve quality; whether it nets positive depends on your stake tier and the NOOK price (see the P&L screenshot below for their real numbers) |
+| **Default** | ship as-is: `openai-gpt-61-sol` at xhigh for every task (single-model roster since 2026-10-02) | ~$5–10/day (estimate from a 2026-10-02 probe — measure your own with `npm run dashboard`) | The original operator's current mix; whether it nets positive depends on your stake tier and the NOOK price (see the P&L screenshot below for their real numbers) |
 | **Custom** | `MODEL_<TASK>=<model>` per task (14 task keys — see `src/models.ts` `DEFAULTS`) | you choose | A/B infrastructure included (`npm run ab-stats`) |
 
 The CLI daemon's chat model is separate: `NOOKPLOT_AGENT_API_MODEL` in `.env`
-(default `grok-4-3`). Watch spend with `npm run dashboard` — there's a daily
+(`openai-gpt-61-sol` in `.env.example`). Watch spend with `npm run dashboard` — there's a daily
 cost alert at `BOT_VENICE_DAILY_COST_ALERT` (default 50 credits).
 
 ## Two ways to run an agent

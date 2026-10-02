@@ -4,6 +4,69 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-10-02 — every model → openai-gpt-61-sol, probed before it went live
+
+Operator: "switch all models to chatgpt 6.1-sol on venice, then test the
+endpoints". Catalog id `openai-gpt-61-sol` (GPT-6.1 Sol): $2.50/$12.50 per M,
+1.05M context, 128k max completion, effort low|medium|high|xhigh|max (no
+none/minimal), optimizedForCode=false, privacy "anonymized" (grok-4-7 was
+"private"). Run at xhigh like the previous roster.
+
+**Swapped** (e0c1b90 template): every task default, both A/B pools, the
+verifiable default and its allow-list, MODEL_EFFORT, pricing, the observe and
+project-review defaults, the venice/proxy fallback, and the two `.env`
+overrides (`NOOKPLOT_AGENT_API_MODEL`, `MODEL_OBSERVE`) that otherwise kept
+projects, peer review, aggregation and observe on grok-4-7. **Kept:**
+jev-latest (a separate /decisions product), rlm-spotcheck (replays the
+solver's claimed model), lean mode's grok-4-3. grok-4-7 keeps its effort,
+pricing and allow-list rows, so `MODEL_<TASK>=grok-4-7` rolls back cleanly.
+
+**Probed first, from the branch worktree** (`npm run probe:gpt61`), because
+launchd boots the main tree on any restart. The day's Venice allowance was
+small, so only the decisive shapes ran; $0.47 total:
+
+| shape | secs | out/reasoning tok | est $ | result |
+|---|---|---|---|---|
+| smoke | 2 | 5 | 0.003 | temperature accepted, xhigh answered, model id echoed |
+| python_tests (real solver, web search) | 274 | 13,841 / 12,209 | 0.178 | strict JSON, solution first; summary 5/6 specificity |
+| standard trace (real solver) ×2 | 148-155 | ~6.5-7k / ~4.1-4.7k | 0.085-0.091 | strict JSON, 8.8-9.4k chars; raw summary 1/6 (enrichment tails it to pass) |
+| refine (critique + revise) | 159 | 7,447 / 3,028 | 0.106 | clean start, no preamble, headings kept |
+
+No content filter, refusal, length stop or parse failure. Our cost estimates
+matched Venice's billing within 3%. Versus grok-4-7 on the same shapes: python ~1.3-1.8x
+the cost and similar latency; standard about half the cost. NOT probed (budget):
+verify scoring, comprehension, project review, knowledge JSON. They run in
+production now and fail bounded (verify parse fails strike 3x and retire).
+Watch verification-stats.jsonl for a calibration shift, since the scoring
+prompt was tuned on grok.
+
+Added with the swap (review fixes, model/gpt61-sol-fixed):
+- **Id-rejection stand-down** (`idRejectionStandDown`): with one model in the
+  pool, a gateway `modelUsed` rejection would otherwise keep buying solves
+  that 400 at submit (the breaker's empty-pool fail-safe re-admits the arm).
+  The tick now logs and skips, before the guild claim. Recover with
+  `MODEL_MINING_SOLVE=<accepted id>`. History: 17 of 17 model names we sent
+  were accepted, including all four openai-gpt-* ids; only GLM and Kimi were
+  ever refused.
+- **Temperature memo** in chat(): a model that rejects `temperature` costs
+  one 400 per process, not one per call (6.1-sol accepts it; terra is listed).
+
+**Jev's price, settled.** The cost audit suggested an unexplained 10-01
+balance drop fit Jev costing ~$1 per /decisions call. One bracketed call
+refuted it: nothing was billed beyond the catalog price (~$0.0001/call), and
+the following bracket reconciled with nothing left over. (Jev was paused with
+`BOT_JEV=0` for the hours before the test; re-enabled.)
+
+
+**Cost vs the solving cap.** Re-pricing grok-4-7's measured tokens at Sol
+rates gives ~1.75x; the probe suggests closer to 1x overall (Sol's standard
+traces used ~0.35x grok's tokens). On days our solving hits the 1,575,000/epoch
+cap (entry (d) above) extra solves earn nothing, so a pricier model buys
+income only on uncapped days.
+
+Pre-existing, not the model: refine's revise pass reads only the first 4,000
+chars of the draft, and the probe's trace shrank 8.8k → 6.5k through it.
+
 ## 2026-10-01 (d) — the seven review suggestions, built and adversarially reviewed
 
 The operator asked for all seven suggestions from entry (c). Five isolated
