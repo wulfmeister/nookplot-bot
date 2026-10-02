@@ -160,11 +160,12 @@ describe("models", () => {
       // volume tasks stay on grok-4-3. Verification moved to grok-4-6 since
       // 2026-08-13 (grok-4-5 before that, from 07-30).
       // 2026-09-29: single-model roster (operator) — every task defaults to grok-4-7.
-      assert.equal(pickModel("mining_solve"), process.env.MODEL_MINING_SOLVE ?? "grok-4-7");
-      assert.equal(pickModel("verification_score"), process.env.MODEL_VERIFICATION_SCORE ?? "grok-4-7");
-      assert.equal(pickModel("verification_comprehension"), process.env.MODEL_VERIFICATION_COMPREHENSION ?? "grok-4-7");
-      assert.equal(pickModel("knowledge_body"), process.env.MODEL_KNOWLEDGE_BODY ?? "grok-4-7");
-      assert.equal(pickModel("bounty_draft"), process.env.MODEL_BOUNTY_DRAFT ?? "grok-4-7");
+      // 2026-10-01: the roster moved to openai-gpt-61-sol (operator) — same shape.
+      assert.equal(pickModel("mining_solve"), process.env.MODEL_MINING_SOLVE ?? "openai-gpt-61-sol");
+      assert.equal(pickModel("verification_score"), process.env.MODEL_VERIFICATION_SCORE ?? "openai-gpt-61-sol");
+      assert.equal(pickModel("verification_comprehension"), process.env.MODEL_VERIFICATION_COMPREHENSION ?? "openai-gpt-61-sol");
+      assert.equal(pickModel("knowledge_body"), process.env.MODEL_KNOWLEDGE_BODY ?? "openai-gpt-61-sol");
+      assert.equal(pickModel("bounty_draft"), process.env.MODEL_BOUNTY_DRAFT ?? "openai-gpt-61-sol");
     } finally {
       if (savedLean === undefined) delete process.env.BOT_LEAN;
       else process.env.BOT_LEAN = savedLean;
@@ -184,7 +185,9 @@ describe("models", () => {
     // returns empty content with the whole budget spent on reasoning.
     // 2026-09-29: the pool is grok-4-7 alone (operator: "replace every model
     // with grok 4.7"). The 09-20 four-arm pool's evidence is in the CHANGELOG.
-    const allowed = new Set(["grok-4-7"]);
+    // 2026-10-01: the one arm is openai-gpt-61-sol (operator: "switch all
+    // models to chatgpt 6.1-sol"); grok-4-7 held it 09-29 → 10-01.
+    const allowed = new Set(["openai-gpt-61-sol"]);
     try {
       const seen = new Set<string>();
       for (let i = 0; i < 40; i++) {
@@ -218,7 +221,7 @@ describe("models", () => {
       // 2026-09-02 with solve-shaped requests at xhigh: 200 OK, full output.
       assert.equal(effortFor("claude-opus-5"), "xhigh");
       assert.equal(effortFor("claude-opus-5-5"), "xhigh"); // python_tests lane 2026-09-24 → 09-29
-      assert.equal(effortFor("grok-4-7"), "xhigh"); // whole roster since 2026-09-29
+      assert.equal(effortFor("grok-4-7"), "xhigh"); // whole roster 2026-09-29 → 10-01 (kept for env rollback)
       assert.equal(effortFor("openai-gpt-56-terra"), "xhigh");
       // deepseek-v4-1-flash joined 2026-09-20 at "high" (catalog default).
       // NOT its "max" tier: probed 09-20 the python solve shape at max spent
@@ -589,9 +592,10 @@ describe("mining.maybeOverrideModelForVerifiable (route weak-for-code models off
 
   it("routes a weak-code A/B pick → the default on a verifiable (python_tests) challenge", () => {
     clean();
-    // Default is grok-4-7 since 2026-09-29 (single-model roster). History:
-    // claude-opus-5-5 09-24→09-29, deepseek-v4-1-flash 09-20→09-24, opus-5 09-02→09-20.
-    try { assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3")).model, "grok-4-7"); }
+    // Default is openai-gpt-61-sol since 2026-10-01 (single-model roster). History:
+    // grok-4-7 09-29→10-01, claude-opus-5-5 09-24→09-29, deepseek-v4-1-flash
+    // 09-20→09-24, opus-5 09-02→09-20.
+    try { assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3")).model, "openai-gpt-61-sol"); }
     finally { restore(); }
   });
   it("leaves an already code-strong A/B pick (opus / gpt-55) unchanged on verifiable; deepseek is rerouted", () => {
@@ -602,8 +606,9 @@ describe("mining.maybeOverrideModelForVerifiable (route weak-for-code models off
       assert.equal(maybeOverrideModelForVerifiable(py, AB("claude-opus-5-5")).model, "claude-opus-5-5");
       assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-7")).model, "grok-4-7");
       // deepseek-v4-1-flash left VERIFIABLE_CODE_MODELS on 2026-09-24 — as an
-      // A/B pick it no longer keeps python_tests; every attempt routes to the default.
-      assert.equal(maybeOverrideModelForVerifiable(py, AB("deepseek-v4-1-flash")).model, "grok-4-7");
+      // A/B pick it no longer keeps python_tests; every attempt routes to the
+      // default (grok-4-7 09-29→10-01, openai-gpt-61-sol since 2026-10-01).
+      assert.equal(maybeOverrideModelForVerifiable(py, AB("deepseek-v4-1-flash")).model, "openai-gpt-61-sol");
     } finally { restore(); }
   });
   it("does NOT touch standard (non-verifiable) challenges — keeps grok in the A/B pool", () => {
@@ -623,7 +628,8 @@ describe("mining.maybeOverrideModelForVerifiable (route weak-for-code models off
   it("won't force a parse-fail-sidelined default model", () => {
     clean();
     try {
-      const rates = { "grok-4-7": { attempts: 10, failures: 8, rate: 0.8 } };
+      // Keyed on the CURRENT default (openai-gpt-61-sol since 2026-10-01; grok-4-7 before).
+      const rates = { "openai-gpt-61-sol": { attempts: 10, failures: 8, rate: 0.8 } };
       assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates).model, "grok-4-3");
     } finally { restore(); }
   });
@@ -634,13 +640,14 @@ describe("mining.maybeOverrideModelForVerifiable (route weak-for-code models off
     clean();
     const now = Date.parse("2026-09-17T19:33:00Z");
     const H = 3_600_000;
-    // Default is claude-opus-5-5 since 2026-09-24 (this test predates that swap).
+    // Keyed on the current default: claude-opus-5-5 09-24→09-29, grok-4-7
+    // 09-29→10-01, openai-gpt-61-sol since 2026-10-01 (this test predates all three).
     const rates = (ageMs: number) => ({
-      "grok-4-7": { attempts: 10, failures: 8, rate: 0.8, lastCallMs: now - ageMs },
+      "openai-gpt-61-sol": { attempts: 10, failures: 8, rate: 0.8, lastCallMs: now - ageMs },
     });
     try {
       assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates(H), now).model, "grok-4-3");
-      assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates(25 * H), now).model, "grok-4-7");
+      assert.equal(maybeOverrideModelForVerifiable(py, AB("grok-4-3"), rates(25 * H), now).model, "openai-gpt-61-sol");
     } finally { restore(); }
   });
 });

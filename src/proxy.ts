@@ -4,7 +4,7 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 const PORT = Number(process.env.PROXY_PORT ?? 18790);
 const VENICE_BASE = process.env.VENICE_BASE_URL ?? "https://api.venice.ai/api/v1";
 const VENICE_KEY = process.env.VENICE_API_KEY;
-const DEFAULT_MODEL = process.env.NOOKPLOT_AGENT_API_MODEL ?? "grok-4-7";
+const DEFAULT_MODEL = process.env.NOOKPLOT_AGENT_API_MODEL ?? "openai-gpt-61-sol";
 
 // Describe YOUR agent's stake/boost position in BOT_STRATEGY_POSITION — it
 // steers the daemon's earning priorities. The default assumes a fresh

@@ -51,11 +51,30 @@ export type Task =
 // breaker's empty-pool fail-safe keeps the arm running. The per-task history
 // in the comments below is kept as the record of why each earlier pick was
 // made. Revert per task with MODEL_<TASK> env overrides.
+// 2026-10-01 — SINGLE-MODEL ROSTER MOVES to openai-gpt-61-sol (operator:
+// "switch all models to chatgpt 6.1-sol on venice"). The grok-4-7 roster ran
+// 2026-09-29 → 10-01; every "grok-4-7" note below is that era's record.
+// Live public catalog 2026-10-01: GPT-6.1 Sol, $2.50/$12.50 per M, 1.05M ctx
+// (922k in / 128k out), effort low|medium|high|xhigh|max (NO none/minimal),
+// default high, optimizedForCode=false, privacy=anonymized (grok-4-7 was
+// private). NOT live-probed before this commit: the Venice key was 402-locked
+// until 2026-10-02T00:00Z. ORDER MATTERS: probe from the branch WORKTREE,
+// then merge (src/_probe-gpt61.ts header). launchd (KeepAlive) boots the main
+// working tree on ANY restart, so merging first puts this roster live
+// unprobed. The merge alone is also not the whole swap: .env's
+// NOOKPLOT_AGENT_API_MODEL and MODEL_OBSERVE win over these defaults for the
+// no-model call sites (projects, peer review, aggregation, proxy, observe) —
+// the probe lists them. Open questions the probe settles: whether explicit
+// temperature is rejected (terra — like 6.1-sol a developers.openai.com-sourced
+// catalog listing, unlike the openrouter-sourced 5.6 sol that accepted it —
+// 400'd on any temperature 09-03), whether xhigh answers on the live path,
+// and parse / specificity on both solve shapes. The one-arm trade-offs above
+// still hold.
 const DEFAULTS: Record<Task, string> = {
-  bounty_draft: "grok-4-7",
-  bounty_work: "grok-4-7",
-  bounty_critique: "grok-4-7",
-  bounty_revise: "grok-4-7",
+  bounty_draft: "openai-gpt-61-sol",
+  bounty_work: "openai-gpt-61-sol",
+  bounty_critique: "openai-gpt-61-sol",
+  bounty_revise: "openai-gpt-61-sol",
   // mining_solve default → claude-opus-5 (operator, 2026-09-02): opus-4-8
   // failed the gateway's traceSummary specificity gate on 12/16 mining
   // attempts since 08-28 (chronic near-misses, 30-34 vs threshold 35);
@@ -88,8 +107,8 @@ const DEFAULTS: Record<Task, string> = {
   // Also observed 09-20: opus-5 uniquely trips Venice's content_filter on our
   // standard-trace system prompt (finish_reason=content_filter, 0 tokens, 1s) —
   // grok-4-6 / terra / gemini / deepseek / even opus-4-8 did not.
-  mining_solve: "grok-4-7",
-  mining_learning: "grok-4-7",
+  mining_solve: "openai-gpt-61-sol",
+  mining_learning: "openai-gpt-61-sol",
   // Verification moved to grok-4-5 on 2026-07-30 (operator). NOTE: this is
   // NOT a cost saving — grok-4-5 lists $2.27/$6.80 per M vs grok-4-3's
   // $1.42/$2.83, so it roughly doubles verification inference; the operator
@@ -99,14 +118,14 @@ const DEFAULTS: Record<Task, string> = {
   // verification-stats.jsonl for a step change in mean scores.
   // grok-4-5 → grok-4-6 on 2026-08-13 (operator): same price, same 500k ctx,
   // NOT beta, and it restores the xhigh effort tier 4-5 dropped.
-  verification_score: "grok-4-7",
-  verification_comprehension: "grok-4-7",
-  crowd_jury_score: "grok-4-7",
-  knowledge_topic: "grok-4-7",
-  knowledge_body: "grok-4-7",
-  research_extract: "grok-4-7",
-  action_suggest: "grok-4-7",
-  fit_evaluate: "grok-4-7",
+  verification_score: "openai-gpt-61-sol",
+  verification_comprehension: "openai-gpt-61-sol",
+  crowd_jury_score: "openai-gpt-61-sol",
+  knowledge_topic: "openai-gpt-61-sol",
+  knowledge_body: "openai-gpt-61-sol",
+  research_extract: "openai-gpt-61-sol",
+  action_suggest: "openai-gpt-61-sol",
+  fit_evaluate: "openai-gpt-61-sol",
 };
 
 const A_B_POOL: Record<Task, string[] | undefined> = {
@@ -115,8 +134,9 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   // thinking, see XHIGH_THINKING_MODELS below).
   // gpt-55-pro is excluded — significantly more expensive per call without
   // a confirmed quality delta worth the cost on bounty drafts.
-  // 2026-09-29: single-model roster — see the DEFAULTS header.
-  bounty_draft: ["grok-4-7"],
+  // 2026-09-29: single-model roster — see the DEFAULTS header (grok-4-7
+  // 09-29 → 10-01, openai-gpt-61-sol since 2026-10-01).
+  bounty_draft: ["openai-gpt-61-sol"],
   bounty_work: undefined,
   bounty_critique: undefined,
   bounty_revise: undefined,
@@ -194,7 +214,9 @@ const A_B_POOL: Record<Task, string[] | undefined> = {
   // 2026-09-29: single-model roster (operator) — see the DEFAULTS header. The
   // 09-20 → 09-28 four-arm pool (grok-4-6 / deepseek-v4-1-flash / terra /
   // gemini-3-8-flash) and its measured results are in CHANGELOG 2026-09-29.
-  mining_solve: ["grok-4-7"],
+  // 2026-10-01: the one arm is openai-gpt-61-sol (operator); grok-4-7 held it
+  // 09-29 → 10-01. Revert with MODEL_MINING_SOLVE=grok-4-7.
+  mining_solve: ["openai-gpt-61-sol"],
   mining_learning: undefined,
   verification_score: undefined,
   verification_comprehension: undefined,
@@ -230,7 +252,8 @@ const MODEL_EFFORT: Record<string, ReasoningEffort> = {
   // default high) — operator wants it at xhigh, and this time it's supported.
   "grok-4-6": "xhigh",
   // grok-4-7 at "xhigh" (catalog 2026-09-29: low|medium|high|xhigh). The whole
-  // roster since 09-29; probed at xhigh on both solve shapes before shipping.
+  // roster 09-29 → 10-01; probed at xhigh on both solve shapes before shipping.
+  // Kept so a MODEL_<TASK>=grok-4-7 rollback still gets its dial.
   "grok-4-7": "xhigh",
   "openai-gpt-55": "high",
   // Sol at "xhigh" (probed OK 09-02) — out of the roster since 09-03 (terra
@@ -239,6 +262,14 @@ const MODEL_EFFORT: Record<string, ReasoningEffort> = {
   // Terra at "xhigh" per operator (2026-09-03). Catalog lists none..max;
   // live-probed at xhigh same day: 200 OK, 5.5k chars in 65s.
   "openai-gpt-56-terra": "xhigh",
+  // openai-gpt-61-sol at "xhigh" — the roster convention, and the tier its 5.6
+  // sibling sol answered on the live path (probe 09-02, 200 OK). Catalog
+  // 2026-10-01 lists low|medium|high|xhigh|max (no none/minimal). NOT "max":
+  // gpt-55 400'd at max in May, and luna's catalog-listed max was refused on
+  // the live path from 09-01. Whole roster since 2026-10-01. UNVERIFIED live
+  // until `npm run probe:gpt61` runs: if xhigh 400s or returns empty content,
+  // drop to "high" (the catalog default).
+  "openai-gpt-61-sol": "xhigh",
   // gemini-3-8-flash: the catalog exposes NO effort options (like opus-5
   // pre-09-02), but the live path ACCEPTS "high" (probe 09-03: 200 OK, no
   // 400) — the value may be server-ignored. Operator asked for high.

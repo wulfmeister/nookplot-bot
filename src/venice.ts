@@ -40,8 +40,33 @@ const BASE = process.env.VENICE_BASE_URL ?? "https://api.venice.ai/api/v1";
 const KEY = process.env.VENICE_API_KEY;
 // Fallback for chat() calls that pass no model (projects.ts, peer-review.ts).
 // NOTE: .env's NOOKPLOT_AGENT_API_MODEL wins — it was claude-opus-4-8 until
-// 2026-09-29, which silently routed those call sites to opus-4-8.
-const DEFAULT_MODEL = process.env.NOOKPLOT_AGENT_API_MODEL ?? "grok-4-7";
+// 2026-09-29, which silently routed those call sites to opus-4-8. On
+// 2026-10-01 it still reads grok-4-7: the 6.1-sol swap needs that .env line.
+const DEFAULT_MODEL = process.env.NOOKPLOT_AGENT_API_MODEL ?? "openai-gpt-61-sol";
+
+// Models that 400 on ANY explicit temperature ("Unsupported value:
+// 'temperature' does not support 0.2 with this model. Only the default (1)
+// value is supported."). chat() omits the field for them instead of spending a
+// 400 plus a retry on every call; that retry also used up attempt 0, leaving
+// a slow solve one abort retry instead of two. Seeded with terra (09-03). A
+// rejection seen at runtime is remembered for the rest of the process, so an
+// unprobed model pays the 400 once per boot, not once per call.
+// openai-gpt-61-sol is NOT seeded: whether it rejects temperature is
+// UNVERIFIED until src/_probe-gpt61.ts runs.
+const NO_TEMPERATURE_MODELS = new Set<string>(["openai-gpt-56-terra"]);
+export function acceptsTemperature(model: string): boolean {
+  return !NO_TEMPERATURE_MODELS.has(model);
+}
+export function markTemperatureRejected(model: string): void {
+  NO_TEMPERATURE_MODELS.add(model);
+}
+/** Pure: is this error a 400 rejecting the temperature field itself? */
+export function isTemperatureRejection(message: string): boolean {
+  return (
+    message.includes("Venice API 400") &&
+    /unsupported (value|parameter).{0,20}'temperature'/i.test(message)
+  );
+}
 
 /**
  * Convenience: Venice web-search-enabled parameters.
@@ -217,7 +242,7 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
   // Retryable downward like max_tokens: some models (gpt-56-terra, 09-03)
   // reject ANY explicit temperature — on that specific 400 we drop the field
   // (server default) and retry rather than failing the call.
-  let effectiveTemperature = opts.temperature;
+  let effectiveTemperature = acceptsTemperature(model) ? opts.temperature : undefined;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     // A concurrent call may have tripped the stand-down while this one waited
     // to retry. Don't spend the retry on a key that is refusing everything.
@@ -327,11 +352,10 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
       // rejections are deliberately NOT auto-downgraded: effort is an
       // operator calibration choice, and silently nerfing it would hide a
       // roster misconfiguration (the luna-max lesson) — those stay loud.
-      const temp400 =
-        lastErr.message.includes("Venice API 400") &&
-        /unsupported value.{0,20}'temperature'/i.test(lastErr.message);
+      const temp400 = isTemperatureRejection(lastErr.message);
       if (temp400 && effectiveTemperature !== undefined) {
         effectiveTemperature = undefined;
+        markTemperatureRejected(model);
         console.warn(`   ↩ ${model} rejected temperature=${opts.temperature} — retrying with server default`);
         continue;
       }
