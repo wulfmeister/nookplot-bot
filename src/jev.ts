@@ -32,6 +32,7 @@ import { NOOK_DIR } from "./util.js";
 import { join } from "node:path";
 import { recordVeniceCall } from "./venice-cost.js";
 import { _resetVeniceBreakerForTests, noteVeniceError, veniceStandingDown } from "./venice-breaker.js";
+import { wakeGateStatus } from "./wake-gate.js";
 
 const BASE = process.env.VENICE_BASE_URL ?? "https://api.venice.ai/api/v1";
 export const JEV_MODEL = "jev-latest";
@@ -128,6 +129,9 @@ export async function jevDecide(
   // The process-wide stand-down (venice-breaker.ts): a spend limit or lockout
   // seen by ANY Venice caller pauses Jev too. Same key, same refusal.
   if (veniceStandingDown(now).active) return null;
+  // Wake gate (wake-gate.ts): Jev calls Venice through its own fetch, so it
+  // needs its own check. Real clock, not opts.nowMs (tests inject fake times).
+  if (wakeGateStatus().closed) return null;
   const key = process.env.VENICE_API_KEY;
   if (!key) return null;
   const doFetch = opts.fetchImpl ?? fetch;

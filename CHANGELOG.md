@@ -50,6 +50,22 @@ transport drop or timeout during a simulated sleep → 1 request, no retry;
 timeout without sleep → unchanged (one retry); right after a wake → refused
 with 0 requests.
 
+**Review (5 agents, 2 lenses + skeptics): no blockers.** Replaying the
+10-02 06:49Z → 10-03 15:04Z sleep against the bot's loop schedules: the old
+code made ~73 billed chat attempts there, the new code would make 0 (every
+awake interval in that window was a 6-34s DarkWake). Follow-ups shipped:
+- Confirmed and fixed: the heartbeat started lazily, so a first gate check
+  more than 60s after boot read as a phantom wake (5-min hold, no sleep). It
+  now starts at module load (0ac1bd3).
+- A daemon (re)start counts as a wake (`noteDaemonBoot` in main()): launchd
+  restarts after a watchdog exit can land inside a DarkWake, where the gate
+  used to start open. Cost: a 5-min hold after every restart.
+- Jev's own /decisions fetch honours the gate (it bypassed chat()).
+Left as low: ticks due during sleep run at the next interval after the gate
+opens rather than the moment it opens; an in-flight call across a sleep
+shorter than ~60s can still get its one retry; a backward clock step extends
+the hold.
+
 ## 2026-10-02 — every model → openai-gpt-61-sol, probed before it went live
 
 Operator: "switch all models to chatgpt 6.1-sol on venice, then test the

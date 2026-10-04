@@ -93,6 +93,8 @@ export interface WakeGate {
   observe(nowMs?: number): WakeGateState;
   /** Tests only: start over with no wake recorded. */
   reset(nowMs?: number): void;
+  /** Record a wake at nowMs without a clock gap (daemon boot). */
+  markWake(nowMs?: number): WakeGateState;
 }
 
 /**
@@ -129,6 +131,10 @@ export function createWakeGate(
   return {
     observe,
     reset: (nowMs = now()) => { state = freshWakeGateState(nowMs); },
+    markWake: (nowMs = now()) => {
+      state = { lastBeatMs: nowMs, lastWakeMs: nowMs, wakeId: state.wakeId + 1 };
+      return state;
+    },
   };
 }
 
@@ -163,6 +169,23 @@ export function observeNow(nowMs = Date.now()): WakeGateState {
 
 export function wakeGateStatus(nowMs = Date.now()): WakeGateStatus {
   return wakeGateStatusOf(observeNow(nowMs), nowMs, wakeSettleMs());
+}
+
+/**
+ * Daemon boot counts as a wake (2026-10-04 review): launchd restarts the bot
+ * on a watchdog exit(70) or a crash, and those have happened INSIDE macOS
+ * maintenance wakes. A process born in an ~8s DarkWake would otherwise start
+ * with the gate open and launch a generation Venice bills after the host
+ * sleeps again. Cost: Venice work waits BOT_WAKE_GATE_SEC after every
+ * restart. Called from index.ts main() only, so tests and probes are not
+ * held.
+ */
+export function noteDaemonBoot(nowMs = Date.now()): void {
+  processGate.markWake(nowMs);
+  const settle = wakeSettleMs();
+  if (settle > 0) {
+    console.log(`🌙 daemon boot — holding Venice work for ${Math.round(settle / 1000)}s of continuous uptime (wake gate)`);
+  }
 }
 
 /** Did the host sleep after `startMs`? Observes the clock first. */

@@ -83,6 +83,7 @@ import { runEarningSurfacesTick } from "./earning-surfaces.js";
 import { runSettlementsTick } from "./settlements.js";
 import { maybeWarnVeniceBalance } from "./venice-balance.js";
 import { standDownSkip } from "./venice-breaker.js";
+import { noteDaemonBoot } from "./wake-gate.js";
 import { runApiMarketplaceTick } from "./api-marketplace-sell.js";
 import { runProjectsReviewTick, runExecScoringTick } from "./projects.js";
 import { runPeerReviewTick } from "./peer-review.js";
@@ -2682,6 +2683,9 @@ async function main() {
   try {
     const lock = acquireInstanceLock();
     if ("pid" in lock) console.log(`🔒 instance lock acquired (pid ${lock.pid}, rev ${lock.gitRev ?? "?"})`);
+    // A restart may land inside a macOS maintenance wake: hold Venice work
+    // until the host has been awake BOT_WAKE_GATE_SEC (wake-gate.ts).
+    noteDaemonBoot();
   } catch (err) {
     console.error(`✗ ${(err as Error).message}`);
     process.exit(1);
