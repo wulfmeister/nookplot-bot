@@ -3,6 +3,7 @@ import { Agent, fetch as undiciFetch } from "undici";
 import { effortFor } from "./models.js";
 import { recordFailedVeniceCall, recordVeniceCall, shouldFireDailyAlert, veniceSpentToday } from "./venice-cost.js";
 import { VeniceStandDownError, classifyVeniceBillingError, noteVeniceError, veniceStandingDown } from "./venice-breaker.js";
+import { HostSleepInterruptError, VeniceWakeGateError, hostSleptSince, wakeGateStatus } from "./wake-gate.js";
 
 export interface VeniceParameters {
   include_venice_system_prompt?: boolean;
@@ -212,6 +213,12 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
   // failed-attempt lockout. See venice-breaker.ts.
   const standDown = veniceStandingDown();
   if (standDown.active) throw new VeniceStandDownError(standDown);
+  // Wake gate (wake-gate.ts): right after the host wakes from sleep, start
+  // nothing until it has been continuously awake for BOT_WAKE_GATE_SEC. A call
+  // started in an ~8s maintenance wake is billed by Venice after the host
+  // sleeps again (10-03: a whole day's allowance). Refused calls send nothing.
+  const gate = wakeGateStatus();
+  if (gate.closed) throw new VeniceWakeGateError(gate);
   assertVeniceKey();
   const maxAttempts = 3;
   let lastErr: Error | null = null;
@@ -251,6 +258,13 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
       if (sd.active) {
         if (lastErr) fail(lastErr, lastCls.isAbort, lastCls.causeCode);
         throw new VeniceStandDownError(sd);
+      }
+      // Same for the wake gate: a retry right after a wake would start a
+      // generation in a maintenance blip.
+      const wg = wakeGateStatus();
+      if (wg.closed) {
+        if (lastErr) fail(lastErr, lastCls.isAbort, lastCls.causeCode);
+        throw new VeniceWakeGateError(wg);
       }
     }
     const attemptStart = Date.now();
@@ -335,6 +349,15 @@ export async function chat(messages: ChatMessage[], opts: ChatOptions = {}) {
         try {
           recordVeniceCall({ model, outcome: "rate-limited" });
         } catch { /* telemetry must never break the call */ }
+      }
+      // The host slept while this attempt was in flight (wake-gate.ts saw the
+      // wall clock jump). The abort/transport error is the sleep, not the
+      // model, and Venice has likely billed the generation already: never
+      // retry it. Billing errors (402/429) keep their own path above.
+      if ((cls.isAbort || cls.transient) && !/Venice API (?:402|429)\b/.test(lastErr.message) && hostSleptSince(attemptStart)) {
+        // causeCode omitted: the ledger cause should name the sleep, not the
+        // socket error the sleep produced.
+        throw fail(new HostSleepInterruptError(Date.now() - attemptStart), true);
       }
       // A 400 rejecting our (floored) max_tokens means this model's completion
       // limit is below the floor — halve and retry instead of failing.

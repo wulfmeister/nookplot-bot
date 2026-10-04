@@ -140,7 +140,7 @@ export function challengeBaseReward(c: Pick<Challenge, "baseReward" | "difficult
 /** Failures that say nothing about whether we can solve this KIND: the
  *  inference account, the network, the gateway's own 5xx, IPFS. */
 const INFRA_FAILURE =
-  /Venice API (?:402|429|5\d\d)|spend limit|Insufficient USD|Diem balance|VENICE_API_KEY missing|Inference processing failed|overloaded|fetch failed|operation was aborted|ECONNRESET|ETIMEDOUT|ECONNREFUSED|socket hang up|\bstand(?:ing|s)?[- ]?down\b|\bstood down\b|Gateway request failed \(5\d\d\)|<!DOCTYPE html|IPFS upload failed|Failed to pin|unexpected error while recording/i;
+  /Venice API (?:402|429|5\d\d)|spend limit|Insufficient USD|Diem balance|VENICE_API_KEY missing|Inference processing failed|overloaded|fetch failed|operation was aborted|ECONNRESET|ETIMEDOUT|ECONNREFUSED|socket hang up|\bstand(?:ing|s)?[- ]?down\b|\bstood down\b|wake-gate|interrupted by host sleep|Gateway request failed \(5\d\d\)|<!DOCTYPE html|IPFS upload failed|Failed to pin|unexpected error while recording/i;
 
 /** Gateway refusals about the challenge's AVAILABILITY or our quota, not the
  *  quality of the solution: epoch cap, duplicate, guild locks, full

@@ -6,7 +6,7 @@ import { writeNote } from "./vault.js";
 import { NOOK_DIR, readJsonl, appendJsonl } from "./util.js";
 import { canVerifyNow, recordCrowdScore, recordVerifyLimitHit, isVerifyCapError } from "./quotas.js";
 import { recordAudit } from "./audit.js";
-import { standDownSkip } from "./venice-breaker.js";
+import { isVeniceBillingError, standDownSkip } from "./venice-breaker.js";
 import {
   finalizedSubmissionSkip,
   FINALIZED_TTL_MS,
@@ -251,6 +251,10 @@ export async function scoreCrowdJurySubmissions(
         continue;
       }
       console.warn(`   ⚠ ${idShort}: ${msg.slice(0, 200)}`);
+      // A billing refusal, stand-down or host-sleep interruption says nothing
+      // about the submission. Every logged id is "seen" forever (loadSeen), so
+      // logging it would drop a real candidate for good: stop the tick instead.
+      if (isVeniceBillingError(msg)) break;
       appendJsonl(CROWD_LOG, { ts: new Date().toISOString(), submissionId: sub.id, score: 0, outcome: "error", notes: msg.slice(0, 200) });
     }
   }

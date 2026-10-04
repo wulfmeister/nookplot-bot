@@ -51,6 +51,7 @@
  * ENV: BOT_VENICE_STANDDOWN=0 disables the breaker (calls go through as before).
  */
 
+import { isWakeGateOrSleepError, wakeGateStatus } from "./wake-gate.js";
 export const LOCKOUT_PAUSE_MS = 30 * 60_000;
 export const UNKNOWN_402_PAUSE_MS = 30 * 60_000;
 /** Added after the refill boundary so the first call doesn't race the refill. */
@@ -164,6 +165,7 @@ let kind: StandDownKind | null = null;
 let pauseId = 0;
 let knownNextEpoch: string | null = null;
 const loggedPauseByLoop = new Map<string, number>();
+const loggedWakeByLoop = new Map<string, number>();
 /** When the current pause began (its first refusal). Readings sent earlier may predate it. */
 let pauseStartedMs = 0;
 /** A reading sent during the current pause reported `accessPermitted: false`. */
@@ -362,6 +364,9 @@ export function isVeniceStandDownError(err: unknown): boolean {
 export function isVeniceBillingError(text: string | undefined | null): boolean {
   if (!text) return false;
   if (text.includes(STAND_DOWN_PREFIX)) return true;
+  // Wake-gate refusals and sleep-interrupted calls (wake-gate.ts) say nothing
+  // about the work either: the host was asleep, not the challenge bad.
+  if (isWakeGateOrSleepError(text)) return true;
   return classifyVeniceBillingError(text) !== null;
 }
 
@@ -374,6 +379,20 @@ export function standDownSkip(
   nowMs = Date.now(),
   log: (line: string) => void = (line) => console.log(line),
 ): boolean {
+  // Wake gate (wake-gate.ts): after the host wakes from sleep, hold Venice work
+  // until it has been continuously awake for BOT_WAKE_GATE_SEC. Brief
+  // maintenance wakes (~8s) then never start a generation that Venice bills
+  // after the host sleeps again. Logs once per loop per wake.
+  // Real clock on purpose: nowMs is injectable for stand-down tests, and a
+  // fake time must never read as a clock jump (a "wake").
+  const gate = wakeGateStatus();
+  if (gate.closed) {
+    if (loggedWakeByLoop.get(loop) !== gate.wakeId) {
+      loggedWakeByLoop.set(loop, gate.wakeId);
+      log(`⏸ ${loop} skipped: host woke ${Math.round(gate.wokeAgoMs / 1000)}s ago — waiting ${Math.round(gate.remainingMs / 1000)}s more (wake gate)`);
+    }
+    return true;
+  }
   const s = veniceStandingDown(nowMs);
   if (!s.active) return false;
   if (loggedPauseByLoop.get(loop) !== s.pauseId) {

@@ -4,6 +4,52 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-10-04 — wake gate: sleep-time Venice drains were our own calls
+
+**Measured, not guessed.** Joining the new balance readings
+(`venice-balance.jsonl`), the ledger (including the new failed-call rows) and
+`pmset -g log` for 10-02 → 10-04:
+- While the laptop was awake, each 30-min balance drop matched the ledger to
+  within ±$0.02.
+- During the sleep from 10-02 06:49Z to 10-03 15:04Z (38 maintenance
+  "DarkWakes", ~8s each), money left the key with almost no completed calls.
+  29 `timeout` rows each landed 0-1s after a wake, with 1.7-3.2h of wall time
+  elapsed, and the unexplained drop per row (~$0.10-0.21) matched one GPT-6.1
+  Sol generation.
+
+Mechanism: a DarkWake fires the bot's timers, a tick starts a chat() call, the
+host sleeps again mid-generation, and Venice finishes and bills it. On the next
+blip the call "times out" and chat()'s one abort-retry starts another billed
+generation. On 10-03 this used the whole day's allowance by 15:19Z, 15 minutes
+after the laptop properly woke, so the bot stood down and made **0 solves**
+that day. All 6 python "aborted" errors since 10-02 were this cycle; mining
+while awake was 21 of 21 accepted. The 09-27/28 clamshell weekend (31
+DarkWakes) fits the same pattern.
+
+**Correction:** entries (c)/(d) and the 10-02 entry called these drains
+unexplained, possibly another consumer of the account. For the sleep cases
+that was wrong: it was this bot. The 10-01 00:22-03:46Z drop (laptop awake,
+no sleep events) is still unexplained.
+
+**Fix** (`src/wake-gate.ts`, sleep-tolerant; it never prevents sleep):
+- A 15s heartbeat; a wall-clock gap over 60s means the host slept.
+- After a wake, no Venice call starts until the host has been continuously
+  awake for `BOT_WAKE_GATE_SEC` (default 300s). DarkWakes last ~8s (p90 13s;
+  1 of 160 ran past 300s), so they never start a generation. chat() refuses
+  with no request sent, and every loop that checks the stand-down
+  (`standDownSkip`) also skips, logging once per wake.
+- A call the host slept through is never retried; it throws "Venice call
+  interrupted by host sleep" and its ledger row names the sleep.
+- Those errors are non-work failures everywhere: mining and learnings don't
+  mark work done, verify retries later with no strike or streak, the ranker
+  excludes them, and crowd-jury no longer logs a billing/sleep error as a
+  permanently "seen" candidate (the same class the stand-down review flagged).
+
+Verified: 14 new tests (880/880), plus chat() against a local fake server:
+transport drop or timeout during a simulated sleep → 1 request, no retry;
+timeout without sleep → unchanged (one retry); right after a wake → refused
+with 0 requests.
+
 ## 2026-10-02 — every model → openai-gpt-61-sol, probed before it went live
 
 Operator: "switch all models to chatgpt 6.1-sol on venice, then test the

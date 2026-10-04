@@ -41,6 +41,7 @@
 import { isDiversityBlockError, isFinalizedError, isReciprocalVerificationError } from "./skip-caches.js";
 import { isVerifyCapError } from "./quotas.js";
 import { STAND_DOWN_PREFIX } from "./venice-breaker.js";
+import { isWakeGateOrSleepError } from "./wake-gate.js";
 
 /** 422 "complete the comprehension challenge before verifying" or ARTIFACT_INSPECTION_REQUIRED. */
 export function isComprehensionGateError(msg: string): boolean {
@@ -79,6 +80,7 @@ export type VerifyErrorKind =
   | "rate"               // known rate limits: gateway cooldown / "rate limit" 429, any Venice 429
   | "transport"          // fetch failed / ECONNRESET / DNS / socket errors
   | "unavailable"        // 502/503/504: proxy/host down (Cloudflare HTML pages, blackouts)
+  | "host-sleep"         // wake-gate refusal or a call the laptop slept through (wake-gate.ts)
   // Temporary but possibly deterministic for this submission: retry later, strike.
   | "unknown-429"        // gateway 429 we don't recognise: maybe a reworded permanent block
   | "server"             // 500 from the gateway, or a Venice 500 "Inference processing failed"
@@ -139,6 +141,9 @@ export function classifyVerifyError(rawMsg: string): VerifyErrorClass {
   if (isDiversityBlockError(msg)) return PERMANENT("diversity");
   if (isReciprocalVerificationError(msg)) return PERMANENT("reciprocal");
   if (isComprehensionGateError(msg)) return PERMANENT("comprehension-gate");
+  // The host slept: says nothing about the submission or the key. Retry later,
+  // no strike, no ceiling, no streak (sleep is routine, not a failure run).
+  if (isWakeGateOrSleepError(msg)) return LOOP_STOP("host-sleep", false);
   if (isVerifyCapError(msg)) return LOOP_STOP("verify-cap", false);
   if (isVeniceBudgetError(msg)) return LOOP_STOP("budget", true);
 
