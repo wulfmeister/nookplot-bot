@@ -86,33 +86,79 @@ export function wakeSettleMs(env: NodeJS.ProcessEnv = process.env): number {
   return Number.isFinite(n) && n >= 0 ? n * 1000 : WAKE_SETTLE_MS_DEFAULT;
 }
 
-// ── process-wide state ─────────────────────────────────────────────────────
+// ── detector: state + heartbeat ────────────────────────────────────────────
 
-let state: WakeGateState = freshWakeGateState(Date.now());
-let heartbeat: ReturnType<typeof setInterval> | null = null;
-
-function ensureHeartbeat(): void {
-  if (heartbeat) return;
-  heartbeat = setInterval(() => observeNow(), WAKE_HEARTBEAT_MS);
-  // Never keeps a script (probe, test) alive on its own.
-  heartbeat.unref?.();
+export interface WakeGate {
+  /** Fold the clock reading into the state (and log a detected wake). */
+  observe(nowMs?: number): WakeGateState;
+  /** Tests only: start over with no wake recorded. */
+  reset(nowMs?: number): void;
 }
+
+/**
+ * A wake detector bound to a clock and a timer. The heartbeat starts HERE, at
+ * construction — module load for the process-wide one — and never lazily on
+ * the first observation.
+ *
+ * Why (fixed 2026-10-04, the day the gate shipped): the state is seeded with
+ * the time of construction, so with a lazy heartbeat the first observation
+ * measured the gap since IMPORT. Any first gate check more than 60s after boot
+ * (connect retries during a slow gateway, claimRewards, the 30s verify-poll
+ * delay) read as a wake: a phantom "🌙 host woke from sleep" and 5 minutes
+ * of Venice work held with no sleep at all. Reproduced: import, wait 65s,
+ * check → closed, wakeId 1. Phantom wake lines also make the log useless for
+ * sleep forensics, which is half of what the 🌙 line is for.
+ *
+ * Residual (UNVERIFIED in production): a synchronous stall of the event loop
+ * past WAKE_GAP_MS also delays the beat and reads as a wake. Nothing in the
+ * bot is known to block that long.
+ */
+export function createWakeGate(
+  now: () => number,
+  startHeartbeat: (beat: () => void, periodMs: number) => void,
+  onWake: (s: WakeGateState) => void = () => {},
+): WakeGate {
+  let state = freshWakeGateState(now());
+  const observe = (nowMs = now()): WakeGateState => {
+    const prevWake = state.wakeId;
+    state = observeClock(state, nowMs);
+    if (state.wakeId !== prevWake) onWake(state);
+    return state;
+  };
+  startHeartbeat(() => { observe(); }, WAKE_HEARTBEAT_MS);
+  return {
+    observe,
+    reset: (nowMs = now()) => { state = freshWakeGateState(nowMs); },
+  };
+}
+
+// ── process-wide instance ──────────────────────────────────────────────────
+
+// Declared before processGate: createWakeGate starts the heartbeat while it
+// constructs, i.e. during this module's evaluation.
+let processHeartbeat: ReturnType<typeof setInterval> | null = null;
+
+const processGate = createWakeGate(
+  () => Date.now(),
+  (beat, periodMs) => {
+    processHeartbeat = setInterval(beat, periodMs);
+    // unref: never keeps a script (probe, test) alive on its own.
+    processHeartbeat.unref?.();
+  },
+  () => {
+    const settle = wakeSettleMs();
+    if (settle > 0) {
+      console.log(`🌙 host woke from sleep — holding Venice work for ${Math.round(settle / 1000)}s of continuous uptime (wake gate)`);
+    }
+  },
+);
 
 /**
  * Observe the clock now. Every gate check calls this first, so a timer that
  * fires on resume before the heartbeat does still sees the gap.
  */
 export function observeNow(nowMs = Date.now()): WakeGateState {
-  ensureHeartbeat();
-  const prevWake = state.wakeId;
-  state = observeClock(state, nowMs);
-  if (state.wakeId !== prevWake) {
-    const settle = wakeSettleMs();
-    if (settle > 0) {
-      console.log(`🌙 host woke from sleep — holding Venice work for ${Math.round(settle / 1000)}s of continuous uptime (wake gate)`);
-    }
-  }
-  return state;
+  return processGate.observe(nowMs);
 }
 
 export function wakeGateStatus(nowMs = Date.now()): WakeGateStatus {
@@ -149,5 +195,10 @@ export function isWakeGateOrSleepError(text: string | undefined | null): boolean
 
 /** Tests only. */
 export function _resetWakeGateForTests(nowMs = Date.now()): void {
-  state = freshWakeGateState(nowMs);
+  processGate.reset(nowMs);
+}
+
+/** Tests only: was the process-wide heartbeat started (at module load)? */
+export function _wakeGateHeartbeatStartedForTests(): boolean {
+  return processHeartbeat !== null;
 }

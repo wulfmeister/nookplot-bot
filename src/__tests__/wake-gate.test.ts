@@ -6,8 +6,11 @@ import {
   HostSleepInterruptError,
   VeniceWakeGateError,
   WAKE_GAP_MS,
+  WAKE_HEARTBEAT_MS,
   WAKE_SETTLE_MS_DEFAULT,
+  type WakeGateState,
   _resetWakeGateForTests,
+  createWakeGate,
   freshWakeGateState,
   isWakeGateOrSleepError,
   observeClock,
@@ -89,6 +92,73 @@ describe("wake gate: clock observations", () => {
     assert.equal(wakeSettleMs({ BOT_WAKE_GATE_SEC: "120" }), 120_000);
     assert.equal(wakeSettleMs({ BOT_WAKE_GATE_SEC: "-5" }), SETTLE);
     assert.equal(wakeSettleMs({ BOT_WAKE_GATE_SEC: "abc" }), SETTLE);
+  });
+});
+
+describe("wake gate: the heartbeat starts at construction (no phantom wake at boot)", () => {
+  // Fake clock + fake timer: `beat` is whatever createWakeGate registered.
+  function harness() {
+    const h = {
+      now: T0,
+      beat: null as (() => void) | null,
+      periods: [] as number[],
+      wakes: [] as WakeGateState[],
+    };
+    const gate = createWakeGate(
+      () => h.now,
+      (beat, periodMs) => { h.beat = beat; h.periods.push(periodMs); },
+      (s) => h.wakes.push(s),
+    );
+    return { h, gate };
+  }
+
+  it("registers the heartbeat during construction, before any observation", () => {
+    const { h } = harness();
+    assert.equal(h.periods.length, 1, "heartbeat must start at construction, not on the first gate check");
+    assert.equal(h.periods[0], WAKE_HEARTBEAT_MS);
+    assert.ok(h.beat);
+  });
+
+  it("65s awake after boot with no gate check is NOT a wake (the 10-04 phantom-wake repro)", () => {
+    const { h, gate } = harness();
+    // Boot: connect retries + claimRewards take 65s; only the heartbeat runs.
+    for (h.now = T0 + WAKE_HEARTBEAT_MS; h.now <= T0 + 65_000; h.now += WAKE_HEARTBEAT_MS) h.beat!();
+    h.now = T0 + 65_000;
+    const s = gate.observe();
+    assert.equal(s.wakeId, 0, "no sleep happened");
+    assert.equal(h.wakes.length, 0, "no 🌙 line");
+    assert.equal(wakeGateStatusOf(s, h.now, SETTLE).closed, false, "Venice work not held");
+  });
+
+  it("a frozen process (no beats for 65s: the host slept) is still a wake", () => {
+    const { h, gate } = harness();
+    h.now = T0 + 65_000;
+    const s = gate.observe();
+    assert.equal(s.wakeId, 1);
+    assert.equal(h.wakes.length, 1);
+    assert.equal(wakeGateStatusOf(s, h.now, SETTLE).closed, true);
+  });
+
+  it("the heartbeat alone detects a wake and reports it (the 🌙 line) with no gate check", () => {
+    const { h, gate } = harness();
+    h.now = T0 + WAKE_HEARTBEAT_MS;
+    h.beat!();
+    h.now = T0 + 2 * 3600_000; // slept 2h; the first thing to run on resume is the beat
+    h.beat!();
+    assert.equal(h.wakes.length, 1);
+    assert.equal(h.wakes[0].lastWakeMs, h.now);
+    // A gate check 1s later sees the same wake, not a second one.
+    h.now += 1_000;
+    assert.equal(gate.observe().wakeId, 1);
+    assert.equal(h.wakes.length, 1);
+  });
+
+  it("reset forgets the wake", () => {
+    const { h, gate } = harness();
+    h.now = T0 + 3600_000;
+    gate.observe();
+    gate.reset();
+    assert.equal(wakeGateStatusOf(gate.observe(), h.now, SETTLE).closed, false);
   });
 });
 
