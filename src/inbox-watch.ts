@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { writeFileSync } from "node:fs";
 import type { NookplotRuntime } from "@nookplot/runtime";
 import { NOOK_DIR, readJsonl, appendJsonl } from "./util.js";
-import { jevTriageMessage, compareTriage, labelTriage, TRIAGE_ICON, REPLIED_TRIAGE, type InboxTriage } from "./jev.js";
+import { jevTriageMessage, compareTriage, labelTriage, TRIAGE_ICON, fixedTriageFor, type InboxTriage } from "./jev.js";
 
 type RuntimeLike = Pick<NookplotRuntime, "connection">;
 
@@ -91,8 +91,9 @@ export async function runInboxWatchTick(runtime: RuntimeLike): Promise<void> {
     if (triaged >= TRIAGE_MAX_PER_TICK) break;
     const key = threadKey(t);
     const text = String(t.lastMessage ?? "").trim();
-    // Our own outbound message: fixed "replied" state, no Jev call.
-    if (t.direction === "sent") continue;
+    // Our own outbound message ("replied") or a gateway system notice ("act"):
+    // fixed label, no Jev call.
+    if (fixedTriageFor(t)) continue;
     if (triageByKey.has(key) || !text) continue;
     const triage = await jevTriageMessage({ from: t.otherName ?? t.otherAddress, messageType: t.messageType, text });
     if (!triage) break; // Jev paused/disabled/failing — stop, try next tick
@@ -100,7 +101,7 @@ export async function runInboxWatchTick(runtime: RuntimeLike): Promise<void> {
     triaged++;
     appendJsonl(TRIAGE_LOG, { ts: new Date().toISOString(), key, threadId: t.id ?? t.threadId, from: t.otherName ?? t.otherAddress, triage });
   }
-  const triageOf = (t: InboxThread) => (t.direction === "sent" ? REPLIED_TRIAGE : triageByKey.get(threadKey(t)) ?? null);
+  const triageOf = (t: InboxThread) => fixedTriageFor(t) ?? triageByKey.get(threadKey(t)) ?? null;
 
   // Snapshot for the dashboard (always overwrite with the current view).
   const snapshot = {

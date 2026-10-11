@@ -1732,6 +1732,22 @@ export async function fetchOpenChallengesPaged(
  */
 const UNSERVABLE_SOURCE_TYPES = new Set(["rlm_trajectory", "distillation_request", "project_improvement"]);
 
+/**
+ * Does this challenge name OUR agent (2026-10-11, operator)? The gateway
+ * auto-posts citation_audit challenges about specific agents; 5 named us and
+ * we solved all 5 — 4 paid (~430k NOOK) and 2 verified PUBLIC traces concluded
+ * "Verdict: gaming" about our own agent. Auditing ourselves is a conflict of
+ * interest and a reputational own-goal, so skip any challenge whose title or
+ * description contains our address. BOT_SKIP_SELF_AUDITS=0 re-enables.
+ */
+export function namesOwnAgent(ch: Pick<Challenge, "title" | "description">, myAddress: string): boolean {
+  if (process.env.BOT_SKIP_SELF_AUDITS === "0") return false;
+  const addr = myAddress.trim().toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(addr)) return false;
+  const text = `${ch.title ?? ""}\n${ch.description ?? ""}`.toLowerCase();
+  return text.includes(addr);
+}
+
 export function challengeFitsBudget(ch: Challenge): boolean {
   if (ch.status && ch.status !== "open") return false;
   if (ch.submissionCount !== undefined && ch.maxSubmissions !== undefined && ch.submissionCount >= ch.maxSubmissions) return false;
@@ -1966,6 +1982,7 @@ async function discoverAndSolveMiningChallengesInner(
     if (!challengeFitsBudget(c)) return false;
     if (attempted.has(c.id)) return false;
     if (opts.myAddress && c.posterAddress?.toLowerCase() === opts.myAddress.toLowerCase()) return false;
+    if (opts.myAddress && namesOwnAgent(c, opts.myAddress)) return false;
     return true;
   };
 

@@ -726,7 +726,15 @@ async function refreshBotStatus() {
   }
 }
 
+let loadAllRunning = false;
 async function loadAll() {
+  // Skip a refresh while the previous one is still loading (2026-10-08: slow
+  // gateway made each load >30s, so the 30s timer stacked requests).
+  if (loadAllRunning) return;
+  loadAllRunning = true;
+  try { await loadAllInner(); } finally { loadAllRunning = false; }
+}
+async function loadAllInner() {
   document.getElementById("last-refresh").textContent = "loading…";
   try {
     const [snap, net, mining, verify, claims, earn, log, st, cr, fn, ep, pr, mp, experiments, ib, cap] = await Promise.all([

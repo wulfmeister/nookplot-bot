@@ -74,7 +74,7 @@ export function assessVeniceBalance(
   return (
     `Venice balance low: ${spendable.toFixed(2)} spendable (DIEM ${b.diem.toFixed(2)}, ` +
     `USD ${b.usd.toFixed(2)}) < ${threshold} — inference will 402 when it hits zero ` +
-    `(2026-08-05: ~5.7h outage, ~3 slots lost).${refill} Top up manually: npm run buy-credits. ` +
+    `(2026-08-05: ~5.7h outage, ~3 slots lost).${refill} Top up at https://venice.ai/settings/api (npm run buy-credits buys Nookplot gateway credits, not Venice). ` +
     `This reads account balances only: it cannot see a per-API-key DIEM/USD spend limit, which 402s every call ` +
     `even while the account has balance (2026-10-01).`
   );

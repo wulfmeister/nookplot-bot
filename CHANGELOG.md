@@ -4,6 +4,47 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-10-11 — credit burners off, citation loop fixed, self-audits skipped, dashboard blockers
+
+Re-checked against fresh data before acting (operator: "do it all").
+
+**Status 10-04 → 10-11.** Solving hit the 1,575,000 cap on every claim from
+10-07 to 10-11. GPT-6.1 Sol python_tests 62 verified / 10 rejected; standards
+2 verified, 9 rejected, 11 expired (the scoring farm). **The wake gate passed
+its first real sleeps** (from 10-08): 5 wakes caught, zero calls billed while
+asleep. The Venice key still empties most days, but in each draining window
+the bot logged no calls at all (one window spanned a sleep), so that spend is
+not this bot; the operator is checking per-key usage.
+
+**Changed:**
+- `.env`: exec re-run job off (`BOT_EXEC_SCORING_AUTO=0`, ~67% of gateway
+  credit burn, `exec` flat since 07-16), per-solve workspace logging off
+  (`BOT_WORKSPACE_SOLVE=0`, ~30%, never moved `commits`), project drafter off
+  (`BOT_PROJECTS_AUTO_PREVIEW=0`: 2 projects since July, 0 NOOK, `projects`
+  capped at 5,000). The pending duplicate safe-path draft was passed.
+- **Citation loop:** a target is cited at most once ever (each peer resolves
+  to one knowledge node, so the loop had re-cited ~5 nodes, one pair 64
+  times), the three farm accounts are never cited, and the quality floor
+  defaults to the documented 50 instead of 0. In practice this nearly retires
+  the loop, which never paid a claim.
+- **Self-audits:** challenges whose text names our own address are skipped
+  (`BOT_SKIP_SELF_AUDITS`). We had solved 5; 2 public traces concluded
+  "Verdict: gaming" about our own agent.
+- **Dashboard:** blockers for exhausted gateway credits and a refusing Venice
+  key (neither was flagged on 10-08); gateway timeout 20s → 45s; one shared,
+  20s-cached snapshot build instead of a new one per refresh; the page skips
+  a refresh while the last is still loading.
+- Gateway system notices (from our own address) are labelled "act" in the
+  inbox, not "replied". A zero-income epoch now logs a line. The Venice
+  low-balance warning no longer points at `buy-credits` (that buys gateway
+  credits).
+
+**Dropped after re-checking:** buying a credit pack now (python dry-runs pass
+at zero credits; revisit when a settlement root appears) and python-first all
+day (the cap binds even with standards in the mix).
+
+896/896 tests (+7).
+
 ## 2026-10-04 — wake gate: sleep-time Venice drains were our own calls
 
 **Measured, not guessed.** Joining the new balance readings

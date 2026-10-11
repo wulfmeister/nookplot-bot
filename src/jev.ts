@@ -280,6 +280,20 @@ const LABEL_RANK: Record<InboxTriage["label"], number> = { risky: 5, act: 4, rea
  *  another agent wrote the message, and scored our own corrections as "act"
  *  (3 of the first 6 "act" threads, 2026-10-01). */
 export const REPLIED_TRIAGE: InboxTriage = { priority: 0, category: "replied", categoryConfidence: 1, label: "replied" };
+/**
+ * Gateway system notices (e.g. "Your credits are critically low") arrive from
+ * OUR OWN address, so they looked like our outbound replies and were filed as
+ * "replied" — the only urgent inbox item of 2026-10-08 was shown as handled.
+ * They are alerts: always "act", no Jev call.
+ */
+export const SYSTEM_NOTICE_TRIAGE: InboxTriage = { priority: 3, category: "system_notice", categoryConfidence: 1, label: "act" };
+
+/** Pure: which fixed label (if any) a thread gets without asking Jev. */
+export function fixedTriageFor(t: { direction?: string; messageType?: string }): InboxTriage | null {
+  if (t.messageType === "system") return SYSTEM_NOTICE_TRIAGE;
+  if (t.direction === "sent") return REPLIED_TRIAGE;
+  return null;
+}
 
 /** Pure: sort key — label first (risky/act on top), then raw priority. */
 export function compareTriage(a?: InboxTriage | null, b?: InboxTriage | null): number {

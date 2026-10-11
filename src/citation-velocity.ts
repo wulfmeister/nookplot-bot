@@ -23,7 +23,7 @@
  */
 import { join } from "node:path";
 import type { NookplotRuntime } from "@nookplot/runtime";
-import { NOOK_DIR, appendJsonl, sleep } from "./util.js";
+import { NOOK_DIR, appendJsonl, readJsonl, sleep } from "./util.js";
 
 type RuntimeLike = Pick<NookplotRuntime, "connection">;
 
@@ -33,10 +33,47 @@ const LOG_PATH = join(NOOK_DIR, "citation-velocity.jsonl");
 const MAX_CITATIONS_PER_TICK = 3;
 
 // Quality floor for peer learnings we'll cite. Real gateway response
-// has `upvote_count` rather than a 0-100 quality score; we use 0+ as
-// floor (i.e. accept everything) since `network-learnings` is already
-// gateway-curated by quality. Override via BOT_CITATION_QUALITY_FLOOR.
-const PEER_QUALITY_FLOOR = Number(process.env.BOT_CITATION_QUALITY_FLOOR ?? 0);
+// has `upvote_count` rather than a 0-100 quality score. The default was 0
+// (accept everything) while AGENTS.md documented 50; on 2026-10-11 the loop
+// had sent 4,509+ citations, only 10 at quality >=50, two public
+// citation_audit traces called our pattern "gaming", and citations never
+// paid a claim. Default is now the documented 50 (operator, 10-11).
+// Override via BOT_CITATION_QUALITY_FLOOR.
+const PEER_QUALITY_FLOOR = Number(process.env.BOT_CITATION_QUALITY_FLOOR ?? 50);
+
+// Authors we never cite: the template/sybil farm accounts identified
+// 2026-09-20/27 (address prefixes). 116 of 351 citations 10-08→11 went to
+// them. Extend via BOT_CITATION_EXCLUDE_AUTHORS (comma-separated prefixes).
+const DEFAULT_EXCLUDED_AUTHOR_PREFIXES = ["0x2677e9ed", "0x7354b0ac", "0x8432a8c4"];
+
+export function excludedAuthorPrefixes(env: NodeJS.ProcessEnv = process.env): string[] {
+  const extra = (env.BOT_CITATION_EXCLUDE_AUTHORS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  return [...DEFAULT_EXCLUDED_AUTHOR_PREFIXES, ...extra];
+}
+
+/** Target items we have already cited, from the log (lifetime). */
+export function citedTargetsFromLog(rows: Array<{ kind?: string; targetItemId?: string }>): Set<string> {
+  const out = new Set<string>();
+  for (const r of rows) if (r.kind === "citation" && r.targetItemId) out.add(r.targetItemId);
+  return out;
+}
+
+/**
+ * Pure gate for one candidate citation. A target is cited at most ONCE ever:
+ * the peer id resolves to the author's single knowledge node, so without
+ * this every tick re-cited the same ~5 nodes (one pair 64 times).
+ */
+export function citationAllowed(
+  peerAddr: string,
+  peerId: string,
+  alreadyCited: Set<string>,
+  excludedPrefixes: string[] = excludedAuthorPrefixes(),
+): { ok: boolean; reason?: string } {
+  const a = peerAddr.toLowerCase();
+  if (excludedPrefixes.some((p) => a.startsWith(p))) return { ok: false, reason: "excluded author" };
+  if (alreadyCited.has(peerId)) return { ok: false, reason: "already cited" };
+  return { ok: true };
+}
 
 const CITATION_TYPES = ["extends", "supports", "derives_from"] as const;
 type CitationType = (typeof CITATION_TYPES)[number];
@@ -278,6 +315,11 @@ export async function runCitationVelocityTick(
   // For each domain, browse peers and cite high-quality ones
   let citationsThisTick = 0;
   const me = myAddress.toLowerCase();
+  let alreadyCited = new Set<string>();
+  try {
+    alreadyCited = citedTargetsFromLog(readJsonl(LOG_PATH) as Array<{ kind?: string; targetItemId?: string }>);
+  } catch { /* no log yet */ }
+  const excluded = excludedAuthorPrefixes();
   for (const domain of domains) {
     if (citationsThisTick >= MAX_CITATIONS_PER_TICK) break;
     const peers = await browseNetworkLearnings(runtime, domain);
@@ -285,6 +327,7 @@ export async function runCitationVelocityTick(
       (p) =>
         peerAuthor(p) !== me &&
         peerAuthor(p) !== "" &&
+        !excluded.some((x) => peerAuthor(p).startsWith(x)) &&
         peerQuality(p) >= PEER_QUALITY_FLOOR,
     );
     if (candidates.length === 0) continue;
@@ -297,6 +340,7 @@ export async function runCitationVelocityTick(
       const peerAddr = peerAuthor(peer);
       const peerId = peerAddr ? await resolvePeerKnowledgeId(runtime, peerAddr, domain) : null;
       if (!peerId) continue;
+      if (!citationAllowed(peerAddr, peerId, alreadyCited, excluded).ok) continue;
       // Pick a relevant item of ours — prefer one in the same domain
       const mineCandidates = myByDomain.get(domain) ?? myItems;
       const mine = mineCandidates[Math.floor(Math.random() * mineCandidates.length)];
@@ -306,6 +350,7 @@ export async function runCitationVelocityTick(
       const res = await citePeer(runtime, myId, peerId, type);
       if (res.ok) {
         citationsThisTick++;
+        alreadyCited.add(peerId);
         console.log(
           `📎 cited peer ${peerId.slice(0, 8)} (${peerAuthor(peer).slice(0, 10)}, ` +
             `quality=${peerQuality(peer)}) → as "${type}" of our ${myId.slice(0, 8)}`,

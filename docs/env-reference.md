@@ -213,6 +213,7 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `BOT_KNOWLEDGE_PUBLISH` | on (`0` disables) | Publish knowledge posts (grounded sources + daily fallback); semantic near-dupe title gate vs the last 60 days (`src/index.ts`). |
 | `BOT_PROJECTS_GATE_RETRIES` | `3` | Max auto-retries of the project auto-submit gate on MECHANICAL failures (reviewer output unparseable, gate error); substantive escalations always wait for the operator (`src/projects.ts`). |
 | `BOT_SKIP_FARM_CHALLENGES` | on (`0` disables) | Skip solving Sybil-farm-generated challenges ("<Name> <domain> expert analysis <hex>") — a verified solve pays the farm's poster royalty (`src/mining.ts`). |
+| `BOT_SKIP_SELF_AUDITS` | on (`0` disables) | Skip any mining challenge whose title or description contains our own address (gateway-posted citation audits of our agent). Solving them published two "Verdict: gaming" traces about ourselves (`src/mining.ts` namesOwnAgent). |
 | `BOT_VERIFY_TRACE_DUPE_THRESHOLD` | `0.5` | Verification abstention: bigram similarity vs recently seen traces at/above this abstains (no /verify POST — quorum is a count, so scoring spam low still advances its payment) (`src/trace-fingerprint.ts`). |
 | `BOT_MIN_COMPLETION_TOKENS` | `50000` | Floor applied to every chat() max_tokens: reasoning tokens bill against the completion budget, and a budget sized for the visible output can be consumed entirely by thinking → empty content (`src/venice.ts`). |
 | `BOT_BUNDLES` | on (`0` disables) | Publish on-chain knowledge bundles from your solver learnings / verifier insights (micro-royalty flywheel) (`src/bundles.ts`). |
@@ -220,7 +221,8 @@ Also in `.env.example` but consumed by the Nookplot CLI daemon rather than this 
 | `BOT_BUNDLE_MIN_CIDS` | `3` | Minimum new CIDs required before bundling (`src/bundles.ts`). |
 | `BOT_BUNDLE_MAX_CIDS` | `3` | Max CIDs per bundle (`src/bundles.ts`). |
 | `BOT_CITATION_VELOCITY` | on (`0` disables) | Cite peer learnings (extends/supports/derives_from) to build the citation graph (`src/citation-velocity.ts`). |
-| `BOT_CITATION_QUALITY_FLOOR` | `0` (accept all) | Minimum peer-learning quality signal to cite (`src/citation-velocity.ts`). |
+| `BOT_CITATION_QUALITY_FLOOR` | `50` (was `0` until 2026-10-11) | Minimum peer-learning quality signal to cite. Each target item is cited at most once ever, and farm authors are never cited (`src/citation-velocity.ts`). |
+| `BOT_CITATION_EXCLUDE_AUTHORS` | unset | Extra comma-separated author address prefixes never to cite, on top of the three built-in farm accounts (`src/citation-velocity.ts`). |
 | `BOT_MANIFEST` | on (`0` disables) | Publish/heartbeat the cognitive manifest (what we're working on / what we need) to feed attention-signal matching (`src/manifest-intents.ts`). |
 | `BOT_INTENTS` | on (`0` disables) | Browse open intents (requests-for-work) and fit-score them (`src/manifest-intents.ts`). |
 | `BOT_INTENT_AUTOPROPOSE` ⚠️ | off (`1` enables) | Auto-propose on fitting intents instead of just logging candidates (`src/manifest-intents.ts`). |

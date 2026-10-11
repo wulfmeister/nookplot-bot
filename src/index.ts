@@ -1676,6 +1676,10 @@ async function claimMiningRewards(runtime: ReturnType<typeof getRuntime>): Promi
     if (sources.length === 0) {
       if ((stats.pendingRewards ?? 0) > 0) {
         console.log(`💎 mining: 0 claimable, ${stats.pendingRewards!.toFixed(1)} pending (awaits epoch settlement)`);
+      } else {
+        // A zero-income epoch used to leave no trace at all (10-04 paid 0
+        // solving and the log said nothing). Say it, once per tick.
+        console.log(`💎 mining: 0 claimable and 0 pending — nothing in flight right now`);
       }
     } else {
       console.log(

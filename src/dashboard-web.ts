@@ -63,7 +63,9 @@ async function gwGet<T>(path: string): Promise<T | null> {
   try {
     const r = await fetch(`${GATEWAY}${path}`, {
       headers: HEADERS,
-      signal: AbortSignal.timeout(20_000),
+      // 45s (was 20s): on 2026-10-08 gateway calls took 18-46s and the 20s abort
+      // blanked the credits/funnel/epoch panels exactly when they mattered.
+      signal: AbortSignal.timeout(45_000),
     });
     if (!r.ok) return null;
     return (await r.json()) as T;
@@ -201,7 +203,24 @@ interface VerifyStatsEntry {
   domain?: string;
 }
 
+// One shared in-flight snapshot plus a 20s cache (2026-10-08): a snapshot
+// makes ~11 gateway calls; with the gateway at 3-46s per call it ran past the
+// page's 30s refresh, and every open tab stacked a new full build on top of
+// the last one, adding load to an already slow gateway.
+let snapshotInFlight: Promise<Awaited<ReturnType<typeof buildSnapshotUncached>>> | null = null;
+let snapshotCache: { at: number; value: Awaited<ReturnType<typeof buildSnapshotUncached>> } | null = null;
+const SNAPSHOT_CACHE_MS = 20_000;
 async function buildSnapshot() {
+  if (snapshotCache && Date.now() - snapshotCache.at < SNAPSHOT_CACHE_MS) return snapshotCache.value;
+  if (!snapshotInFlight) {
+    snapshotInFlight = buildSnapshotUncached()
+      .then((value) => { snapshotCache = { at: Date.now(), value }; return value; })
+      .finally(() => { snapshotInFlight = null; });
+  }
+  return snapshotInFlight;
+}
+
+async function buildSnapshotUncached() {
   const wallet = MY_ADDR ? await getWalletBalances(MY_ADDR) : null;
   const [profile, stake, agentStats, mySubsRes, poolRes, epochRes, rlmRes, creditsRes, proofRes, contribRes, authorshipRes] = await Promise.all([
     gwGet<{ address: string; displayName?: string }>("/v1/agents/me"),
@@ -389,6 +408,11 @@ async function buildSnapshot() {
     claimable: agentStats?.claimableBalance ?? {},
     emergencyReserve: Boolean(epochRes?.epoch?.isEmergencyReserve),
     rlmExhausted: (rlmRes?.dailyCount ?? 0) >= (rlmRes?.dailyCap ?? 10),
+    credits: creditsRes ? { balance: Number(creditsRes.balance), budgetStatus: creditsRes.budgetStatus } : null,
+    venice: (() => {
+      const rows = readJsonlTail<{ ts: string; accessPermitted?: boolean | null; diem?: number | null }>(join(NOOK_DIR, "venice-balance.jsonl"), 3);
+      return rows.length ? rows[rows.length - 1] : null;
+    })(),
   });
 
   return {
@@ -712,6 +736,8 @@ function computeBlockers(args: {
   claimable: Record<string, number>;
   emergencyReserve: boolean;
   rlmExhausted: boolean;
+  credits?: { balance: number; budgetStatus?: string } | null;
+  venice?: { ts: string; accessPermitted?: boolean | null; diem?: number | null } | null;
 }) {
   const blockers: Array<{ severity: "high" | "med" | "low"; scope: "network" | "us"; message: string; action?: string }> = [];
   const p = args.poolDist;
@@ -729,6 +755,30 @@ function computeBlockers(args: {
   // ("Failed to prepare mining reward claim") leaving 361,422 NOOK claimed but
   // unsettled — and NOTHING surfaced it: the blocker list showed only routine
   // verifier-supply notes. Same silent-failure shape as the 53h blackout.
+  // Gateway service-fee credits (2026-10-08): they ran out at 03:07Z and the
+  // only signal was a system DM filed as "replied". Earning paths (mining
+  // submit, verify, python dry-runs) are free; exec-score, workspace logging,
+  // knowledge anchoring and the on-chain claim relay are not.
+  if (args.credits && Number.isFinite(args.credits.balance) &&
+      (args.credits.balance < 2 || args.credits.budgetStatus === "critical")) {
+    blockers.push({
+      severity: args.credits.balance < 0.5 ? "high" : "med",
+      scope: "us",
+      message: `Gateway credits at ${args.credits.balance.toFixed(2)} (${args.credits.budgetStatus ?? "low"}) — exec-score, workspace logging and knowledge anchoring fail; on-chain claim relays will too once a Merkle root appears. Mining, verify and python dry-runs are unaffected.`,
+      action: "Keep BOT_EXEC_SCORING_AUTO=0 and BOT_WORKSPACE_SOLVE=0; top up (npm run buy-credits -- --pack=0) before the next settlement root.",
+    });
+  }
+  // Venice key refusing (402 spend limit / empty balance): every LLM loop is
+  // stood down until the 00:00Z DIEM refill. Read from the daemon's 30-min
+  // balance poll (the stand-down itself lives in the daemon's memory).
+  if (args.venice && args.venice.accessPermitted === false && Date.now() - Date.parse(args.venice.ts) < 2 * 3_600_000) {
+    blockers.push({
+      severity: "med",
+      scope: "us",
+      message: `Venice key refusing calls (balance ${(args.venice.diem ?? 0).toFixed(2)} DIEM) — mining, verify, posting and knowledge are stood down until the 00:00Z refill.`,
+      action: "If the bot's own ledger didn't spend it, check Venice's usage-by-key page: something else is drawing on this key/account.",
+    });
+  }
   const relay = claimRelayHealth(args.claimHistory ?? []);
   if (relay.stalledHours !== null) {
     blockers.push({
