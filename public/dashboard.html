@@ -319,6 +319,7 @@ pre.raw { font-family: var(--code); font-size: 11px; background: var(--inset); p
     <span id="bot-status" class="lamp" title="daemon status">checking</span>
     <span id="agent-addr" class="hash"></span>
     <span id="wallet-balance"></span>
+    <a id="profile-link" href="#" target="_blank" rel="noopener" hidden>public profile</a>
     <span class="spacer"></span>
     <span>Updated <span id="last-refresh">never</span></span>
     <button class="btn" onclick="loadAll()">Refresh</button>
@@ -546,6 +547,11 @@ pre.raw { font-family: var(--code); font-size: 11px; background: var(--inset); p
       <h2>Contribution score</h2>
       <p class="lede" id="reputation-lede">Nookplot scores 10 kinds of activity daily. 50 verified solves in one domain unlock authorship there.</p>
       <div class="figs" id="reputation-cards"></div>
+    </div>
+    <div class="block" id="passport">
+      <h2>Reputation passport <span class="side" id="passport-meta"></span></h2>
+      <p class="lede">Nookplot's own six-part reputation score, as shown on our public profile. How each part is computed isn't published.</p>
+      <div id="passport-bars"></div>
     </div>
     <div class="block cols two">
       <div><h3>Score by activity</h3><div id="contrib-breakdown"></div></div>
@@ -917,6 +923,8 @@ async function loadAllInner() {
     refreshBotStatus();
     document.getElementById("agent-addr").textContent = shortAddr(snapshot.agent?.address ?? "");
     if (snapshot.agent?.name) document.querySelector(".mast-row .name").textContent = snapshot.agent.name;
+    const pl = document.getElementById("profile-link");
+    if (pl && snapshot.profileUrl) { pl.href = snapshot.profileUrl; pl.hidden = false; }
     renderWalletHeader();
     renderAnswer();
     renderActiveTab();
@@ -1209,7 +1217,9 @@ function renderHoldings() {
     w ? (w.eth >= 0.001 ? "enough for transactions we pay for ourselves" : "low; claims and posts are still gasless through the gateway") : "",
     w ? (w.eth >= 0.001 ? "good" : w.eth > 0 ? "wait" : "bad") : "");
   row("Staked", fmt(staked), `locked in MiningStake, ${tierPill(s.stake?.tier)} at ${s.stake?.multiplier ?? 1}×`, "info");
-  row("Earned, lifetime", fmt(m.nookTotalEarned ?? 0), `${escapeHtml(m.nookTotalEarnedSource ?? "gateway")} total; our own claims ledger says ${fmt(m.nookLifetimeLedgerClaimed ?? 0)}. From ${s.stake?.totalVerifications ?? 0} checks and ${s.stake?.totalSolves ?? 0} solves`, "good");
+  const SRC_NAME = { epoch_solving: "solving", posting: "posting royalties", guild_inference_claim: "guild share", epoch_verification: "checking" };
+  const bySrc = Object.entries(m.nookEarnedBySource ?? {}).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${SRC_NAME[k] ?? escapeHtml(k)} ${fmt(v)}`).join(", ");
+  row("Earned, lifetime", fmt(m.nookTotalEarned ?? 0), `${bySrc ? bySrc + ". " : ""}From ${escapeHtml(m.nookTotalEarnedSource ?? "gateway")}, as on our public profile; our claims log says ${fmt(m.nookLifetimeLedgerClaimed ?? 0)}.${m.nookStatsTotalEarned ? ` (Nookplot's stats endpoint says ${fmt(m.nookStatsTotalEarned)} because it counts the guild share twice.)` : ""}`, "good");
   row("Ready to claim off-chain", fmt(m.nookOffChainClaimable ?? 0), "the gateway ledger; the bot claims it every 30 min", (m.nookOffChainClaimable ?? 0) > 0 ? "wait" : "quiet");
   const rootDate = snapshot.settlement?.rootPublishedAt;
   row("Unclaimed in the newest root", m.onChainProof ? fmt(m.onChainProof.unclaimedThisEpoch) : "—",
@@ -1272,7 +1282,7 @@ function renderEarnedVsExpected() {
   const credited = s.claims?.lifetime ?? 0;
   const settled = s.money?.onChainProof?.cumulativeAmount ?? null;
   setHtml("earnings-status", `<div class="figs">
-    ${fig("Claimed by the bot, lifetime", `${fmt(credited, 1)} <small>NOOK</small>`, `our claims log; the gateway's own total is ${fmt(s.money?.nookTotalEarned ?? 0, 1)} and the gap isn't explained`, "good")}
+    ${fig("Claimed by the bot, lifetime", `${fmt(credited, 1)} <small>NOOK</small>`, `our claims log; Nookplot's own record says ${fmt(s.money?.nookTotalEarned ?? 0, 1)}`, "good")}
     ${fig("Settled to the wallet", settled == null ? "—" : `${fmt(settled, 1)} <small>NOOK</small>`, st?.rootEpoch != null ? `through root epoch ${st.rootEpoch}` : "")}
     ${fig("Waiting for settlement", st && st.unsettledNook > 0 ? `${fmt(st.unsettledNook, 1)} <small>NOOK</small>` : "0", st?.lastOnChainAt ? `credited since the last on-chain claim, ${fmtDay(st.lastOnChainAt)}` : "", st && st.unsettledNook > 0 ? "bad" : "good")}
   </div>`);
@@ -1710,7 +1720,7 @@ function renderReputation() {
   const GATE = 50;
   if (!r) {
     setHtml("reputation-cards", `<div class="empty">Reputation data unavailable: /v1/contributions returned nothing.</div>`);
-    renderExperiments(); renderMyProjects();
+    renderPassport(); renderExperiments(); renderMyProjects();
     return;
   }
   setHtml("reputation-cards", [
@@ -1767,8 +1777,17 @@ function renderReputation() {
     }
   }
   setHtml("authorship-status", auth);
+  renderPassport();
   renderExperiments();
   renderMyProjects();
+}
+
+function renderPassport() {
+  const p = snapshot.passport;
+  if (!p) { setHtml("passport-meta", ""); setHtml("passport-bars", `<div class="empty">Passport unavailable this refresh.</div>`); return; }
+  setHtml("passport-meta", `${p.overall ?? "?"} of 1000, tier ${escapeHtml(p.tierName ?? p.tier ?? "?")}${snapshot.profileUrl ? `, <a href="${escapeHtml(snapshot.profileUrl)}" target="_blank" rel="noopener">public profile</a>` : ""}`);
+  setHtml("passport-bars", `<div class="hbars">${(p.domains ?? []).map((d) =>
+    `<span>${escapeHtml(d.label)}</span><div class="meter"><i class="${d.score >= 700 ? "good" : d.score >= 300 ? "" : "bad"}" style="width:${Math.max(1, Math.min(100, d.score / 10))}%"></i></div><span>${Number(d.score)} <span class="quiet">of 1000</span></span>`).join("")}</div>`);
 }
 
 function renderExperiments() {

@@ -355,15 +355,26 @@ async function buildSnapshotUncached() {
   const expected24h = recent24h
     .filter((e) => e.outcome === "deferred" || e.outcome === "pass")
     .reduce((s, e) => s + (e.rewardNook ?? 0), 0);
-  // Lifetime NOOK earned (fixed 2026-10-11). The card used to read
-  // stake.totalEarnedNook, which is the GUILD-member earned_for_guild figure
-  // (~30k) — it understated lifetime earnings ~2,500x. Use the gateway's
-  // agent-stats totalEarned, and our own claims ledger (every off-chain claim,
-  // full file) as the fallback and a cross-check shown under the number.
+  // Lifetime NOOK earned. 2026-10-11: the card read stake.totalEarnedNook,
+  // the GUILD-member earned_for_guild figure (~30k), ~2,500x too low; it was
+  // switched to /v1/mining/stats/agent totalEarned. 2026-10-12 correction:
+  // that figure double-counts the guild share. It equals exactly
+  // /v1/agents/:addr/earnings totalLifetime (85,349,388) + its
+  // guild_inference_claim (10,233,212). Nookplot's own profile page shows the
+  // /earnings figure, which also matches our claims ledger, so that is the
+  // number now; the stats figure is kept only as a labelled reference.
+  const [earningsRes, passportRes] = await Promise.all([
+    gwGet<{ earned?: { totalLifetime?: number | string; bySourceType?: Record<string, number | string> } }>(`/v1/agents/${MY_ADDR}/earnings`),
+    gwGet<{ domains?: Array<{ domain: string; score: number; label?: string }>; overall?: number; tier?: number; tierName?: string; computedAt?: string }>(`/v1/agents/${MY_ADDR}/passport`),
+  ]);
   const ledgerLifetimeClaimed = readJsonlSafe<ClaimEntry>(join(NOOK_DIR, "mining-claims.jsonl"))
     .filter((c) => c.kind !== "on-chain")
     .reduce((s, c) => s + (Number(c.claimed) || 0), 0);
-  const gatewayLifetime = Number(agentStats?.totalEarned);
+  const gatewayLifetime = Number(earningsRes?.earned?.totalLifetime);
+  const statsLifetime = Number(agentStats?.totalEarned);
+  const earnedBySource = Object.fromEntries(
+    Object.entries(earningsRes?.earned?.bySourceType ?? {}).map(([k, v]) => [k, Number(v) || 0]),
+  );
   const claimedTotal = claims.reduce((s, c) => s + (c.claimed ?? 0), 0);
   const offChainClaimable = Object.values(agentStats?.claimableBalance ?? {}).reduce((a, b) => a + (b ?? 0), 0);
 
@@ -465,8 +476,11 @@ async function buildSnapshotUncached() {
       nookStaked: stake?.stakedNook ?? 0,
       // total earned NOOK ever (across solver + verifier + royalty)
       nookTotalEarned: Number.isFinite(gatewayLifetime) && gatewayLifetime > 0 ? gatewayLifetime : ledgerLifetimeClaimed,
-      nookTotalEarnedSource: Number.isFinite(gatewayLifetime) && gatewayLifetime > 0 ? "gateway" : "claims ledger",
+      nookTotalEarnedSource: Number.isFinite(gatewayLifetime) && gatewayLifetime > 0 ? "Nookplot's earnings record" : "claims ledger",
       nookLifetimeLedgerClaimed: ledgerLifetimeClaimed,
+      nookEarnedBySource: earnedBySource,
+      /** /v1/mining/stats/agent totalEarned: counts the guild share twice. Reference only. */
+      nookStatsTotalEarned: Number.isFinite(statsLifetime) ? statsLifetime : null,
       // sum of all 'epoch_*' balances on the gateway ledger that haven't
       // been settled into a Merkle proof yet
       nookOffChainClaimable: offChainClaimable,
@@ -532,6 +546,11 @@ async function buildSnapshotUncached() {
           computedAt: contribRes.computedAt,
         }
       : null,
+    // Nookplot's reputation passport (the public profile's "418/1000").
+    passport: passportRes?.domains
+      ? { overall: passportRes.overall ?? null, tier: passportRes.tier ?? null, tierName: passportRes.tierName ?? null, computedAt: passportRes.computedAt ?? null, domains: passportRes.domains.map((d) => ({ domain: d.domain, label: d.label ?? d.domain, score: d.score })) }
+      : null,
+    profileUrl: MY_ADDR ? `https://nookplot.com/agent/${MY_ADDR}` : null,
     authorship: authorshipRes
       ? {
           // Total domains the network is tracking for us.

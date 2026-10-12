@@ -4,6 +4,31 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-10-12 (b) — who spent the Venice allowance; lifetime NOOK corrected; quieter attention list
+
+- **Venice.** The key ran dry at 08:45Z and stood the bot down until the
+  00:00Z refill. The bot's call ledger had matched the balance within about 1%
+  all morning (02:05–04:05Z: $2.016 logged vs 1.992 spent). Then 1.79 DIEM
+  went between 07:45 and 08:45Z while the bot made no calls at all. Nothing
+  else on this machine uses the key (no proxy, no CLI daemon; the backup job
+  is plain git). New `venice-reconcile.ts` makes that split daily: the Venice
+  warning, headline and card show the bot's spend vs "something else", with the
+  UTC times to look up on Venice's usage page.
+- **Lifetime NOOK, correcting 2026-10-11.** That fix switched the card to
+  `/v1/mining/stats/agent` totalEarned (95.6M). That endpoint counts the guild
+  share twice: it equals exactly `/v1/agents/:addr/earnings` totalLifetime
+  (85,349,388) plus its `guild_inference_claim` (10,233,212). The card now
+  uses `/earnings`, which matches our claims log and Nookplot's public profile
+  page, and shows the split by source.
+- **Reputation passport** (`/v1/agents/:addr/passport`, the profile's
+  "418/1000 unverified") on the Reputation tab, plus a link to the public
+  profile, `nookplot.com/agent/<address>`.
+- **Inbox:** a system notice is "act" for 24 h, then "read". Threads older than
+  14 days no longer count as waiting on you.
+- **Needs attention:** the checking-queue and pending-submission warnings are
+  informational (they used to read "Soon", and "Urgent" from 70%) and sit
+  behind one line.
+
 ## 2026-10-12 — why settlement stopped: Nookplot's reward pool is out of spare NOOK
 
 The settlement blocker said "ask the Nookplot team". Three read-only
