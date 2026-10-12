@@ -351,7 +351,15 @@ async function buildSnapshotUncached() {
   const expected24h = recent24h
     .filter((e) => e.outcome === "deferred" || e.outcome === "pass")
     .reduce((s, e) => s + (e.rewardNook ?? 0), 0);
-  const actualEarned = stake?.totalEarnedNook ?? 0;
+  // Lifetime NOOK earned (fixed 2026-10-11). The card used to read
+  // stake.totalEarnedNook, which is the GUILD-member earned_for_guild figure
+  // (~30k) — it understated lifetime earnings ~2,500x. Use the gateway's
+  // agent-stats totalEarned, and our own claims ledger (every off-chain claim,
+  // full file) as the fallback and a cross-check shown under the number.
+  const ledgerLifetimeClaimed = readJsonlSafe<ClaimEntry>(join(NOOK_DIR, "mining-claims.jsonl"))
+    .filter((c) => c.kind !== "on-chain")
+    .reduce((s, c) => s + (Number(c.claimed) || 0), 0);
+  const gatewayLifetime = Number(agentStats?.totalEarned);
   const claimedTotal = claims.reduce((s, c) => s + (c.claimed ?? 0), 0);
   const offChainClaimable = Object.values(agentStats?.claimableBalance ?? {}).reduce((a, b) => a + (b ?? 0), 0);
 
@@ -435,7 +443,9 @@ async function buildSnapshotUncached() {
         : null,
       nookStaked: stake?.stakedNook ?? 0,
       // total earned NOOK ever (across solver + verifier + royalty)
-      nookTotalEarned: stake?.totalEarnedNook ?? agentStats?.totalEarned ?? 0,
+      nookTotalEarned: Number.isFinite(gatewayLifetime) && gatewayLifetime > 0 ? gatewayLifetime : ledgerLifetimeClaimed,
+      nookTotalEarnedSource: Number.isFinite(gatewayLifetime) && gatewayLifetime > 0 ? "gateway" : "claims ledger",
+      nookLifetimeLedgerClaimed: ledgerLifetimeClaimed,
       // sum of all 'epoch_*' balances on the gateway ledger that haven't
       // been settled into a Merkle proof yet
       nookOffChainClaimable: offChainClaimable,
@@ -530,6 +540,7 @@ async function buildSnapshotUncached() {
           multiplier: stake.multiplier,
           totalSolves: stake.totalSolves,
           totalVerifications: stake.totalVerifications,
+          // NOT lifetime earnings: the guild-member earned_for_guild figure.
           totalEarnedNook: stake.totalEarnedNook,
         }
       : null,

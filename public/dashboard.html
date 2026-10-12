@@ -1096,7 +1096,7 @@ function renderMoneyCards() {
     {
       label: "NOOK earned (lifetime)",
       big: `<span class="good">${fmt(m.nookTotalEarned ?? 0, 0)}</span>`,
-      sub: `${snapshot.stake?.totalVerifications ?? 0} verifications + ${snapshot.stake?.totalSolves ?? 0} solves`,
+      sub: `${m.nookTotalEarnedSource ?? "gateway"} total · our claims ledger ${fmt(m.nookLifetimeLedgerClaimed ?? 0, 0)}<br>${snapshot.stake?.totalVerifications ?? 0} verifications + ${snapshot.stake?.totalSolves ?? 0} solves`,
     },
     {
       label: "NOOK off-chain claimable",
