@@ -18,6 +18,10 @@ const ERC20_ABI = [
   "function symbol() view returns (string)",
 ];
 
+// One provider with a static network (2026-10-11 review): a provider per call
+// retries network detection every second, forever, while the RPC is down.
+let provider: JsonRpcProvider | null = null;
+
 interface CachedBalance {
   ts: number;
   data: WalletBalances;
@@ -44,7 +48,7 @@ export async function getWalletBalances(address: string): Promise<WalletBalances
     return cache.data;
   }
   try {
-    const provider = new JsonRpcProvider(RPC_URL);
+    provider ??= new JsonRpcProvider(RPC_URL, 8453, { staticNetwork: true });
     const nook = new Contract(NOOK_ADDRESS, ERC20_ABI, provider);
     const [rawBal, ethBal, block] = await Promise.all([
       nook.balanceOf(address) as Promise<bigint>,

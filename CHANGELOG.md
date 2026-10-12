@@ -4,6 +4,83 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-10-11 (c) — dashboard redesign: six tabs, pictures instead of paragraphs
+
+Operator ask: make the dashboard easier to understand without losing
+information, cut meaningless text, add explainer pictures. First a 6-agent
+inventory listed everything the old page showed (434 items): 62 were stale or
+wrong, 19 redundant, 18 jargon, 9 filler. Then the page was rebuilt.
+
+- **Structure:** 11 tabs became 6 (Now, Money, Work, Network, Reputation,
+  Activity). Old `#hash` links still land on the matching section.
+- **The answer first:** the header now says, in two to four sentences, whether
+  the bot is running, what it credited today, where money is stuck and what is
+  waiting on the operator.
+- **Pictures:** the NOOK journey (five stations, the line drawn broken where
+  settlement stalls), the three balances (NOOK, gateway credits, Venice), how
+  a solve gets paid, three-circle check counters on every waiting submission
+  and on the network queue, ticket stubs for the daily allowance, an epoch
+  clock, the emission split as one bar, contribution scores as bars.
+- **Look:** cyanotype survey sheet. Colour carries state only (green paid,
+  amber waiting, red stuck, blue information). B612, the cockpit-display
+  typeface; monospace only for hashes, the log and raw JSON. Tabs are buttons
+  (keyboard reachable), the page fits 375px wide, motion respects reduced-
+  motion.
+- **Wrong numbers removed or relabelled:** "Conversion" (lifetime claims ÷ a
+  24h sum of submit-time placeholders; it read about 125,000,000%) became
+  Credited / Settled / Waiting; "on pace" colouring went (both limits are
+  rolling 24 hours, not 02:00 counters); "UNLOCKED" badges came from
+  evidenceCount ≥ 50 on about 15 tags while the gateway has unlocked 5, so
+  authorship now comes from the gateway; the always-zero "our subs in pool"
+  and blank rank became our real pending counts; "1499 verdicts" was 1,499
+  diagnostic runs that found none; "Expected NOOK" is labelled as the
+  gateway's placeholder; the pools text now says payouts are pro rata and
+  that solving pay has topped out at 1,575,000 on most recent claims.
+- **Server:** `/api/snapshot` adds `settlement` (cause, root epoch and date,
+  unsettled NOOK, hours) and `venice` (latest balance poll); settlement
+  blockers carry `kind: "settlement"`. The credit-earning hints no longer
+  assert income the ledger doesn't show.
+
+## 2026-10-11 (b) — credit packs at the contract's price; settlement blocker names the real cause
+
+**Credit packs.** The operator bought one Micro pack. Gateway credits had
+dropped below the 0.50 an exec run or workspace costs on 10-08, and below one
+0.10 relay on 10-10. The script printed "Payment: 2 USDC" and "Purchased 125
+credits"; the transaction moved 1 USDC and the ledger credited 25.00, the same
+gap measured in May. Reading the CreditPurchase contract directly
+(`packs(id)`) shows it for every pack: Micro $1 → 25, Standard $5 → 140, Bulk
+$20 → 650, against a listing of $2 → 125, $10 → 700, $35 → 3,250.
+- New `src/credit-packs.ts`: reads the contract's packs and parses a purchase
+  receipt (USDC paid, credits from the purchase event).
+- `buy-credits`: shows the contract price (and the listing when it differs),
+  refuses an inactive pack, approves exactly the price (approving the listing
+  left a 1 USDC allowance), and reports what the receipt charged and credited
+  instead of the listing. It no longer claims a tier-2 "upgrade": relays
+  already cost 0.10.
+- `buy-credits` safety (from review): `--pack` is required and unknown
+  arguments are errors. Without the `--`, npm used to swallow `--dry-run` and
+  the defaults made a live Micro purchase; that now stops the run. The price
+  may not exceed the listed one unless `--max-usdc` allows it (approving the
+  contract price had removed the old implicit cap). A receipt that can't be
+  read after sending now says "outcome unknown, check before retrying", not
+  "failed", so a flaky RPC can't lead to buying twice.
+- Dashboard pack cards show the contract price and credits per dollar, with
+  the listing noted where it disagrees. If the RPC read fails, they show the
+  listing, labelled as such.
+
+**Settlement blocker.** The "on-chain claim relay stalled" blocker said the
+cause was "usually a gateway-side 500 on /claim-prepare". It is not: the
+newest Merkle root is epoch 164 (2026-09-02T02:00Z), our last on-chain claim
+swept it shortly after, and no root has been published since for any agent
+checked. The blocker now compares the root's publish time with our last
+on-chain claim. If the root is older, it says "no new settlement root"
+(network scope, ask the Nookplot team). If a newer root exists and the claim
+hasn't landed, it points at credits and the claim log. With no proof data it
+says it couldn't tell.
+
+**Also (0e9250a):** the lifetime-earnings card showed the guild figure; it now
+shows the gateway's total earned, with our claims ledger as the fallback.
+
 ## 2026-10-11 — credit burners off, citation loop fixed, self-audits skipped, dashboard blockers
 
 Re-checked against fresh data before acting (operator: "do it all").

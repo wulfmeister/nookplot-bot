@@ -1233,6 +1233,18 @@ Tabs:
 - **History** — earned-vs-expected status, claim cumulative chart, network snapshot table
 - **Raw** — full /api/snapshot for debugging
 
+**2026-10-11 redesign (supersedes the list above, kept for history):** six
+tabs, each answering one question. **Now**: a plain-sentence status line, the
+NOOK journey diagram (work → waiting for checks → credited → settlement root →
+wallet, broken where money is stuck), the needs-attention list and this epoch.
+**Money**: the three balances (NOOK, gateway credits, Venice), holdings, P&L,
+claims and credits. **Work**: epoch, how a solve gets paid, pending checks,
+daily allowance, prize pools, output and quality. **Network**: the checking
+queue, trends, peers, snapshots. **Reputation** and **Activity** (project
+draft, inbox, side tracks, catalog tracks, log, raw JSON). Old hash links
+(`#credits`, `#today`, `#blockers`, `#raw`, …) open the matching section.
+`/api/snapshot` gained `settlement` and `venice`; blockers carry `kind`.
+
 Auto-refreshes every 30s. The dashboard re-uses all our existing JSONL
 data and adds peer-rank computation by querying the live verifiable pool.
 
@@ -1282,6 +1294,9 @@ Credits are gateway service-fee currency, NOT NOOK. They pay for:
    - Micro: $2 USDC → 125 credits
    - Standard: $10 USDC → 700 credits
    - Bulk: $35 USDC → 3,250 credits
+
+   (These are the gateway's LISTED prices. The contract charges $1 → 25,
+   $5 → 140 and $20 → 650: see "Credit packs + tier 2", 2026-10-11 re-measure.)
    All upgrade us to **tier 2** (200 daily relays at 0.10 cr each).
 
 4. **Buy with NOOK** (20-30% discount over USDC price).
@@ -1347,6 +1362,23 @@ $0.016/credit. (Worth reporting to the gateway team.) The tier-2 daily drip
 (45 cr/day at 0.10 cr/relay = 450 relays/day headroom) means net is still
 positive even at the worse rate.
 
+**2026-10-11 re-measure (all three packs, read from the contract):** the
+contract's `packs(id)` getter returns (name, usdcPrice, creditAmount ×100,
+active). It confirms the May measurement and extends it to the other packs:
+
+| Pack | Gateway lists | Contract charges | cr/$ |
+|---|---|---|---|
+| Micro (0) | $2 → 125 | **$1 → 25** | 25 |
+| Standard (1) | $10 → 700 | **$5 → 140** | 28 |
+| Bulk (2) | $35 → 3,250 | **$20 → 650** | 32.5 |
+
+A second Micro buy moved exactly 1 USDC and the ledger credited 25.00. The
+script had printed the listing ("Payment: 2 USDC", "Purchased 125 credits")
+and approved 2 USDC, leaving a 1 USDC allowance behind. `buy-credits.ts` and
+the dashboard's pack cards now read the contract (`src/credit-packs.ts`), and
+the script reports what the receipt actually charged and credited. The
+relay cost was already 0.10 before that buy (tier 2 from the May purchase).
+
 **Verify tier-2 status:** check next signed relay cost in
 `/v1/credits/transactions` — tier 1 = 0.25 cr/relay, tier 2 = 0.10 cr/relay.
 
@@ -1362,8 +1394,8 @@ yet (admin-only paths only). The `--nook`
 flag in `buy-credits.ts` fails fast until the gateway ships it.
 
 ```bash
-npm run buy-credits -- --pack=0          # $2 USDC → 25 cr (see pricing mismatch above)
-npm run buy-credits -- --pack=2          # $35 USDC → 650 cr (best $/cr)
+npm run buy-credits -- --pack=0          # $1 USDC → 25 cr (contract price; see pricing mismatch above)
+npm run buy-credits -- --pack=2          # $20 USDC → 650 cr (best $/cr)
 ```
 
 ## Environment toggles (canonical list)

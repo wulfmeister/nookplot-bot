@@ -25,6 +25,8 @@ import { readFileSync, existsSync, statSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { NOOK_DIR, BOT_LOG_PATH, readJsonl, readJsonlTail } from "./util.js";
 import { getWalletBalances } from "./wallet.js";
+import { mergePackPricing, readOnChainPacks, type OnChainPack } from "./credit-packs.js";
+import { JsonRpcProvider } from "ethers";
 import { bountySummary } from "./bounties.js";
 import { clarificationSummary } from "./clarifications.js";
 import { swarmSummary } from "./swarms.js";
@@ -421,6 +423,7 @@ async function buildSnapshotUncached() {
       const rows = readJsonlTail<{ ts: string; accessPermitted?: boolean | null; diem?: number | null }>(join(NOOK_DIR, "venice-balance.jsonl"), 3);
       return rows.length ? rows[rows.length - 1] : null;
     })(),
+    proof: proofRes ?? null,
   });
 
   return {
@@ -531,6 +534,11 @@ async function buildSnapshotUncached() {
             }))
             .sort((a, b) => b.solvesInDomain - a.solvesInDomain)
             .slice(0, 8),
+          // Verified solves for EVERY tracked domain (2026-10-11): the
+          // expertise table read "not tracked" for any tag outside the top 8.
+          solvesByDomain: Object.fromEntries((authorshipRes.rights ?? [])
+            .map((r) => [r.domain_tag ?? r.domain ?? "", r.solves_in_domain ?? r.verifiedSolves ?? 0])
+            .filter(([d]) => d)),
         }
       : null,
     stake: stake
@@ -599,6 +607,25 @@ async function buildSnapshotUncached() {
       last20Dims: dimMeans,
     },
     blockers,
+    // Where on-chain settlement stands (2026-10-11): the dashboard's NOOK
+    // journey needs it as data, not only as a blocker sentence.
+    settlement: (() => {
+      const relay = claimRelayHealth(claims);
+      const why = settlementStallCause(proofRes ?? null, relay.lastOnChain);
+      return {
+        cause: relay.stalledHours === null ? "none" : why.cause,
+        rootEpoch: proofRes?.epochNumber ?? null,
+        rootPublishedAt: proofRes?.publishedAt ?? null,
+        lastOnChainAt: relay.lastOnChain,
+        unsettledNook: relay.unsettledNook,
+        stalledHours: relay.stalledHours,
+      };
+    })(),
+    // Latest Venice balance poll from the daemon (venice-balance.jsonl).
+    venice: (() => {
+      const rows = readJsonlTail<{ ts: string; diem?: number | null; usd?: number | null; accessPermitted?: boolean | null; nextEpochBegins?: string }>(join(NOOK_DIR, "venice-balance.jsonl"), 1);
+      return rows.length ? rows[rows.length - 1] : null;
+    })(),
     // MCP-derived tracks: scraped from the official MCP catalog, implemented
     // as raw-API modules in our codebase. See AGENTS.md for full doc.
     mcpTracks: {
@@ -738,6 +765,30 @@ export function claimRelayHealth(
   };
 }
 
+/**
+ * Pure: why on-chain settlement is behind (2026-10-11). The stall blocker
+ * blamed "a gateway-side 500 on /claim-prepare" — true on 07-30, wrong since
+ * 09-02: the newest Merkle root is epoch 164 (2026-09-02T02:00Z), our last
+ * on-chain claim swept it shortly after, and no root has been published
+ * since, for any agent checked. Nothing to relay is not a relay failure.
+ *   "no-new-root": the newest root is no newer than our last on-chain claim;
+ *                  Nookplot-side, and the cumulative claim sweeps on the next root.
+ *   "relay":       a newer root exists (or we never claimed one) yet the claim
+ *                  has not landed: our credits (0.10 per relay) or a gateway 500.
+ *   "unknown":     no usable proof data.
+ */
+export function settlementStallCause(
+  proof: { hasProof?: boolean; epochNumber?: number; publishedAt?: string } | null | undefined,
+  lastOnChainTs: string | null,
+): { cause: "no-new-root" | "relay" | "unknown"; epoch?: number; publishedAt?: string } {
+  const rootMs = proof?.hasProof !== false && proof?.publishedAt ? Date.parse(proof.publishedAt) : NaN;
+  if (!Number.isFinite(rootMs)) return { cause: "unknown" };
+  const out = { epoch: proof!.epochNumber, publishedAt: proof!.publishedAt };
+  const lastMs = lastOnChainTs ? Date.parse(lastOnChainTs) : NaN;
+  if (Number.isFinite(lastMs) && rootMs <= lastMs) return { cause: "no-new-root", ...out };
+  return { cause: "relay", ...out };
+}
+
 function computeBlockers(args: {
   poolDist: { total: number; v0: number; v1: number; v2: number; vHigh: number };
   avgVCount: number;
@@ -749,8 +800,9 @@ function computeBlockers(args: {
   rlmExhausted: boolean;
   credits?: { balance: number; budgetStatus?: string } | null;
   venice?: { ts: string; accessPermitted?: boolean | null; diem?: number | null } | null;
+  proof?: { hasProof?: boolean; epochNumber?: number; publishedAt?: string } | null;
 }) {
-  const blockers: Array<{ severity: "high" | "med" | "low"; scope: "network" | "us"; message: string; action?: string }> = [];
+  const blockers: Array<{ severity: "high" | "med" | "low"; scope: "network" | "us"; message: string; action?: string; kind?: string }> = [];
   const p = args.poolDist;
   const blockedPct = p.total > 0 ? p.v0 / p.total : 0;
 
@@ -792,14 +844,32 @@ function computeBlockers(args: {
   }
   const relay = claimRelayHealth(args.claimHistory ?? []);
   if (relay.stalledHours !== null) {
-    blockers.push({
-      severity: relay.stalledHours >= 24 ? "high" : "med",
-      scope: "us",
-      message:
-        `On-chain claim relay stalled ~${relay.stalledHours.toFixed(0)}h: ${Math.round(relay.unsettledNook).toLocaleString()} NOOK ` +
-        `claimed off-chain with no on-chain settlement since ${relay.lastOnChain ?? "?"}`,
-      action: "Usually a gateway-side 500 on /claim-prepare; the claim is idempotent on cumulative proof so it sweeps when the gateway recovers. Escalate if it outlasts a day.",
-    });
+    const unsettled = `${Math.round(relay.unsettledNook).toLocaleString()} NOOK claimed off-chain`;
+    const why = settlementStallCause(args.proof, relay.lastOnChain);
+    if (why.cause === "no-new-root") {
+      blockers.push({
+        kind: "settlement",
+        severity: relay.stalledHours >= 24 ? "high" : "med",
+        scope: "network",
+        message:
+          `No new settlement root since ${why.publishedAt?.slice(0, 10) ?? "?"} (epoch ${why.epoch ?? "?"}): ${unsettled} ` +
+          `is waiting for Nookplot to publish one. Our last on-chain claim already swept that root.`,
+        action: "Nookplot-side, not a relay failure on our end: the newest root predates our last on-chain claim. The claim is cumulative and sweeps on the first new root if gateway credits are ≥0.10. Ask the Nookplot team.",
+      });
+    } else {
+      blockers.push({
+        kind: "settlement",
+        severity: relay.stalledHours >= 24 ? "high" : "med",
+        scope: "us",
+        message:
+          `On-chain claim relay stalled ~${relay.stalledHours.toFixed(0)}h: ${unsettled} ` +
+          `with no on-chain settlement since ${relay.lastOnChain ?? "?"}` +
+          (why.cause === "relay" ? ` though a newer root exists (epoch ${why.epoch ?? "?"})` : ""),
+        action: why.cause === "relay"
+          ? "A root is waiting and our claim hasn't landed: check gateway credits (each relay costs 0.10) and the 💎 claim lines in bot.log. A gateway 500 on /claim-prepare clears on its own; the claim is cumulative."
+          : "Couldn't read /v1/mining/proof. If its root is no newer than our last on-chain claim, Nookplot hasn't published one; otherwise the relay is failing (credits or a gateway 500).",
+      });
+    }
   }
 
   const gw = gatewayReachability(args.networkHistory);
@@ -1031,23 +1101,62 @@ async function buildSidetracks() {
 
 // ── Credits acquisition info ────────────────────────────────────────────
 
+// The contract's pack prices (credit-packs.ts): the gateway listing is wrong.
+// Prices change rarely; cache 10 min, and keep the last good read on an RPC
+// failure so one flaky call does not flip the cards back to the listing.
+// One provider with a static network (a provider per call leaked: ethers
+// retries network detection every second, forever, when the RPC is down),
+// one read in flight, a 12s cap, and a failure is remembered for 60s.
+const ONCHAIN_PACKS_TTL_MS = 10 * 60_000;
+const ONCHAIN_PACKS_FAIL_TTL_MS = 60_000;
+const ONCHAIN_PACKS_TIMEOUT_MS = 12_000;
+let onChainPacksCache: { ts: number; packs: OnChainPack[] } | null = null;
+let onChainPacksFailedAt = 0;
+let onChainPacksInFlight: Promise<OnChainPack[] | null> | null = null;
+let packsProvider: JsonRpcProvider | null = null;
+async function onChainPacksCached(): Promise<OnChainPack[] | null> {
+  const now = Date.now();
+  if (onChainPacksCache && now - onChainPacksCache.ts < ONCHAIN_PACKS_TTL_MS) return onChainPacksCache.packs;
+  if (now - onChainPacksFailedAt < ONCHAIN_PACKS_FAIL_TTL_MS) return onChainPacksCache?.packs ?? null;
+  if (onChainPacksInFlight) return onChainPacksInFlight;
+  onChainPacksInFlight = (async () => {
+    try {
+      packsProvider ??= new JsonRpcProvider(process.env.BASE_RPC_URL ?? "https://mainnet.base.org", 8453, { staticNetwork: true });
+      const packs = await Promise.race([
+        readOnChainPacks(packsProvider),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ONCHAIN_PACKS_TIMEOUT_MS / 1000}s`)), ONCHAIN_PACKS_TIMEOUT_MS)),
+      ]);
+      onChainPacksCache = { ts: Date.now(), packs };
+      return packs;
+    } catch (err) {
+      onChainPacksFailedAt = Date.now();
+      console.warn(`on-chain credit-pack read failed: ${(err as Error).message.slice(0, 120)}`);
+      return onChainPacksCache?.packs ?? null;
+    } finally {
+      onChainPacksInFlight = null;
+    }
+  })();
+  return onChainPacksInFlight;
+}
+
 async function buildCredits() {
-  const [balance, packs, txs, usage] = await Promise.all([
+  const [balance, packs, txs, usage, onChainPacks] = await Promise.all([
     gwGet<{ balance: number; lifetimeEarned: number; lifetimeSpent: number; budgetStatus: string }>("/v1/credits/balance"),
     gwGet<{ packs?: Array<{ id: number; name: string; usdcPrice: string; credits: number; nookDiscount: number }>; contractAddress?: string; nookTokenAddress?: string }>("/v1/credits/packs"),
     gwGet<{ transactions?: Array<{ id: string; amountCredits: number; balanceAfter: number; type: string; referenceId?: string; createdAt: string }> }>("/v1/credits/transactions?limit=20"),
     gwGet<{ days: number; totalRequests: number; totalCostCredits: number; byProvider?: Record<string, unknown> }>("/v1/credits/usage?days=7"),
+    onChainPacksCached(),
   ]);
   return {
     balance,
-    packs: packs?.packs ?? [],
+    packs: mergePackPricing(packs?.packs ?? [], onChainPacks),
     creditPurchaseContract: packs?.contractAddress,
     nookTokenAddress: packs?.nookTokenAddress,
     transactions: txs?.transactions ?? [],
     usage: usage,
     waysToGetMore: [
-      { method: "Daily activity drip", detail: "Tier 2 = max 45 cr/day. Cross-category diversity required: content, social, marketplace, projects, tools, protocol. Diminishing returns per-category — we already hit content/social/protocol; gaining marketplace + projects would unlock more.", effort: "low" },
-      { method: "Passive engagement", detail: "0.10/upvote, 0.15/comment, 0.50/citation on YOUR content. Citation-velocity loop already publishes 8 learnings/day and cites peers; reciprocal citations from peers are the main path here. Mostly automatic — accelerated by more reach (followers).", effort: "low" },
+      { method: "Daily activity drip", detail: "Up to 45 credits a day at tier 2 for activity across six categories: content, social, marketplace, projects, tools and protocol. It has rarely paid lately; any payment shows up as a movement above.", effort: "low" },
+      { method: "Passive engagement", detail: "0.10 per upvote, 0.15 per comment and 0.50 per citation on our content. Any payment shows up as a movement above.", effort: "low" },
     ],
   };
 }
@@ -1276,7 +1385,11 @@ async function buildEpochProgress() {
   const lastStart = curStart - 24 * 3600_000;
   const subs = subsRes?.submissions ?? [];
 
-  const vstats = readJsonl<VerifyStatsEntry>(join(NOOK_DIR, "verification-stats.jsonl"));
+  // Checks are counted from quotas.jsonl, the same source as /api/capacity
+  // (2026-10-11). verification-stats.jsonl is written by the standard verify
+  // path only, so every artifact verify since 10-04 counted as 0.
+  const vstats = readJsonl<{ ts?: string; kind?: string }>(join(NOOK_DIR, "quotas.jsonl"))
+    .filter((e) => e.kind === "verify" || e.kind === "crowd-score");
   const vCount = (lo: number, hi: number) =>
     vstats.filter((e) => {
       const t = e.ts ? new Date(e.ts).getTime() : NaN;

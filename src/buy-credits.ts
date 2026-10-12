@@ -11,11 +11,17 @@
  * candidate (`purchaseWithNOOK(uint256)`). If it reverts the helper falls
  * back to USDC with an explanatory note.
  *
- * Usage:
- *   npm run buy-credits -- --pack=0          # Micro $2 USDC
- *   npm run buy-credits -- --pack=1          # Standard $10 USDC
- *   npm run buy-credits -- --pack=2 --nook   # Bulk $35 via NOOK (with discount)
+ * Usage (prices are the contract's, read live — see credit-packs.ts; the
+ * gateway's /v1/credits/packs listing is higher and wrong):
+ *   npm run buy-credits -- --pack=0          # Micro: 1 USDC → 25 credits
+ *   npm run buy-credits -- --pack=1          # Standard: 5 USDC → 140 credits
+ *   npm run buy-credits -- --pack=2 --nook   # Bulk: 20 USDC → 650 credits, via NOOK (with discount)
  *   npm run buy-credits -- --pack=0 --dry-run  # Print planned tx, don't send
+ *   npm run buy-credits -- --pack=0 --max-usdc=3  # Accept a contract price up to 3 USDC
+ *
+ * The "--" matters: without it npm keeps the flags and the script refuses to
+ * run. --pack is required; unknown arguments are errors. The USDC price may
+ * not exceed the gateway's listed price unless --max-usdc allows it.
  *
  * Requires:
  *   - NOOKPLOT_AGENT_PRIVATE_KEY in .env
@@ -28,10 +34,10 @@
  */
 import "dotenv/config";
 import { JsonRpcProvider, Wallet, Contract, AbiCoder, parseUnits, formatUnits, formatEther } from "ethers";
+import { CREDIT_PURCHASE, USDC_TOKEN, parseBuyArgs, priceWithinCeiling, readOnChainPack, summarizePurchaseReceipt } from "./credit-packs.js";
+import type { Provider, TransactionReceipt } from "ethers";
 
-const CREDIT_PURCHASE = "0x1A8C121e5C79623986f85F74C66d9cAd086B2358";
 const NOOK_TOKEN = "0xb233BDFFD437E60fA451F62c6c09D3804d285Ba3";
-const USDC_TOKEN = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // Base mainnet
 const RPC_URL = process.env.BASE_RPC_URL ?? "https://mainnet.base.org";
 
 const ERC20_ABI = [
@@ -59,6 +65,8 @@ const NOOK_PURCHASE_SELECTOR = "0xa7b69a0e";
 
 // Observed NOOK amounts from recent successful on-chain purchases.
 // Used as the "expected" rate to compute a safe maxNookAmount upper bound.
+// usdc/credits are the GATEWAY'S ADVERTISED figures (/v1/credits/packs), not
+// what the contract charges; the USDC path reads the real price on-chain.
 const PACKS = [
   { id: 0, name: "Micro", usdc: "2", credits: 125, nookDiscount: 20,
     observedNookAmount: "99854.4444444" },
@@ -68,25 +76,41 @@ const PACKS = [
     observedNookAmount: "1797400" },
 ];
 
-interface Args {
-  packId: number;
-  useNook: boolean;
-  dryRun: boolean;
+/**
+ * Poll for a receipt, riding out RPC errors (the public Base RPC rate-limits).
+ * Throws only when no receipt arrives in time: the caller then reports the
+ * transaction as broadcast with an unknown outcome, never as failed.
+ */
+async function waitForReceipt(provider: Provider, hash: string, timeoutMs = 180_000): Promise<TransactionReceipt> {
+  const deadline = Date.now() + timeoutMs;
+  let lastErr = "";
+  while (Date.now() < deadline) {
+    try {
+      const r = await provider.getTransactionReceipt(hash);
+      if (r) return r;
+    } catch (err) {
+      lastErr = (err as Error).message.slice(0, 120);
+    }
+    await new Promise((res) => setTimeout(res, 3_000));
+  }
+  throw new Error(`no receipt after ${Math.round(timeoutMs / 1000)}s${lastErr ? ` (last RPC error: ${lastErr})` : ""}`);
 }
 
-function parseArgs(): Args {
-  const argv = process.argv.slice(2);
-  const out: Args = { packId: 0, useNook: false, dryRun: false };
-  for (const a of argv) {
-    if (a.startsWith("--pack=")) out.packId = Number(a.split("=")[1]);
-    else if (a === "--nook") out.useNook = true;
-    else if (a === "--dry-run") out.dryRun = true;
-  }
-  return out;
+/** A sent transaction whose outcome we could not read: never tell the operator it failed. */
+function exitUnknown(what: string, hash: string, err: unknown): never {
+  console.error(`⚠ ${what} tx ${hash} was broadcast but its outcome is unknown: ${(err as Error).message}`);
+  console.error(`  Check https://basescan.org/tx/${hash} and the credits ledger (dashboard Credits tab) BEFORE retrying, or you may buy twice.`);
+  process.exit(5);
 }
 
 async function main() {
-  const args = parseArgs();
+  const parsed = parseBuyArgs(process.argv.slice(2), process.env);
+  if (!parsed.args) {
+    for (const e of parsed.errors) console.error(`✗ ${e}`);
+    console.error(`Usage: npm run buy-credits -- --pack=N [--dry-run] [--max-usdc=X] [--nook]`);
+    process.exit(2);
+  }
+  const args = parsed.args;
   const pack = PACKS[args.packId];
   if (!pack) {
     console.error(`Unknown pack id ${args.packId}. Valid: 0, 1, 2 (Micro, Standard, Bulk).`);
@@ -102,9 +126,26 @@ async function main() {
   const wallet = new Wallet(pk, provider);
   const address = await wallet.getAddress();
 
+  // The contract's own price, not the gateway listing (see credit-packs.ts).
+  const onChain = await readOnChainPack(provider, args.packId);
+  if (!onChain.active) {
+    console.error(`Pack #${args.packId} "${onChain.name}" is not active on the CreditPurchase contract.`);
+    process.exit(2);
+  }
+  const onChainUsdc = formatUnits(onChain.usdcPrice, 6);
+  const ceiling = priceWithinCeiling(onChain.usdcPrice, pack.usdc, args.maxUsdc);
+  if (!args.useNook && !ceiling.ok) {
+    console.error(`✗ The contract now charges ${onChainUsdc} USDC for pack #${args.packId}, above the ${ceiling.ceilingUsdc} USDC ceiling.`);
+    console.error(`  If that is expected, re-run with --max-usdc=${onChainUsdc}.`);
+    process.exit(3);
+  }
+
   console.log(`Wallet:  ${address}`);
-  console.log(`Pack:    #${pack.id} "${pack.name}" — ${pack.credits} credits`);
-  console.log(`Payment: ${args.useNook ? `NOOK (${pack.nookDiscount}% discount, est < ${pack.usdc} USDC equivalent)` : `${pack.usdc} USDC`}`);
+  console.log(`Pack:    #${onChain.id} "${onChain.name}" — ${onChain.credits} credits for ${onChainUsdc} USDC (contract price)`);
+  if (onChain.credits !== pack.credits || Number(onChainUsdc) !== Number(pack.usdc)) {
+    console.log(`         (the gateway lists ${pack.credits} credits for ${pack.usdc} USDC; the contract charges the price above)`);
+  }
+  console.log(`Payment: ${args.useNook ? `NOOK (${pack.nookDiscount}% discount, est < ${onChainUsdc} USDC equivalent)` : `${onChainUsdc} USDC`}`);
   console.log(`RPC:     ${RPC_URL}`);
   console.log("");
 
@@ -123,19 +164,20 @@ async function main() {
   const rawBal = (await paymentToken.balanceOf(address)) as bigint;
   console.log(`${paymentName} balance: ${formatUnits(rawBal, decimals)} ${paymentName}`);
 
-  // Approve amount: for USDC we know exactly ($pack.usdc * 10^6). For NOOK,
+  // Approve amount: for USDC we know exactly (the on-chain usdcPrice). For NOOK,
   // the discount math is on-contract; we approve a generous max to avoid
   // a second tx if our math is off. Standard pattern.
   // For NOOK: contract takes (packId, maxNookAmount). We've observed the
   // exact required amounts from successful on-chain txs. Send 1.2× as the
   // slippage buffer — contract pulls exact, returns nothing extra.
-  // For USDC: contract pulls exactly pack.usdc (in 6 decimals).
+  // For USDC: contract pulls exactly the on-chain usdcPrice; approve exactly
+  // that (approving the advertised price left a 1 USDC allowance on 10-11).
   const nookMaxAmount = args.useNook
     ? parseUnits((Number(pack.observedNookAmount) * 1.2).toFixed(4), 18)
     : 0n;
   const approvalAmount = args.useNook
     ? nookMaxAmount
-    : parseUnits(pack.usdc, 6);
+    : onChain.usdcPrice;
   if (rawBal < approvalAmount) {
     if (args.useNook) {
       // For NOOK we don't know exact required amount until contract math runs.
@@ -160,7 +202,16 @@ async function main() {
     console.log(`📝 Step 1: approving CreditPurchase to spend ${formatUnits(approvalAmount, decimals)} ${paymentName}…`);
     const approveTx = await paymentToken.approve(CREDIT_PURCHASE, approvalAmount);
     console.log(`  tx: ${approveTx.hash}`);
-    await approveTx.wait();
+    let approveReceipt: TransactionReceipt;
+    try {
+      approveReceipt = await waitForReceipt(provider, approveTx.hash);
+    } catch (err) {
+      exitUnknown("approve", approveTx.hash, err);
+    }
+    if (approveReceipt.status !== 1) {
+      console.error(`✗ approve tx ${approveTx.hash} reverted; nothing was purchased.`);
+      process.exit(4);
+    }
     console.log(`  ✅ confirmed`);
   } else {
     console.log(`📝 Step 1: allowance already sufficient — skipping`);
@@ -176,38 +227,60 @@ async function main() {
     const callData = NOOK_PURCHASE_SELECTOR + argsHex.slice(2);
     console.log(`📝 Step 2: calling CreditPurchase via raw selector ${NOOK_PURCHASE_SELECTOR}`);
     console.log(`         args: (packId=${args.packId}, maxNookAmount=${formatUnits(nookMaxAmount, 18)} NOOK)`);
+    let hash: string;
     try {
-      const tx = await wallet.sendTransaction({ to: CREDIT_PURCHASE, data: callData });
-      console.log(`  tx: ${tx.hash}`);
-      const receipt = await tx.wait();
-      if (receipt?.status === 1) {
-        console.log(`  ✅ confirmed in block ${receipt.blockNumber} • gas used: ${receipt.gasUsed.toString()}`);
-        console.log("");
-        console.log(`🎉 Purchased ${pack.credits} credits with NOOK. Bot upgraded to tier 2 (200 relays/day, 0.10 cr each).`);
-      } else {
-        console.error(`✗ tx ${tx.hash} reverted on-chain. Check on basescan.`);
-        process.exit(4);
-      }
+      hash = (await wallet.sendTransaction({ to: CREDIT_PURCHASE, data: callData })).hash;
     } catch (err) {
-      const msg = (err as Error).message;
-      console.error(`✗ purchase failed: ${msg.slice(0, 300)}`);
+      console.error(`✗ purchase not sent: ${(err as Error).message.slice(0, 300)}`);
       process.exit(4);
     }
+    console.log(`  tx: ${hash}`);
+    let receipt: TransactionReceipt;
+    try {
+      receipt = await waitForReceipt(provider, hash);
+    } catch (err) {
+      exitUnknown("purchase", hash, err);
+    }
+    if (receipt.status !== 1) {
+      console.error(`✗ tx ${hash} reverted on-chain. Check on basescan.`);
+      process.exit(4);
+    }
+    console.log(`  ✅ confirmed in block ${receipt.blockNumber} • gas used: ${receipt.gasUsed.toString()}`);
+    reportOutcome(receipt.logs, address, "NOOK");
   } else {
     const creditContract = new Contract(CREDIT_PURCHASE, CREDIT_PURCHASE_ABI, wallet);
     console.log(`📝 Step 2: calling purchaseWithUSDC(${args.packId})…`);
+    let hash: string;
     try {
-      const tx = await creditContract.purchaseWithUSDC(args.packId);
-      console.log(`  tx: ${tx.hash}`);
-      const receipt = await tx.wait();
-      console.log(`  ✅ confirmed in block ${receipt.blockNumber} • gas used: ${receipt.gasUsed.toString()}`);
-      console.log("");
-      console.log(`🎉 Purchased ${pack.credits} credits with USDC. Bot upgraded to tier 2.`);
+      hash = (await creditContract.purchaseWithUSDC(args.packId)).hash;
     } catch (err) {
-      console.error(`✗ purchase failed: ${(err as Error).message.slice(0, 300)}`);
+      console.error(`✗ purchase not sent: ${(err as Error).message.slice(0, 300)}`);
       process.exit(4);
     }
+    console.log(`  tx: ${hash}`);
+    let receipt: TransactionReceipt;
+    try {
+      receipt = await waitForReceipt(provider, hash);
+    } catch (err) {
+      exitUnknown("purchase", hash, err);
+    }
+    if (receipt.status !== 1) {
+      console.error(`✗ tx ${hash} reverted on-chain; the approval may still stand. Check on basescan.`);
+      process.exit(4);
+    }
+    console.log(`  ✅ confirmed in block ${receipt.blockNumber} • gas used: ${receipt.gasUsed.toString()}`);
+    reportOutcome(receipt.logs, address, "USDC");
   }
+}
+
+/** Print what the tx actually charged and credited, read from its logs. */
+function reportOutcome(logs: ReadonlyArray<{ address: string; topics: readonly string[]; data: string }>, buyer: string, paidWith: "USDC" | "NOOK"): void {
+  const out = summarizePurchaseReceipt(logs, buyer);
+  console.log("");
+  const paid = paidWith === "USDC" ? `paid ${formatUnits(out.usdcPaid, 6)} USDC` : "paid with NOOK";
+  const got = out.credits === null ? "credit amount not found in the receipt" : `${out.credits} credits`;
+  console.log(`🎉 Purchase confirmed: ${paid} → ${got} (from the transaction's logs).`);
+  console.log(`   The gateway credits the balance shortly after; check the dashboard's Credits tab or GET /v1/credits/balance.`);
 }
 
 main().catch((err) => {
