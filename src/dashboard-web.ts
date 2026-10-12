@@ -26,6 +26,7 @@ import { join, resolve } from "node:path";
 import { NOOK_DIR, BOT_LOG_PATH, readJsonl, readJsonlTail } from "./util.js";
 import { getWalletBalances } from "./wallet.js";
 import { mergePackPricing, readOnChainPacks, type OnChainPack } from "./credit-packs.js";
+import { GATEWAY_RELAYER, readPoolState } from "./settlement-pool.js";
 import { JsonRpcProvider } from "ethers";
 import { bountySummary } from "./bounties.js";
 import { clarificationSummary } from "./clarifications.js";
@@ -409,7 +410,9 @@ async function buildSnapshotUncached() {
     offChainClaimableUsd: offChainClaimable * price.usd,
   };
 
+  const chain = await settlementChainCached();
   const blockers = computeBlockers({
+    chain,
     poolDist,
     avgVCount,
     myPending: myPending.length,
@@ -619,6 +622,7 @@ async function buildSnapshotUncached() {
         lastOnChainAt: relay.lastOnChain,
         unsettledNook: relay.unsettledNook,
         stalledHours: relay.stalledHours,
+        chain,
       };
     })(),
     // Latest Venice balance poll from the daemon (venice-balance.jsonl).
@@ -801,6 +805,7 @@ function computeBlockers(args: {
   credits?: { balance: number; budgetStatus?: string } | null;
   venice?: { ts: string; accessPermitted?: boolean | null; diem?: number | null } | null;
   proof?: { hasProof?: boolean; epochNumber?: number; publishedAt?: string } | null;
+  chain?: SettlementChain | null;
 }) {
   const blockers: Array<{ severity: "high" | "med" | "low"; scope: "network" | "us"; message: string; action?: string; kind?: string }> = [];
   const p = args.poolDist;
@@ -853,8 +858,13 @@ function computeBlockers(args: {
         scope: "network",
         message:
           `No new settlement root since ${why.publishedAt?.slice(0, 10) ?? "?"} (epoch ${why.epoch ?? "?"}): ${unsettled} ` +
-          `is waiting for Nookplot to publish one. Our last on-chain claim already swept that root.`,
-        action: "Nookplot-side, not a relay failure on our end: the newest root predates our last on-chain claim. The claim is cumulative and sweeps on the first new root if gateway credits are ≥0.10. Ask the Nookplot team.",
+          `is waiting for Nookplot to publish one. Our last on-chain claim already swept that root.` +
+          (args.chain
+            ? ` Nookplot's reward pool has only ${Math.round(args.chain.headroomNook).toLocaleString()} NOOK to spare, so its contract would refuse any root that adds more (and a single root may add at most ${Math.round(args.chain.maxEpochPayoutNook).toLocaleString()}).`
+            : ""),
+        action: args.chain
+          ? "Nookplot-side: they must top up the reward pool from their treasury, then publish (catch-up roots of at most the per-root cap, an hour apart, or raise the cap). The claim is cumulative and sweeps on the first new root. `npm run stake -- settlement` shows the numbers."
+          : "Nookplot-side, not a relay failure on our end: the newest root predates our last on-chain claim. The claim is cumulative and sweeps on the first new root if gateway credits are ≥0.10. Ask the Nookplot team.",
       });
     } else {
       blockers.push({
@@ -866,10 +876,23 @@ function computeBlockers(args: {
           `with no on-chain settlement since ${relay.lastOnChain ?? "?"}` +
           (why.cause === "relay" ? ` though a newer root exists (epoch ${why.epoch ?? "?"})` : ""),
         action: why.cause === "relay"
-          ? "A root is waiting and our claim hasn't landed: check gateway credits (each relay costs 0.10) and the 💎 claim lines in bot.log. A gateway 500 on /claim-prepare clears on its own; the claim is cumulative."
+          ? "A root is waiting and our claim hasn't landed: check gateway credits (each relay costs 0.10) and the 💎 claim lines in bot.log. If the gateway relayer is out of ETH, claim with our own gas: `npm run stake -- claim-direct`."
           : "Couldn't read /v1/mining/proof. If its root is no newer than our last on-chain claim, Nookplot hasn't published one; otherwise the relay is failing (credits or a gateway 500).",
       });
     }
+  }
+
+  // The gateway relayer pays the gas for every "gasless" action. On 10-12 it
+  // had 0.000254 ETH left, about 4 days at its burn rate, and no top-ups.
+  if (args.chain && args.chain.relayerEth < 0.001) {
+    const days = args.chain.relayerDaysLeft;
+    blockers.push({
+      kind: "relayer",
+      severity: days !== null && days < 2 ? "high" : "med",
+      scope: "network",
+      message: `Nookplot's relayer is down to ${args.chain.relayerEth.toFixed(6)} ETH${days !== null ? `, about ${days < 1 ? "less than a day" : `${Math.round(days)} days`} at its current burn` : ""}. When it runs dry, every gasless action fails, ours included: anchoring posts and claiming settlements.`,
+      action: "Nookplot-side. If a root lands while it's dry, claim with our own gas: `npm run stake -- claim-direct` (the wallet holds enough ETH).",
+    });
   }
 
   const gw = gatewayReachability(args.networkHistory);
@@ -1113,7 +1136,12 @@ const ONCHAIN_PACKS_TIMEOUT_MS = 12_000;
 let onChainPacksCache: { ts: number; packs: OnChainPack[] } | null = null;
 let onChainPacksFailedAt = 0;
 let onChainPacksInFlight: Promise<OnChainPack[] | null> | null = null;
-let packsProvider: JsonRpcProvider | null = null;
+let sharedBaseProvider: JsonRpcProvider | null = null;
+/** One static-network Base provider for every dashboard RPC read. */
+function baseProvider(): JsonRpcProvider {
+  sharedBaseProvider ??= new JsonRpcProvider(process.env.BASE_RPC_URL ?? "https://mainnet.base.org", 8453, { staticNetwork: true });
+  return sharedBaseProvider;
+}
 async function onChainPacksCached(): Promise<OnChainPack[] | null> {
   const now = Date.now();
   if (onChainPacksCache && now - onChainPacksCache.ts < ONCHAIN_PACKS_TTL_MS) return onChainPacksCache.packs;
@@ -1121,9 +1149,8 @@ async function onChainPacksCached(): Promise<OnChainPack[] | null> {
   if (onChainPacksInFlight) return onChainPacksInFlight;
   onChainPacksInFlight = (async () => {
     try {
-      packsProvider ??= new JsonRpcProvider(process.env.BASE_RPC_URL ?? "https://mainnet.base.org", 8453, { staticNetwork: true });
       const packs = await Promise.race([
-        readOnChainPacks(packsProvider),
+        readOnChainPacks(baseProvider()),
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ONCHAIN_PACKS_TIMEOUT_MS / 1000}s`)), ONCHAIN_PACKS_TIMEOUT_MS)),
       ]);
       onChainPacksCache = { ts: Date.now(), packs };
@@ -1137,6 +1164,74 @@ async function onChainPacksCached(): Promise<OnChainPack[] | null> {
     }
   })();
   return onChainPacksInFlight;
+}
+
+/**
+ * Settlement as the chain sees it (2026-10-12): the reward pool's spare NOOK
+ * (balance minus what it already owes) is the most a new root may add, and
+ * the gateway relayer's ETH is what "gasless" actions run on. Both explain
+ * the stall better than the gateway does. Cached 10 min; one read in flight;
+ * a failure keeps the last good read and is retried after 60s.
+ */
+export interface SettlementChain {
+  readAt: string;
+  poolBalanceNook: number;
+  unclaimedNook: number;
+  headroomNook: number;
+  maxEpochPayoutNook: number;
+  paused: boolean;
+  relayerEth: number;
+  /** From the relayer's balance 24h earlier; null when it didn't fall. */
+  relayerDaysLeft: number | null;
+}
+let chainCache: { ts: number; v: SettlementChain } | null = null;
+let chainFailedAt = 0;
+let chainInFlight: Promise<SettlementChain | null> | null = null;
+async function settlementChainCached(): Promise<SettlementChain | null> {
+  const now = Date.now();
+  if (chainCache && now - chainCache.ts < ONCHAIN_PACKS_TTL_MS) return chainCache.v;
+  if (now - chainFailedAt < ONCHAIN_PACKS_FAIL_TTL_MS) return chainCache?.v ?? null;
+  if (chainInFlight) return chainInFlight;
+  chainInFlight = (async () => {
+    try {
+      const p = baseProvider();
+      const read = (async () => {
+        const head = await p.getBlockNumber();
+        const [pool, ethNow, ethDayAgo] = await Promise.all([
+          readPoolState(p),
+          p.getBalance(GATEWAY_RELAYER),
+          p.getBalance(GATEWAY_RELAYER, Math.max(0, head - 43_200)), // Base: ~2s blocks
+        ]);
+        return { pool, ethNow, ethDayAgo };
+      })();
+      const { pool, ethNow, ethDayAgo } = await Promise.race([
+        read,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ONCHAIN_PACKS_TIMEOUT_MS / 1000}s`)), ONCHAIN_PACKS_TIMEOUT_MS)),
+      ]);
+      const nook = (x: bigint) => Number(x / 10n ** 12n) / 1e6;
+      const eth = (x: bigint) => Number(x) / 1e18;
+      const burn = ethDayAgo > ethNow ? eth(ethDayAgo - ethNow) : 0;
+      const v: SettlementChain = {
+        readAt: new Date().toISOString(),
+        poolBalanceNook: nook(pool.poolBalance),
+        unclaimedNook: nook(pool.unclaimedObligations),
+        headroomNook: nook(pool.headroom),
+        maxEpochPayoutNook: nook(pool.maxEpochPayout),
+        paused: pool.paused,
+        relayerEth: eth(ethNow),
+        relayerDaysLeft: burn > 0 ? eth(ethNow) / burn : null,
+      };
+      chainCache = { ts: Date.now(), v };
+      return v;
+    } catch (err) {
+      chainFailedAt = Date.now();
+      console.warn(`settlement chain read failed: ${(err as Error).message.slice(0, 120)}`);
+      return chainCache?.v ?? null;
+    } finally {
+      chainInFlight = null;
+    }
+  })();
+  return chainInFlight;
 }
 
 async function buildCredits() {

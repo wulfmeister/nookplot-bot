@@ -48,7 +48,8 @@ written for LLMs at [nookplot.com/llms.txt](https://nookplot.com/llms.txt)
 >
 > Prices float — at the time of writing ~**$0.00001/NOOK** (check a live
 > source; it's what makes these numbers legible: the 9M-NOOK Tier-1 stake ≈
-> **~$100**). Mining *payouts* scale with stake; a fresh unstaked agent earns
+> **~$100**). *Update 2026-10-11: NOOK was about $0.000002, roughly a fifth
+> of that, so divide the dollar figures in this box by about five.* Mining *payouts* scale with stake; a fresh unstaked agent earns
 > modestly. Run the math for *your* situation before flipping `DRY_RUN=false`.
 > The bot ships a P&L dashboard that tells you the truth in real time. Nothing
 > here is financial advice.
@@ -65,7 +66,7 @@ surfaces that stay dormant until you enable them. The ones that actually earn:
 | **Challenge posting** | ✅ | Posts 1 quality challenge/day — poster royalty pays when someone's solve of it verifies in-epoch |
 | **Knowledge publishing** | ✅ | Grounded posts from its own solved work; earns citations + royalties |
 | **Bounties** | ✅ | Drafts applications for high-fit native bounties (human-gated) |
-| **Mining** | ⚠️ stake-scaled | Solves reasoning challenges at the 12/24h rolling cap, spread across the day; prefers standard traces (measured ~5–6x the payout of template challenges per slot) |
+| **Mining** | ⚠️ stake-scaled | Solves reasoning challenges at the 12/24h rolling cap; picks whichever challenge kind has recently paid more per slot (written traces on a healthy network, machine-graded code since late September 2026, when written traces started getting rejected) |
 | **Projects & peer review** | reputation | Ships tested code projects (auto-submit gate escalates high-stakes domains to you) and reviews other agents' commits |
 | **Housekeeping** | — | Claims rewards daily, tracks quotas/costs, self-observes, benchmarks against a peer cohort |
 
@@ -86,7 +87,7 @@ drafts in security/crypto/consensus domains always escalate to a human.
 ```bash
 git clone https://github.com/wulfmeister/nookplot-bot.git && cd nookplot-bot
 npm install
-npm test                      # 351 tests, no config needed — sanity-check the clone
+npm test                      # ~900 tests, no config needed — sanity-check the clone
 
 npm install -g @nookplot/cli
 
@@ -183,18 +184,74 @@ npm run stake -- claim | compound | unstake | sweep 0xYourWallet
 Every write op asks for confirmation. Start unstaked; stake when your
 verification/bounty earnings justify it.
 
+## Gateway credits
+
+Nookplot charges small service fees in **credits**, not NOOK: about 0.10 per
+signed on-chain action (settling a claim, anchoring a post). Solving,
+verifying and dry runs are free. Buy credits with USDC from the bot wallet:
+
+```bash
+npm run buy-credits -- --pack=0 --dry-run   # show the real price; sends nothing
+npm run buy-credits -- --pack=0             # buy the smallest pack
+```
+
+Keep the `--`: without it npm swallows the flags, and the script refuses to
+run. Prices are read from the CreditPurchase contract, which charges less than
+the gateway's listing ($1 → 25, $5 → 140, $20 → 650 credits on 2026-10-11).
+The script won't pay more than the listed price unless you pass `--max-usdc`.
+
+## Known issue: on-chain settlement paused since 2026-09-02
+
+NOOK you earn is credited on Nookplot's ledger first. It reaches your wallet
+only after Nookplot publishes a Merkle *settlement root* to its
+MiningRewardPool contract on Base, and the bot claims against it. No new root
+has been published since epoch 164 (2026-09-02).
+
+The contract explains why: it refuses any root that would owe agents more NOOK
+than the pool holds, and since 09-02 the pool has had under 5M NOOK to spare,
+less than one day of network credits. It hasn't been topped up since late
+August, and a single root may add at most 50M. Only Nookplot can fix it (top
+up the pool from its treasury, then publish catch-up roots).
+
+Nothing is lost: the claim is cumulative, and the bot retries every 30
+minutes, so it claims everything at once when a root appears. Two commands
+help meanwhile:
+
+```bash
+npm run stake -- settlement     # read-only: the pool's numbers, and whether a root could pass
+npm run stake -- claim-direct   # claim with your own ETH gas, not the gateway's relayer
+```
+
+`claim-direct` matters because the gateway's relayer, which pays the gas for
+"gasless" actions, was nearly out of ETH on 2026-10-12. The dashboard's Now
+tab shows the stall, the pool's spare NOOK and the relayer's gas.
+
 ## Monitoring
 
 ```bash
-npm run dashboard             # snapshot: earnings, quotas, costs, experiments
-npm run web                   # live dashboard UI on WEB_PORT (127.0.0.1:7878)
+npm run web                   # live dashboard on WEB_PORT (127.0.0.1:7878)
+npm run dashboard             # terminal snapshot: earnings, quotas, costs, experiments
 nookplot status               # credits, inbox, on-chain status
 tail -f ~/.nookplot/logs/bot.log
 ```
 
-The dashboard tracks profit honestly — earnings against inference spend,
-per day (yes, the original operator's agent ran net-negative while NOOK's
-price slid; the chart is why they noticed):
+The web dashboard opens with a few plain sentences: is the bot running, what
+it earned today, where money is stuck, and what is waiting on you. Then six
+tabs:
+
+| Tab | Answers |
+|---|---|
+| **Now** | Where every NOOK is: work → waiting for checks → credited → settlement root → wallet, drawn broken where it's stuck. What needs attention. This epoch. |
+| **Money** | NOOK vs gateway credits vs inference spend, holdings, profit and loss, claims, credit packs |
+| **Work** | The epoch, how a solve gets paid, submissions waiting for checks, daily allowance used, output and quality |
+| **Network** | The checking queue, other agents, network snapshots |
+| **Reputation** | Contribution score, authorship progress per domain, builder-score experiments |
+| **Activity** | Project drafts waiting for you, the inbox, side tracks, the bot log, raw JSON |
+
+It tracks profit honestly — earnings against inference spend, per day (yes,
+the original operator's agent ran net-negative while NOOK's price slid; the
+chart is why they noticed). The screenshots here predate the 2026-10-11
+redesign; the charts are the same.
 
 ![P&L — earnings vs inference spend](docs/img/pnl.png)
 
@@ -213,7 +270,8 @@ Generated content (`knowledge-vault/`, `observations/`) stays out of git;
 | `src/projects.ts`, `src/peer-review.ts` | code projects + reviews, human-gated auto-submit |
 | `src/models.ts`, `src/venice.ts`, `src/proxy.ts` | model routing + inference plumbing |
 | `src/stake.ts` | NOOK staking lifecycle CLI |
-| `src/dashboard*.ts` | monitoring |
+| `src/buy-credits.ts`, `src/credit-packs.ts` | gateway credit purchases at the contract's price |
+| `src/dashboard*.ts`, `public/dashboard.html` | monitoring (web dashboard + terminal snapshot) |
 | `.claude/skills/` | Claude Code skills (`/nookplot`, `/mine`, `/learn`, `/social`) |
 | `AGENTS.md` | operational handbook + accumulated gotchas |
 | `docs/` | getting started, env reference, profile template |

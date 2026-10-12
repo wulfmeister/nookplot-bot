@@ -35,7 +35,8 @@
 import "dotenv/config";
 import { JsonRpcProvider, Wallet, Contract, AbiCoder, parseUnits, formatUnits, formatEther } from "ethers";
 import { CREDIT_PURCHASE, USDC_TOKEN, parseBuyArgs, priceWithinCeiling, readOnChainPack, summarizePurchaseReceipt } from "./credit-packs.js";
-import type { Provider, TransactionReceipt } from "ethers";
+import type { TransactionReceipt } from "ethers";
+import { exitUnknown, waitForReceipt } from "./tx-wait.js";
 
 const NOOK_TOKEN = "0xb233BDFFD437E60fA451F62c6c09D3804d285Ba3";
 const RPC_URL = process.env.BASE_RPC_URL ?? "https://mainnet.base.org";
@@ -75,33 +76,6 @@ const PACKS = [
   { id: 2, name: "Bulk", usdc: "35", credits: 3250, nookDiscount: 30,
     observedNookAmount: "1797400" },
 ];
-
-/**
- * Poll for a receipt, riding out RPC errors (the public Base RPC rate-limits).
- * Throws only when no receipt arrives in time: the caller then reports the
- * transaction as broadcast with an unknown outcome, never as failed.
- */
-async function waitForReceipt(provider: Provider, hash: string, timeoutMs = 180_000): Promise<TransactionReceipt> {
-  const deadline = Date.now() + timeoutMs;
-  let lastErr = "";
-  while (Date.now() < deadline) {
-    try {
-      const r = await provider.getTransactionReceipt(hash);
-      if (r) return r;
-    } catch (err) {
-      lastErr = (err as Error).message.slice(0, 120);
-    }
-    await new Promise((res) => setTimeout(res, 3_000));
-  }
-  throw new Error(`no receipt after ${Math.round(timeoutMs / 1000)}s${lastErr ? ` (last RPC error: ${lastErr})` : ""}`);
-}
-
-/** A sent transaction whose outcome we could not read: never tell the operator it failed. */
-function exitUnknown(what: string, hash: string, err: unknown): never {
-  console.error(`⚠ ${what} tx ${hash} was broadcast but its outcome is unknown: ${(err as Error).message}`);
-  console.error(`  Check https://basescan.org/tx/${hash} and the credits ledger (dashboard Credits tab) BEFORE retrying, or you may buy twice.`);
-  process.exit(5);
-}
 
 async function main() {
   const parsed = parseBuyArgs(process.argv.slice(2), process.env);

@@ -4,6 +4,47 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-10-12 — why settlement stopped: Nookplot's reward pool is out of spare NOOK
+
+The settlement blocker said "ask the Nookplot team". Three read-only
+investigations (the contract, Nookplot's repo, the gateway API) found the
+cause, and it reproduces on-chain:
+
+- `MiningRewardPool` (`0x3632428a9878d2b58f58f9ef7c57cb0ee5760a01`, source
+  verified on Sourcify) rejects any root that would owe agents more NOOK than
+  the pool holds (`InsolventRoot`), or that adds more than `maxEpochPayout`
+  (50M). Since the 09-02 root the pool has had 4,849,967 NOOK to spare, less
+  than one day of network credits (~4.85M), and no NOOK has been added since.
+- A `publishRoot` dry run (an `eth_call` from Nookplot's own publisher, nothing
+  sent) passes at +4.84M and reverts `InsolventRoot` at +4.86M; +60M reverts
+  `ExceedsMaxEpochPayout`. The publisher has sent no transaction since 09-02,
+  yet it holds gas.
+- The same thing happened 08-21 to 08-24 and ended minutes after a 60M
+  top-up. The pool has lived on four manual top-ups (62M, 222M, 100M, 60M);
+  fees cover about 2% of the 5M a day promised.
+- Nookplot's relayer, which pays the gas for every "gasless" action, was down
+  to 0.000254 ETH, about 4–5 days, and `/v1/status` reports the relay as
+  degraded.
+
+Only Nookplot can unblock it: top up the pool, publish catch-up roots of at
+most 50M an hour apart (or raise the cap), and refill the relayer. The
+publishing code is not public, and no endpoint lets an agent trigger a root.
+
+What we built:
+- `npm run stake -- settlement`: read-only. The pool's numbers, the gateway
+  proof against the on-chain root, the relayer's gas, and whether a one-day
+  root would pass.
+- `npm run stake -- claim-direct`: claims from our own wallet with our own
+  gas, so a dry relayer can't block a claim. It refuses unless the gateway's
+  proof matches the on-chain root and there is something new, and it
+  simulates before asking.
+- Dashboard: the settlement blocker and the journey caption name the pool
+  shortfall; a network blocker tracks the relayer's gas; `/api/snapshot`
+  `settlement.chain` carries the numbers (10-minute cache).
+- README: the settlement known issue, gateway credits, the dashboard tabs,
+  and refreshed stale facts (test count, which challenge kinds mining
+  prefers, a dated NOOK price note).
+
 ## 2026-10-11 (c) — dashboard redesign: six tabs, pictures instead of paragraphs
 
 Operator ask: make the dashboard easier to understand without losing

@@ -1398,6 +1398,33 @@ npm run buy-credits -- --pack=0          # $1 USDC → 25 cr (contract price; se
 npm run buy-credits -- --pack=2          # $20 USDC → 650 cr (best $/cr)
 ```
 
+## On-chain settlement: MiningRewardPool (2026-10-12)
+
+Mining rewards settle through `MiningRewardPool`, an ERC1967 (UUPS) proxy at
+`0x3632428a9878d2b58f58f9ef7c57cb0ee5760a01`. The implementation is
+`0x324ce78a9ccedae0d2f76c111775e403d17006fd` (solc 0.8.24, verified source
+on Sourcify). Relayed claims arrive through the ERC2771 forwarder
+`0xbaea9e1b5222ab79d7b194de95ff904d7e8ecf80`, sent by the gateway relayer EOA
+`0x9f1045d983a6ac1faea82fe9314b47de73515d1a`.
+
+- **`claim(cumulativeAmount, proof)` is permissionless.** The leaf is keyed to
+  the caller, so our wallet can claim directly with its own gas:
+  `npm run stake -- claim-direct`.
+- **`publishRoot` is the root publisher's or owner's only.** It reverts with:
+  - `InsolventRoot` when unclaimed obligations would exceed the pool's NOOK
+    balance;
+  - `ExceedsMaxEpochPayout` when one root adds more than 50M;
+  - `RootPublishCooldownActive` within an hour of the last root.
+- **The contract's `epoch()` runs 2 behind the gateway's `epochNumber`.** The
+  09-02 root is contract epoch 162 and gateway epoch 164.
+- **Why roots stopped after 09-02:** the pool had 4,849,967 NOOK to spare, less
+  than one day of credits, and it has not been funded since. Roots resume only
+  after Nookplot tops the pool up. That is what happened 08-21 → 08-24.
+- **Read-only status:** `npm run stake -- settlement`. The dashboard shows the
+  same numbers (`settlement.chain` in `/api/snapshot`).
+- The root-publishing service is private (the public repo has the contract,
+  not the gateway), and no gateway endpoint triggers a root.
+
 ## Environment toggles (canonical list)
 
 ```

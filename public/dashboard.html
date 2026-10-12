@@ -956,7 +956,9 @@ function renderAnswer() {
   const st = snapshot.settlement;
   if (st && st.stalledHours != null && st.unsettledNook > 0) {
     if (st.cause === "no-new-root") {
-      lines.push(["bad", `${fmt(st.unsettledNook)} NOOK is credited but can't reach the wallet: Nookplot hasn't published a settlement root since ${fmtDay(st.rootPublishedAt)}.`]);
+      lines.push(["bad", st.chain && st.chain.headroomNook < st.unsettledNook
+        ? `${fmt(st.unsettledNook)} NOOK is credited but can't reach the wallet: Nookplot's reward pool is short of NOOK, so no settlement root since ${fmtDay(st.rootPublishedAt)}.`
+        : `${fmt(st.unsettledNook)} NOOK is credited but can't reach the wallet: Nookplot hasn't published a settlement root since ${fmtDay(st.rootPublishedAt)}.`]);
     } else {
       lines.push(["bad", `${fmt(st.unsettledNook)} NOOK is credited but the on-chain claim hasn't gone through for ${Math.round(st.stalledHours)} hours.`]);
     }
@@ -1038,7 +1040,10 @@ function renderJourney() {
 
   let caption = "";
   if (stuck && st.cause === "no-new-root") {
-    caption = `<p class="journey-caption">Nothing reaches the wallet until Nookplot publishes a new root. The claim is cumulative: when a root covers these credits, one claim (about 0.10 gateway credits) moves them all.</p>`;
+    const ch = st.chain;
+    caption = ch && ch.headroomNook < st.unsettledNook
+      ? `<p class="journey-caption">Nothing reaches the wallet until Nookplot publishes a new root, and its reward pool can't take one: it has ${fmt(ch.headroomNook)} NOOK to spare and the contract refuses any root that would owe more than the pool holds. Nookplot has to top the pool up from its treasury. The claim is cumulative, so one claim then moves everything waiting: through their relayer, or with our own gas (<code>npm run stake -- claim-direct</code>) if the relayer is dry.</p>`
+      : `<p class="journey-caption">Nothing reaches the wallet until Nookplot publishes a new root. The claim is cumulative: when a root covers these credits, one claim (about 0.10 gateway credits) moves them all.</p>`;
   } else if (stuck && st.cause === "unknown") {
     caption = `<p class="journey-caption">${Math.round(st.unsettledNook).toLocaleString()} NOOK has waited ${Math.round(st.stalledHours)} hours for an on-chain claim, and the settlement proof couldn't be read this refresh, so the cause is unknown.</p>`;
   } else if (stuck) {
@@ -1057,18 +1062,23 @@ function rootStation(st, proof, stuck, days) {
   if (!st) return { ...base, cls: "", v: "?", u: "settlement data missing", notes: [rootLine] };
   if (!stuck) return { ...base, cls: "good", v: "up to date", u: "", notes: [rootLine, proof ? `${fmt(proof.cumulativeAmount)} settled in total` : ""].filter(Boolean) };
   if (st.cause === "no-new-root") return { ...base, cls: "bad", v: fmt(st.unsettledNook), u: "NOOK waiting for a root",
-    notes: [rootLine, days != null ? `${days} days without a new root` : ""].filter(Boolean) };
+    notes: [rootLine, days != null ? `${days} days without a new root` : "",
+      st.chain ? `Nookplot's pool has ${fmt(st.chain.headroomNook)} spare` : ""].filter(Boolean) };
   if (st.cause === "relay") return { ...base, cls: "wait", v: fmt(st.unsettledNook), u: "NOOK covered, claim not landed",
     notes: [rootLine, `waiting ${Math.round(st.stalledHours)} hours`] };
   return { ...base, cls: "", v: fmt(st.unsettledNook), u: "NOOK waiting, cause unknown", notes: [rootLine] };
 }
 
+/** `command` in (already escaped) server text → <code>command</code>. */
+function codeTicks(html) {
+  return html.replace(/`([^`]+)`/g, "<code>$1</code>");
+}
 function renderIssues() {
   const items = [];
   for (const b of snapshot.blockers ?? []) {
     items.push({
       sev: b.severity, scope: b.scope === "network" ? "Nookplot network" : "This bot",
-      what: escapeHtml(b.message), todo: b.action ? escapeHtml(b.action) : "",
+      what: codeTicks(escapeHtml(b.message)), todo: b.action ? codeTicks(escapeHtml(b.action)) : "",
     });
   }
   const p = projectReview?.pending;

@@ -3,6 +3,8 @@ import { ethers } from "ethers";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { prepareSignRelay, preparePermitStakeRelay } from "@nookplot/mcp/signing";
+import { GATEWAY_RELAYER, MINING_REWARD_POOL, MINING_REWARD_POOL_ABI, planDirectClaim, readPoolState, rootWouldPass } from "./settlement-pool.js";
+import { exitUnknown, waitForReceipt } from "./tx-wait.js";
 
 const NOOK_ADDRESS = "0xb233BDFFD437E60fA451F62c6c09D3804d285Ba3";
 const NOOK_DECIMALS = 18;
@@ -302,6 +304,109 @@ async function cmdClaim(sourceType?: string) {
   console.log(`  BaseScan: https://basescan.org/tx/${txHash}`);
 }
 
+type ProofResponse = { hasProof?: boolean; cumulativeAmountRaw?: string; proof?: string[]; merkleRoot?: string; epochNumber?: number; publishedAt?: string };
+
+/**
+ * Read-only: where on-chain settlement stands and, if it's stuck, why
+ * (2026-10-12). Compares the gateway's proof with the MiningRewardPool.
+ */
+async function cmdSettlement() {
+  const provider = new ethers.JsonRpcProvider(RPC, 8453, { staticNetwork: true });
+  const [pool, proof, claimed, relayerEth] = await Promise.all([
+    readPoolState(provider),
+    gatewayGet<ProofResponse>(`/v1/mining/proof/${AGENT_ADDR}`).catch(() => null),
+    new ethers.Contract(MINING_REWARD_POOL, MINING_REWARD_POOL_ABI, provider).cumulativeClaimed(AGENT_ADDR) as Promise<bigint>,
+    provider.getBalance(GATEWAY_RELAYER),
+  ]);
+  const ageDays = Math.floor((Date.now() - Date.parse(pool.lastRootPublishedAt)) / 86_400_000);
+  console.log(`
+MiningRewardPool ${MINING_REWARD_POOL}`);
+  console.log(`  newest root    ${pool.merkleRoot.slice(0, 18)}… (contract epoch ${pool.epoch}), published ${pool.lastRootPublishedAt} (${ageDays} days ago)`);
+  console.log(`  pool balance   ${fmtNook(pool.poolBalance)} NOOK`);
+  console.log(`  owed, unclaimed ${fmtNook(pool.unclaimedObligations)} NOOK`);
+  console.log(`  spare          ${fmtNook(pool.headroom)} NOOK  ← the most a new root may add`);
+  console.log(`  per-root cap   ${pool.maxEpochPayout > 0n ? fmtNook(pool.maxEpochPayout) + " NOOK" : "none"}`);
+  console.log(`  paused ${pool.paused}, claimable ${pool.claimable}`);
+  console.log(`
+This wallet: ${fmtNook(claimed)} NOOK claimed on-chain`);
+  if (proof?.proof && proof.cumulativeAmountRaw) {
+    const cum = BigInt(proof.cumulativeAmountRaw);
+    console.log(`  gateway proof  ${fmtNook(cum)} NOOK cumulative, gateway epoch ${proof.epochNumber ?? "?"}, root ${String(proof.merkleRoot).slice(0, 18)}…`);
+    const plan = planDirectClaim({ proofRoot: proof.merkleRoot, proofCumulative: cum, onChainRoot: pool.merkleRoot, alreadyClaimed: claimed, paused: pool.paused, claimable: pool.claimable });
+    console.log(plan.action === "claim"
+      ? `  → ${fmtNook(plan.delta)} NOOK claimable now: npm run stake -- claim-direct`
+      : `  → nothing to claim: ${plan.reason}`);
+  } else {
+    console.log("  gateway proof  none returned");
+  }
+  console.log(`
+Gateway relayer ${GATEWAY_RELAYER}: ${Number(ethers.formatEther(relayerEth)).toFixed(6)} ETH for gas`);
+  const ethBal = await provider.getBalance(AGENT_ADDR);
+  console.log(`This wallet: ${Number(ethers.formatEther(ethBal)).toFixed(6)} ETH, enough for claim-direct if the relayer runs dry`);
+  const oneDay = 4_850_000n * 10n ** 18n;
+  const pass = rootWouldPass(oneDay, pool);
+  console.log(`
+Could Nookplot publish a root adding one day of credits (~4.85M)? ${pass.ok ? "yes" : `no: ${pass.reasons.join("; ")}`}`);
+}
+
+/**
+ * Claim straight from this wallet with our own gas (2026-10-12): claim() is
+ * permissionless, so this works when the gateway relayer is out of ETH.
+ * Refuses unless the gateway's proof matches the on-chain root and there is
+ * something new to claim; simulates before asking.
+ */
+async function cmdClaimDirect() {
+  const provider = new ethers.JsonRpcProvider(RPC, 8453, { staticNetwork: true });
+  const signer = new ethers.Wallet(PRIVATE_KEY, provider);
+  const poolC = new ethers.Contract(MINING_REWARD_POOL, MINING_REWARD_POOL_ABI, signer);
+  const [pool, proof, claimed] = await Promise.all([
+    readPoolState(provider),
+    gatewayGet<ProofResponse>(`/v1/mining/proof/${AGENT_ADDR}`),
+    poolC.cumulativeClaimed(AGENT_ADDR) as Promise<bigint>,
+  ]);
+  const cum = proof?.cumulativeAmountRaw ? BigInt(proof.cumulativeAmountRaw) : null;
+  const plan = planDirectClaim({ proofRoot: proof?.merkleRoot, proofCumulative: cum, onChainRoot: pool.merkleRoot, alreadyClaimed: claimed, paused: pool.paused, claimable: pool.claimable });
+  if (plan.action !== "claim") {
+    console.log(`Nothing to claim: ${plan.reason}. (Newest root published ${pool.lastRootPublishedAt}.)`);
+    return;
+  }
+  // Simulate first: a revert here costs nothing.
+  await poolC.claim.staticCall(cum, proof.proof);
+  const gas = await poolC.claim.estimateGas(cum, proof.proof);
+  const fee = await provider.getFeeData();
+  const maxCost = gas * (fee.maxFeePerGas ?? fee.gasPrice ?? 0n);
+  const ethBal = await provider.getBalance(AGENT_ADDR);
+  console.log(`
+About to claim ${fmtNook(plan.delta)} NOOK directly from ${AGENT_ADDR}`);
+  console.log(`  pool ${MINING_REWARD_POOL}, root ${pool.merkleRoot.slice(0, 18)}…`);
+  console.log(`  gas ~${gas.toString()}, at most ${ethers.formatEther(maxCost)} ETH (wallet has ${ethers.formatEther(ethBal)})`);
+  if (ethBal < maxCost) throw new Error("not enough ETH in the wallet for gas");
+  if (!(await confirm("Proceed?"))) {
+    console.log("aborted.");
+    return;
+  }
+  let hash: string;
+  try {
+    hash = (await poolC.claim(cum, proof.proof)).hash;
+  } catch (err) {
+    console.error(`✗ claim not sent: ${(err as Error).message.slice(0, 300)}`);
+    process.exit(4);
+  }
+  console.log(`  tx: ${hash}`);
+  let rcpt: ethers.TransactionReceipt;
+  try {
+    rcpt = await waitForReceipt(provider, hash);
+  } catch (err) {
+    exitUnknown("claim", hash, err);
+  }
+  if (rcpt.status !== 1) {
+    console.error(`✗ claim tx ${hash} reverted. Check https://basescan.org/tx/${hash}`);
+    process.exit(4);
+  }
+  console.log(`✓ claimed ${fmtNook(plan.delta)} NOOK in block ${rcpt.blockNumber}`);
+  console.log(`  BaseScan: https://basescan.org/tx/${hash}`);
+}
+
 async function cmdCompound() {
   console.log(`\nAbout to CLAIM + RESTAKE rewards atomically (compound).`);
   console.log(`  fails if you have a pending unstake — cancel it first.\n`);
@@ -366,7 +471,9 @@ Usage:
   npm run stake -- unstake <amount>             Request unstake (7-day cooldown starts)
   npm run stake -- cancel-unstake               Cancel pending unstake
   npm run stake -- complete-unstake             Withdraw after cooldown
-  npm run stake -- claim [sourceType]           Claim earned NOOK to wallet
+  npm run stake -- claim [sourceType]           Claim earned NOOK to wallet (gasless, via the gateway relayer)
+  npm run stake -- claim-direct                 Claim straight from this wallet with our own ETH gas
+  npm run stake -- settlement                   Read-only: where on-chain settlement stands, and why
   npm run stake -- compound                     Claim + restake atomically
   npm run stake -- sweep <toAddress> [amount]   ERC-20 transfer NOOK out (needs ETH for gas)
 
@@ -400,6 +507,12 @@ async function main() {
       break;
     case "compound":
       await cmdCompound();
+      break;
+    case "claim-direct":
+      await cmdClaimDirect();
+      break;
+    case "settlement":
+      await cmdSettlement();
       break;
     case "sweep":
       if (!args[0]) usage();
