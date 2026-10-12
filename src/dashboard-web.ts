@@ -27,6 +27,7 @@ import { NOOK_DIR, BOT_LOG_PATH, readJsonl, readJsonlTail } from "./util.js";
 import { getWalletBalances } from "./wallet.js";
 import { mergePackPricing, readOnChainPacks, type OnChainPack } from "./credit-packs.js";
 import { GATEWAY_RELAYER, readPoolState } from "./settlement-pool.js";
+import { mergeWindows, reconcileVenice, type VeniceReconcile } from "./venice-reconcile.js";
 import { JsonRpcProvider } from "ethers";
 import { bountySummary } from "./bounties.js";
 import { clarificationSummary } from "./clarifications.js";
@@ -411,8 +412,22 @@ async function buildSnapshotUncached() {
   };
 
   const chain = await settlementChainCached();
+  // Venice spend since the 00:00Z refill: the bot's own calls vs the rest.
+  const veniceToday: VeniceReconcile | null = (() => {
+    try {
+      const since = new Date(new Date().toISOString().slice(0, 10) + "T00:00:00.000Z").toISOString();
+      const bal = readJsonlTail<{ ts: string; diem?: number | null; usd?: number | null }>(join(NOOK_DIR, "venice-balance.jsonl"), 200);
+      const cost = readJsonlTail<{ ts: string; estCost?: number | string | null }>(join(NOOK_DIR, "venice-costs.jsonl"), 4000);
+      // Polls from midnight on: the first one (~00:05Z) is already post-refill.
+      const r = reconcileVenice(bal, cost, since);
+      return { ...r, windows: mergeWindows(r.windows) };
+    } catch {
+      return null;
+    }
+  })();
   const blockers = computeBlockers({
     chain,
+    veniceToday,
     poolDist,
     avgVCount,
     myPending: myPending.length,
@@ -628,7 +643,7 @@ async function buildSnapshotUncached() {
     // Latest Venice balance poll from the daemon (venice-balance.jsonl).
     venice: (() => {
       const rows = readJsonlTail<{ ts: string; diem?: number | null; usd?: number | null; accessPermitted?: boolean | null; nextEpochBegins?: string }>(join(NOOK_DIR, "venice-balance.jsonl"), 1);
-      return rows.length ? rows[rows.length - 1] : null;
+      return rows.length ? { ...rows[rows.length - 1], today: veniceToday } : null;
     })(),
     // MCP-derived tracks: scraped from the official MCP catalog, implemented
     // as raw-API modules in our codebase. See AGENTS.md for full doc.
@@ -806,6 +821,7 @@ function computeBlockers(args: {
   venice?: { ts: string; accessPermitted?: boolean | null; diem?: number | null } | null;
   proof?: { hasProof?: boolean; epochNumber?: number; publishedAt?: string } | null;
   chain?: SettlementChain | null;
+  veniceToday?: VeniceReconcile | null;
 }) {
   const blockers: Array<{ severity: "high" | "med" | "low"; scope: "network" | "us"; message: string; action?: string; kind?: string }> = [];
   const p = args.poolDist;
@@ -839,12 +855,29 @@ function computeBlockers(args: {
   // Venice key refusing (402 spend limit / empty balance): every LLM loop is
   // stood down until the 00:00Z DIEM refill. Read from the daemon's 30-min
   // balance poll (the stand-down itself lives in the daemon's memory).
+  const vt = args.veniceToday;
+  const otherWhen = (r: VeniceReconcile) => r.windows.map((w) => `${w.from.slice(11, 16)}–${w.to.slice(11, 16)}`).join(", ");
   if (args.venice && args.venice.accessPermitted === false && Date.now() - Date.parse(args.venice.ts) < 2 * 3_600_000) {
+    const split = vt && vt.spent > 0
+      ? ` Since the 00:00Z refill the bot's own calls used $${vt.bot.toFixed(2)}${vt.other >= 0.1 ? `; $${vt.other.toFixed(2)} went while the bot made no calls (${otherWhen(vt)} UTC)` : ", which accounts for all of it"}.`
+      : "";
     blockers.push({
+      kind: "venice",
       severity: "med",
       scope: "us",
-      message: `Venice key refusing calls (balance ${(args.venice.diem ?? 0).toFixed(2)} DIEM) — mining, verify, posting and knowledge are stood down until the 00:00Z refill.`,
-      action: "If the bot's own ledger didn't spend it, check Venice's usage-by-key page: something else is drawing on this key/account.",
+      message: `Venice key refusing calls (balance ${(args.venice.diem ?? 0).toFixed(2)} DIEM) — mining, verify, posting and knowledge are stood down until the 00:00Z refill.${split}`,
+      action: vt && vt.other >= 0.1
+        ? `Something else is drawing on this Venice account. Check Venice's usage-by-key page for ${otherWhen(vt)} UTC.`
+        : "The bot's own work used today's allowance; it resumes after the 00:00Z refill.",
+    });
+  } else if (vt && vt.other >= 0.5) {
+    // Not refused yet, but something else is already eating the allowance.
+    blockers.push({
+      kind: "venice",
+      severity: "low",
+      scope: "us",
+      message: `$${vt.other.toFixed(2)} of today's Venice allowance went while the bot made no calls (${otherWhen(vt)} UTC).`,
+      action: "Something else is drawing on this Venice account. Check Venice's usage-by-key page for those times.",
     });
   }
   const relay = claimRelayHealth(args.claimHistory ?? []);
@@ -915,26 +948,26 @@ function computeBlockers(args: {
       action: "Watch consecutiveReserveDays; if it rises, network is structurally short on protocol-fee inflows",
     });
   }
-  if (blockedPct >= 0.7) {
+  // Informational (2026-10-12): neither of the next two has anything for us
+  // to do, so they are "low" — they used to read "Soon" and, from 70%,
+  // "Urgent". Verifier supply is network-wide; a sibling identity can't
+  // verify our own solves under the diversity cap.
+  if (blockedPct >= 0.4) {
     blockers.push({
-      severity: "high",
+      kind: "queue",
+      severity: "low",
       scope: "network",
-      message: `${Math.round(blockedPct * 100)}% of verifiable pool at v0 (network-wide verifier starvation)`,
-      action: "Near-quorum priority sort is on; verifier supply is network-wide/exogenous — no local action (a sibling identity can't verify our own solves under the diversity cap, so it wouldn't unstick payouts).",
-    });
-  } else if (blockedPct >= 0.4) {
-    blockers.push({
-      severity: "med",
-      scope: "network",
-      message: `${Math.round(blockedPct * 100)}% of pool at v0 — verifier supply lagging`,
+      message: `${Math.round(blockedPct * 100)}% of the network's checking queue has no checks yet.`,
+      action: "Nothing to do. Part of it is work our checker skips on purpose: our own challenges, copies, and solvers it has already checked 3 times in 14 days.",
     });
   }
   if (args.myPending > 0 && args.avgVCount < 1.5 && args.myPending >= 5) {
     blockers.push({
-      severity: "med",
+      kind: "pending",
+      severity: "low",
       scope: "us",
-      message: `${args.myPending} pending submissions averaging ${args.avgVCount.toFixed(1)} verifications each`,
-      action: "Wait — limited by network verifier supply",
+      message: `${args.myPending} of our submissions are waiting for checks (${args.avgVCount.toFixed(1)} of 3 on average).`,
+      action: "Nothing to do: other agents check them. The Work tab lists each one.",
     });
   }
   // RLM exhausted

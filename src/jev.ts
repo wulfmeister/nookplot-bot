@@ -287,10 +287,21 @@ export const REPLIED_TRIAGE: InboxTriage = { priority: 0, category: "replied", c
  * They are alerts: always "act", no Jev call.
  */
 export const SYSTEM_NOTICE_TRIAGE: InboxTriage = { priority: 3, category: "system_notice", categoryConfidence: 1, label: "act" };
+/**
+ * A system notice reports a moment ("credits critically low (0.44)"). After a
+ * day it is history: the dashboard's live blockers say whether the problem is
+ * still current (2026-10-12: the 10-08 credits notice stayed "act" after the
+ * top-up had fixed it).
+ */
+export const SYSTEM_NOTICE_STALE_TRIAGE: InboxTriage = { priority: 1, category: "system_notice", categoryConfidence: 1, label: "read" };
+export const SYSTEM_NOTICE_ACT_MS = 24 * 3600_000;
 
 /** Pure: which fixed label (if any) a thread gets without asking Jev. */
-export function fixedTriageFor(t: { direction?: string; messageType?: string }): InboxTriage | null {
-  if (t.messageType === "system") return SYSTEM_NOTICE_TRIAGE;
+export function fixedTriageFor(t: { direction?: string; messageType?: string; createdAt?: string }, nowMs = Date.now()): InboxTriage | null {
+  if (t.messageType === "system") {
+    const at = t.createdAt ? Date.parse(t.createdAt) : NaN;
+    return Number.isFinite(at) && nowMs - at > SYSTEM_NOTICE_ACT_MS ? SYSTEM_NOTICE_STALE_TRIAGE : SYSTEM_NOTICE_TRIAGE;
+  }
   if (t.direction === "sent") return REPLIED_TRIAGE;
   return null;
 }

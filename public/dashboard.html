@@ -964,13 +964,14 @@ function renderAnswer() {
     }
   }
   if (veniceRefusingNow()) {
-    lines.push(["wait", "The Venice key is out of budget, so solving and checking pause until 00:00 UTC."]);
+    const vt = snapshot.venice?.today;
+    lines.push(["wait", `The Venice key is out of budget, so solving and checking pause until 00:00 UTC.${vt && vt.other >= 0.1 ? ` $${vt.other.toFixed(2)} of today's allowance went while the bot made no calls.` : ""}`]);
   }
   const others = (snapshot.blockers ?? []).filter((b) => b.kind !== "settlement" && b.severity === "high").length;
   const waiting = [];
   if (others) waiting.push(`${others} other urgent problem${others === 1 ? "" : "s"}`);
   if (projectReview?.pending) waiting.push("a project draft");
-  const act = (inboxData?.threads ?? []).filter((t) => ["act", "risky"].includes(t.triage?.label)).length;
+  const act = actThreads().length;
   if (act) waiting.push(`${act} inbox thread${act === 1 ? "" : "s"} marked act`);
   if (waiting.length) lines.push(["wait", `Waiting on you: ${waiting.join(", ")}.`]);
   const html = lines.map(([cls, t]) => `<li class="${cls}">${escapeHtml(t)}</li>`).join("");
@@ -1073,6 +1074,12 @@ function rootStation(st, proof, stuck, days) {
 function codeTicks(html) {
   return html.replace(/`([^`]+)`/g, "<code>$1</code>");
 }
+/** Inbox threads that still need you: marked act/risky and newer than 14 days. */
+const INBOX_ACT_DAYS = 14;
+function actThreads() {
+  const cutoff = Date.now() - INBOX_ACT_DAYS * 86_400_000;
+  return (inboxData?.threads ?? []).filter((t) => ["act", "risky"].includes(t.triage?.label) && Date.parse(t.createdAt ?? "") >= cutoff);
+}
 function renderIssues() {
   const items = [];
   for (const b of snapshot.blockers ?? []) {
@@ -1083,14 +1090,17 @@ function renderIssues() {
   }
   const p = projectReview?.pending;
   if (p) items.push({ sev: "med", scope: "Your decision", what: `Project draft "${escapeHtml(p.name)}" is waiting for review.`, todo: `Read it on the Activity tab, then <code>npm run projects -- submit ${escapeHtml(p.slug)}</code> or <code>npm run projects -- pass ${escapeHtml(p.slug)}</code>.` });
-  const act = (inboxData?.threads ?? []).filter((t) => ["act", "risky"].includes(t.triage?.label));
-  if (act.length) items.push({ sev: "low", scope: "Inbox", what: `${act.length} thread${act.length === 1 ? "" : "s"} marked act: ${act.slice(0, 3).map((t) => escapeHtml(t.from || "?")).join(", ")}${act.length > 3 ? ` and ${act.length - 3} more` : ""}.`, todo: `<a href="#inbox">Open the inbox</a>. Replies are your call.` });
-  setHtml("attention-meta", items.length ? `${items.length} item${items.length === 1 ? "" : "s"}` : "");
-  const LEVEL = { high: "Urgent", med: "Soon", low: "For you to see" };
-  setHtml("issues", items.length === 0
-    ? `<li class="empty">Nothing needs attention right now.</li>`
-    : items.map((x) => `<li class="issue ${x.sev}"><span class="dot" aria-hidden="true"></span>
-        <div><div class="scope"><span class="level">${LEVEL[x.sev] ?? x.sev}</span>, ${x.scope}</div><div class="what">${x.what}</div>${x.todo ? `<div class="do">${x.todo}</div>` : ""}</div></li>`).join(""));
+  const act = actThreads();
+  if (act.length) items.push({ sev: "med", scope: "Inbox", what: `${act.length} thread${act.length === 1 ? "" : "s"} marked act: ${act.slice(0, 3).map((t) => escapeHtml(t.from || "?")).join(", ")}${act.length > 3 ? ` and ${act.length - 3} more` : ""}.`, todo: `<a href="#inbox">Open the inbox</a>. Replies are your call.` });
+  const LEVEL = { high: "Urgent", med: "Soon", low: "For your information" };
+  const li = (x) => `<li class="issue ${x.sev}"><span class="dot" aria-hidden="true"></span>
+        <div><div class="scope"><span class="level">${LEVEL[x.sev] ?? x.sev}</span>, ${x.scope}</div><div class="what">${x.what}</div>${x.todo ? `<div class="do">${x.todo}</div>` : ""}</div></li>`;
+  // Informational items sit behind one line so the list shows what needs you.
+  const main = items.filter((x) => x.sev !== "low"), fyi = items.filter((x) => x.sev === "low");
+  setHtml("attention-meta", main.length ? `${main.length} item${main.length === 1 ? "" : "s"}` : "");
+  setHtml("issues",
+    (main.length === 0 ? `<li class="empty">Nothing needs attention right now.</li>` : main.map(li).join("")) +
+    (fyi.length ? `<li><details class="more"><summary>${fyi.length} more for your information, no action needed</summary><ul class="issues">${fyi.map(li).join("")}</ul></details></li>` : ""));
 }
 
 /** 24-hour ring from the 02:00 UTC reset; the arc is time elapsed. */
@@ -1180,6 +1190,7 @@ function renderBalances() {
       <div class="head wait">${ico("lamp")}Venice inference</div>
       <div class="amt">${v && v.diem != null ? Number(v.diem).toFixed(2) + " <small class=\"quiet\" style=\"font-size:var(--s2)\">DIEM</small>" : "?"}</div>
       <div class="quiet" style="font-size:var(--s1)">${vc ? `${usdFmt(vc.spentToday ?? 0)} spent today` : ""}${v?.ts ? `, read ${fmtAge(v.ts)}` : ""}${v && v.accessPermitted === false ? (veniceRefusingNow() ? ', <span class="bad">refusing calls</span>' : ", was refusing calls at that reading") : ""}</div>
+      ${v?.today && v.today.spent > 0 ? `<div class="quiet" style="font-size:var(--s1);margin-top:6px">Since 00:00 UTC: the bot's calls $${v.today.bot.toFixed(2)}${v.today.other >= 0.1 ? `, <span class="bad">something else $${v.today.other.toFixed(2)}</span> (${v.today.windows.map((w) => `${w.from.slice(11, 16)}–${w.to.slice(11, 16)}`).join(", ")} UTC)` : ""}</div>` : ""}
       <div class="pays">Fuel for the model's thinking: <strong>every solve and check</strong>. Refills at 00:00 UTC${v?.nextEpochBegins ? `, in ${shortRemaining(Math.max(0, (Date.parse(v.nextEpochBegins) - Date.now()) / 1000))}` : ""}.</div>
     </div>`);
 }
