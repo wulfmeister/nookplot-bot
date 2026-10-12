@@ -2687,9 +2687,6 @@ async function main() {
   try {
     const lock = acquireInstanceLock();
     if ("pid" in lock) console.log(`🔒 instance lock acquired (pid ${lock.pid}, rev ${lock.gitRev ?? "?"})`);
-    // A restart may land inside a macOS maintenance wake: hold Venice work
-    // until the host has been awake BOT_WAKE_GATE_SEC (wake-gate.ts).
-    noteDaemonBoot();
   } catch (err) {
     console.error(`✗ ${(err as Error).message}`);
     process.exit(1);
@@ -2701,6 +2698,11 @@ async function main() {
   // updates when the operator pipes stdout through `tee`; a bare launch freezes
   // it and the self-observer reads a stale tail (see src/bot-log.ts).
   initBotLog();
+  // A restart may land inside a macOS maintenance wake: hold Venice work
+  // until the host has been awake BOT_WAKE_GATE_SEC (wake-gate.ts). Called
+  // after initBotLog so its 🌙 line reaches bot.log (2026-10-12); nothing
+  // between the instance lock and here can start Venice work.
+  noteDaemonBoot();
   process.on("unhandledRejection", (reason) => {
     console.warn(`⚠ unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`);
   });
