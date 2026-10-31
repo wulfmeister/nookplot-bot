@@ -4,6 +4,41 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-10-31 (b) — watching for Nookplot's return; staking and claims without the gateway
+
+- `relaunch-watch.ts`: while the daemon waits out the pause, it checks
+  hourly (`BOT_RELAUNCH_WATCH_MIN`) for signs of a restart:
+  - the gateway answering again;
+  - a new root (merkleRoot or epoch);
+  - nookplot.com's pause page serving a newer distribution, or disappearing;
+  - NOOK added to the pool;
+  - the new root publisher's first transaction, or a replacement;
+  - claims;
+  - the relayer's gas;
+  - new @nookplot npm releases;
+  - replies on the issue named in `BOT_RELAUNCH_ISSUE`.
+
+  The first check is the baseline. On 10-31 it matched the pause: publisher
+  nonce 0, contract epoch 162, a 35,964,102 NOOK pool, 678,477,883 claimed in
+  total, relayer at 0.000004 ETH. `npm run relaunch-watch` checks by hand. On
+  the dashboard: an "Is Nookplot coming back?" card with one lamp per sign, a
+  headline clause, and an urgent item if a root lands during the pause.
+- Unstaking without the gateway (`stake-direct.ts`). `stake-onchain` is
+  read-only and simulates each action. `unstake-direct`,
+  `cancel-unstake-direct` and `complete-unstake-direct` call MiningStake from
+  the wallet, paying their own gas. Checked against the verified source of
+  the deployed implementation: the unstake functions act on the caller, and
+  `requestUnstake` also takes the agent out of its guild.
+- `claim-direct` and `settlement` fall back to nookplot.com's `/api/proof`
+  when the gateway can't answer. During this pause the gateway still serves
+  `/v1/mining/proof` while everything else returns 503, so this only matters
+  if that endpoint stops too.
+- Dashboard: when `/v1/mining/stake` returns 503, the stake is read from
+  MiningStake. The Wallet station had been showing "0 staked".
+- dotenv reads an unquoted `#` as the start of a comment, so `owner/repo#12`
+  arrives as `owner/repo`. `BOT_RELAUNCH_ISSUE` now also takes the issue's
+  URL.
+
 ## 2026-10-31 — Nookplot paused for a rebuild: wait it out instead of relaunching
 
 Since about 2026-10-22 17:00Z every gateway request returns 503 "Nookplot is

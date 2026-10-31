@@ -7,6 +7,7 @@ import { pickModel, pickModelAB } from "./models.js";
 import { runsInLean, leanBanner } from "./lean.js";
 import { NOOK_DIR, appendJsonl, extractJson, readJsonl, readJsonlTail, sleep } from "./util.js";
 import { describeVersionChange, isMaintenanceError, maintenancePollMs, nextMaintenanceState, readMaintenanceState, readManifestSnapshot, saveManifestSnapshot, writeMaintenanceState } from "./gateway-maintenance.js";
+import { relaunchWatchMs, runRelaunchCheck } from "./relaunch-watch.js";
 import { findTemplateFingerprint, findNearDuplicateTrace, nearDupeCorpus, applyOffTopicClamp } from "./trace-fingerprint.js";
 import { webSearch, arxivSearch, formatResultsForPrompt, type SearchResult } from "./research.js";
 import { refine } from "./refine.js";
@@ -2722,6 +2723,18 @@ async function main() {
   let failures = 0;
   let lastPauseLog = 0;
   let sawPause = false;
+  // While paused, look for signs of a restart once an hour (relaunch-watch.ts).
+  // Read-only, and a failed read never stops the wait.
+  let lastRelaunchCheck = 0;
+  const watchRelaunch = async () => {
+    try {
+      const { newly, first } = await runRelaunchCheck();
+      if (first) console.log("🛰 Watching for signs that Nookplot is coming back (this first check is the baseline; npm run relaunch-watch shows it).");
+      for (const s of newly) console.log(`🛰 Nookplot restart sign: ${s.label} (${s.baseline ?? "?"} → ${s.now ?? "?"}).`);
+    } catch (err) {
+      console.warn(`⚠ relaunch check failed: ${(err as Error).message}`);
+    }
+  };
   for (;;) {
     try {
       connection = await runtime.connect();
@@ -2736,6 +2749,11 @@ async function main() {
         if (Date.now() - lastPauseLog >= 3_600_000) {
           console.log(`⏸ Nookplot is paused while it is rebuilt (since ${st.since}). Checking every ${Math.round(poll / 60_000)} min; the bot resumes on its own when it's back.`);
           lastPauseLog = Date.now();
+        }
+        const watchMs = relaunchWatchMs();
+        if (watchMs > 0 && Date.now() - lastRelaunchCheck >= watchMs) {
+          lastRelaunchCheck = Date.now();
+          await watchRelaunch();
         }
         await sleep(poll);
         continue;
@@ -2766,6 +2784,8 @@ async function main() {
       } catch { /* version stays unknown */ }
       console.log(`🔁 Nookplot is back after its rebuild pause (since ${prevState?.since ?? "?"}); ${describeVersionChange(readManifestSnapshot(), version)}.`);
       saveManifestSnapshot(version, nowIso);
+      // Record the return, and whatever else moved, for the dashboard.
+      if (relaunchWatchMs() > 0) await watchRelaunch();
     }
     writeMaintenanceState(nextMaintenanceState(prevState, false, nowIso));
   }

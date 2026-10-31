@@ -1425,6 +1425,47 @@ on Sourcify). Relayed claims arrive through the ERC2771 forwarder
 - The root-publishing service is private (the public repo has the contract,
   not the gateway), and no gateway endpoint triggers a root.
 
+## Nookplot paused for a rebuild (2026-10-22 →)
+
+Since 2026-10-22 ~17:15Z the gateway answers 503 `{"error":"maintenance"}`
+("Nookplot is paused while it is rebuilt") on every endpoint we use except
+`GET /v1/mining/proof/:addr`, which still answered 200 on 10-31. nookplot.com
+is a static pause page with an API of its own: `/api/stats` (distribution
+epoch, totalStaked, cooldown), `/api/proof/:addr` (same shape as the
+gateway's proof) and `/api/claimed/:addr`.
+
+On-chain, verified 10-31:
+- 2026-10-22 07:43Z, about 9.5 hours before the pause: ownership of
+  MiningRewardPool, MiningStake and the other Nookplot contracts moved to
+  `0x0027a5643e3A6a104D21ad7995319dE902B5CFb4`. MiningRewardPool's
+  `rootPublisher` became `0x83fAE4a2727C82ed9d28d2e4A7EbBA27Ba209112`, which
+  is funded but had sent 0 transactions by 10-31.
+- Nothing since: no root (contract epoch 162 = gateway 164), no pool top-up,
+  `totalClaimed` flat, no @nookplot npm release since 08-21.
+
+What the bot does:
+- `gateway-maintenance.ts` waits in-process and resumes on its own.
+- `relaunch-watch.ts` checks the restart signs hourly while paused
+  (`BOT_RELAUNCH_WATCH_MIN`). The baseline is the first check; state lives in
+  `~/.nookplot/relaunch-watch.json`; `npm run relaunch-watch` checks by hand.
+- Staking without the gateway (`stake-direct.ts`). MiningStake proxy is
+  `0x1Fcf45C74C7609Ccf647B678b2116e2CccD9C317`; the implementation is
+  `0x01a78b1b596017122E0cab2da35c16645c71688B` (Sourcify exact match).
+  - The unstake functions use ERC2771 `_msgSender()`, so a direct call acts on
+    the caller.
+  - `requestUnstake(amount)` starts a 7-day cooldown (fixed at request time),
+    calls `miningGuild.onUnstake` (the agent leaves its guild), and the
+    gateway stops reward accrual.
+  - `cancelUnstake()` restores the guild seat if the guild still has room.
+  - `completeUnstake()` pays out after the cooldown.
+  - All three are `whenNotPaused`. The owner can also `waiveCooldown`,
+    `slashAgent` and upgrade the contract (UUPS). `emergencyWithdraw` can't
+    take staked NOOK, only the excess over `totalStaked`.
+- `claim-direct` and `settlement` fall back to nookplot.com's `/api/proof`
+  when the gateway can't answer.
+- The dashboard reads the stake from MiningStake when `/v1/mining/stake`
+  fails.
+
 ## Environment toggles (canonical list)
 
 ```
@@ -1438,6 +1479,7 @@ BOT_RLM_SPOTCHECK=0          # skip RLM spot-check verifier loop
 BOT_NETWORK_STATUS=0         # skip the periodic network-health log
 BOT_VERIFY_THRESHOLD=N       # force a fixed verification threshold (override slack algorithm)
 BOT_AUTO_ONCHAIN_CLAIM=0     # skip on-chain Merkle reward claim
+BOT_RELAUNCH_WATCH_MIN=0     # skip the hourly restart-sign check during a maintenance pause
 BASE_RPC_URL=https://…       # alt Base RPC endpoint (default: mainnet.base.org)
 WEB_PORT=7878                # dashboard port
 WEB_BIND_HOST=127.0.0.1      # dashboard bind addr — don't expose externally (no auth)

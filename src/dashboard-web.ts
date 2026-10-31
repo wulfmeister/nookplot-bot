@@ -29,6 +29,8 @@ import { mergePackPricing, readOnChainPacks, type OnChainPack } from "./credit-p
 import { GATEWAY_RELAYER, readPoolState } from "./settlement-pool.js";
 import { mergeWindows, reconcileVenice, type VeniceReconcile } from "./venice-reconcile.js";
 import { readMaintenanceState, type MaintenanceState } from "./gateway-maintenance.js";
+import { readRelaunchState, relaunchSignals, type RelaunchState } from "./relaunch-watch.js";
+import { readStakeContract } from "./stake-direct.js";
 import { JsonRpcProvider } from "ethers";
 import { bountySummary } from "./bounties.js";
 import { clarificationSummary } from "./clarifications.js";
@@ -273,6 +275,9 @@ async function buildSnapshotUncached() {
       count?: number;
     }>(`/v1/mining/authorship/${MY_ADDR}`),
   ]);
+  // /v1/mining/stake 503s while Nookplot is paused, and the cards read
+  // "0 staked" (2026-10-31): read the stake from the contract instead.
+  const stakeFromChain = stake ? null : await onChainStakeCached();
 
   // Hot-path: only the recent slice is needed for snapshot computations.
   // Switching to tail-read keeps dashboard latency flat as the JSONLs grow.
@@ -439,10 +444,12 @@ async function buildSnapshotUncached() {
   })();
   // Written by the daemon while it waits out a gateway maintenance pause.
   const maintenance = readMaintenanceState();
+  const relaunch = readRelaunchState();
   const blockers = computeBlockers({
     chain,
     veniceToday,
     maintenance,
+    relaunch,
     poolDist,
     avgVCount,
     myPending: myPending.length,
@@ -477,7 +484,7 @@ async function buildSnapshotUncached() {
             label: "Gateway service-fee credits — pays for /v1/exec, relays, etc. Not NOOK.",
           }
         : null,
-      nookStaked: stake?.stakedNook ?? 0,
+      nookStaked: stake?.stakedNook ?? stakeFromChain?.stakedNook ?? 0,
       // total earned NOOK ever (across solver + verifier + royalty)
       nookTotalEarned: Number.isFinite(gatewayLifetime) && gatewayLifetime > 0 ? gatewayLifetime : ledgerLifetimeClaimed,
       nookTotalEarnedSource: Number.isFinite(gatewayLifetime) && gatewayLifetime > 0 ? "Nookplot's earnings record" : "claims ledger",
@@ -551,6 +558,8 @@ async function buildSnapshotUncached() {
         }
       : null,
     maintenance: readMaintenanceState(),
+    // Signs that Nookplot is coming back (relaunch-watch.ts), checked hourly by the daemon while paused.
+    relaunch: relaunch ? { baselineAt: relaunch.baselineAt, checkedAt: relaunch.checkedAt, signals: relaunchSignals(relaunch) } : null,
     // Nookplot's reputation passport (the public profile's "418/1000").
     passport: passportRes?.domains
       ? { overall: passportRes.overall ?? null, tier: passportRes.tier ?? null, tierName: passportRes.tierName ?? null, computedAt: passportRes.computedAt ?? null, domains: passportRes.domains.map((d) => ({ domain: d.domain, label: d.label ?? d.domain, score: d.score })) }
@@ -583,7 +592,9 @@ async function buildSnapshotUncached() {
             .filter(([d]) => d)),
         }
       : null,
-    stake: stake
+    stake: !stake && stakeFromChain
+      ? { ...stakeFromChain, source: "MiningStake contract (the gateway can't answer)" }
+      : stake
       ? {
           stakedNook: stake.stakedNook,
           tier: stake.tier,
@@ -847,6 +858,7 @@ function computeBlockers(args: {
   chain?: SettlementChain | null;
   veniceToday?: VeniceReconcile | null;
   maintenance?: MaintenanceState | null;
+  relaunch?: RelaunchState | null;
 }) {
   const blockers: Array<{ severity: "high" | "med" | "low"; scope: "network" | "us"; message: string; action?: string; kind?: string }> = [];
   const p = args.poolDist;
@@ -915,8 +927,21 @@ function computeBlockers(args: {
       severity: "high",
       scope: "network",
       message: `Nookplot is paused while it is rebuilt${m.since ? ` (since ${m.since.slice(0, 16).replace("T", " ")} UTC)` : ""}. No solving, checking, posting or claims until it's back. On-chain assets are unaffected.`,
-      action: "Nothing to fix on our side. The bot checks every 10 minutes and resumes on its own, logging the gateway version so the rebuilt API can be checked. nookplot.com still offers on-chain unstaking.",
+      action: "Nothing to fix on our side. The bot checks every 10 minutes and resumes on its own, logging the gateway version so the rebuilt API can be checked. Signs of a restart are checked hourly (Now tab, `npm run relaunch-watch`). Unstaking works without the gateway: `npm run stake -- stake-onchain`.",
     });
+    // A new root during the pause is the one sign we can act on: claim-direct
+    // pays its own gas, and the gateway's proof endpoint still answers.
+    const rootSeen = args.relaunch?.firstSeen?.root;
+    if (rootSeen) {
+      const row = relaunchSignals(args.relaunch!).find((r) => r.key === "root");
+      blockers.push({
+        kind: "relaunch-root",
+        severity: "high",
+        scope: "us",
+        message: `A new settlement root is on-chain (${row?.now ?? "?"}), first seen ${rootSeen.slice(0, 16).replace("T", " ")} UTC, while Nookplot is still paused.`,
+        action: "Run `npm run stake -- settlement` to see whether it covers this wallet, then `npm run stake -- claim-direct`. Both work while the gateway is paused.",
+      });
+    }
   }
   const relay = claimRelayHealth(args.claimHistory ?? []);
   if (relay.stalledHours !== null) {
@@ -1258,6 +1283,29 @@ export interface SettlementChain {
   /** From the relayer's balance 24h earlier; null when it didn't fall. */
   relayerDaysLeft: number | null;
 }
+/** The stake as MiningStake records it; used only when the gateway can't answer. Same cache rules as below. */
+let stakeChainCache: { ts: number; v: { stakedNook: number; tier: string; multiplier: number } } | null = null;
+let stakeChainFailedAt = 0;
+async function onChainStakeCached(): Promise<{ stakedNook: number; tier: string; multiplier: number } | null> {
+  if (!MY_ADDR) return null;
+  const now = Date.now();
+  if (stakeChainCache && now - stakeChainCache.ts < ONCHAIN_PACKS_TTL_MS) return stakeChainCache.v;
+  if (now - stakeChainFailedAt < ONCHAIN_PACKS_FAIL_TTL_MS) return stakeChainCache?.v ?? null;
+  try {
+    const c = await Promise.race([
+      readStakeContract(baseProvider(), MY_ADDR),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ONCHAIN_PACKS_TIMEOUT_MS / 1000}s`)), ONCHAIN_PACKS_TIMEOUT_MS)),
+    ]);
+    const v = { stakedNook: Number(c.stake.amount / 10n ** 12n) / 1e6, tier: `tier${c.tier}`, multiplier: c.multiplierBps / 100 };
+    stakeChainCache = { ts: now, v };
+    return v;
+  } catch (err) {
+    stakeChainFailedAt = now;
+    console.warn(`on-chain stake read failed: ${(err as Error).message}`);
+    return stakeChainCache?.v ?? null;
+  }
+}
+
 let chainCache: { ts: number; v: SettlementChain } | null = null;
 let chainFailedAt = 0;
 let chainInFlight: Promise<SettlementChain | null> | null = null;

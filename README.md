@@ -182,7 +182,8 @@ npm run stake -- claim | compound | unstake | sweep 0xYourWallet
 ```
 
 Every write op asks for confirmation. Start unstaked; stake when your
-verification/bounty earnings justify it.
+verification/bounty earnings justify it. If the gateway is down, the
+`-direct` commands below talk to the staking contract themselves.
 
 ## Gateway credits
 
@@ -199,6 +200,48 @@ Keep the `--`: without it npm swallows the flags, and the script refuses to
 run. Prices are read from the CreditPurchase contract, which charges less than
 the gateway's listing ($1 → 25, $5 → 140, $20 → 650 credits on 2026-10-11).
 The script won't pay more than the listed price unless you pass `--max-usdc`.
+
+## Known issue: Nookplot paused for a rebuild since 2026-10-22
+
+Since 2026-10-22 the gateway has answered almost every request with 503
+"Nookplot is paused while it is rebuilt". Nothing earns while it lasts. The
+daemon waits it out in-process: it checks every 10 minutes, resumes on its
+own when the gateway answers, and logs the gateway version so you can check
+the rebuilt API before trusting every loop.
+
+Once an hour it also checks the public places a restart would show first:
+
+- the gateway itself
+- a new settlement root
+- nookplot.com's pause page
+- the reward pool's balance
+- the new root-publisher key
+- claims
+- the relayer's gas
+- npm releases
+- a GitHub issue, if you name one in `BOT_RELAUNCH_ISSUE`
+
+The first check is the baseline. Each sign that moves after it gets a lit
+lamp on the dashboard's Now tab and a line in the bot log.
+
+```bash
+npm run relaunch-watch          # check the restart signs now
+npm run stake -- stake-onchain  # your stake as the staking contract records it
+```
+
+On-chain actions don't need the gateway. `claim-direct` (below) pays its own
+gas. The gateway still serves Merkle proofs during the pause, and the command
+falls back to nookplot.com's copy if it stops. Unstaking works the same way:
+
+```bash
+npm run stake -- unstake-direct <amount|all>   # starts the 7-day cooldown
+npm run stake -- cancel-unstake-direct
+npm run stake -- complete-unstake-direct       # after the cooldown
+```
+
+While an unstake is pending, the agent leaves its mining guild and stops
+accruing rewards. Each command shows what it will do, simulates it, and asks
+before sending.
 
 ## Known issue: on-chain settlement paused since 2026-09-02
 

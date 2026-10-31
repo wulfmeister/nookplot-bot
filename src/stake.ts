@@ -3,13 +3,16 @@ import { ethers } from "ethers";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { prepareSignRelay, preparePermitStakeRelay } from "@nookplot/mcp/signing";
+import { isMaintenanceError } from "./gateway-maintenance.js";
 import { GATEWAY_RELAYER, MINING_REWARD_POOL, MINING_REWARD_POOL_ABI, planDirectClaim, readPoolState, rootWouldPass } from "./settlement-pool.js";
+import { MINING_STAKE, MINING_STAKE_ABI, parseUnstakeAmount, planUnstake, readStakeContract, unstakeAvailableAt, type UnstakePlan } from "./stake-direct.js";
 import { exitUnknown, waitForReceipt } from "./tx-wait.js";
 
 const NOOK_ADDRESS = "0xb233BDFFD437E60fA451F62c6c09D3804d285Ba3";
 const NOOK_DECIMALS = 18;
 
 const GATEWAY = process.env.NOOKPLOT_GATEWAY_URL ?? "https://gateway.nookplot.com";
+const SITE = process.env.NOOKPLOT_SITE_URL ?? "https://nookplot.com";
 const RPC = process.env.NOOKPLOT_RPC_URL ?? "https://mainnet.base.org";
 const API_KEY = required("NOOKPLOT_API_KEY");
 const PRIVATE_KEY = required("NOOKPLOT_AGENT_PRIVATE_KEY", "AGENT_PRIVATE_KEY");
@@ -59,6 +62,7 @@ async function readStake(): Promise<Record<string, unknown> | null> {
     return await gatewayGet(`/v1/mining/stake/${AGENT_ADDR}`);
   } catch (err) {
     console.warn(`   ⚠ stake read failed: ${(err as Error).message}`);
+    if (isMaintenanceError((err as Error).message)) console.warn("     The gateway is paused; `npm run stake -- stake-onchain` reads the stake from the contract.");
     return null;
   }
 }
@@ -306,18 +310,42 @@ async function cmdClaim(sourceType?: string) {
 
 type ProofResponse = { hasProof?: boolean; cumulativeAmountRaw?: string; proof?: string[]; merkleRoot?: string; epochNumber?: number; publishedAt?: string };
 
+/** A gateway that is paused, down or unreachable, as opposed to one that answered with an error. */
+function gatewayUnavailable(msg: string): boolean {
+  return isMaintenanceError(msg) || /failed \(5\d\d\)/.test(msg) || /fetch failed|ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|aborted|timeout/i.test(msg);
+}
+
+/**
+ * This wallet's Merkle proof: the gateway's, or nookplot.com's when the
+ * gateway can't answer (2026-10-31). The pause page serves the same proof
+ * shape for the root it publishes, and planDirectClaim still refuses a proof
+ * whose root isn't the pool's.
+ */
+async function fetchProof(): Promise<{ proof: ProofResponse; source: string }> {
+  try {
+    return { proof: await gatewayGet<ProofResponse>(`/v1/mining/proof/${AGENT_ADDR}`), source: "the gateway" };
+  } catch (err) {
+    const msg = (err as Error).message;
+    if (!gatewayUnavailable(msg)) throw err;
+    const res = await fetch(`${SITE}/api/proof/${AGENT_ADDR}`, { signal: AbortSignal.timeout(20_000) });
+    if (!res.ok) throw new Error(`the gateway can't answer (${msg.slice(0, 80)}) and ${SITE}'s proof lookup failed (${res.status})`);
+    return { proof: (await res.json()) as ProofResponse, source: `${new URL(SITE).host} (the gateway can't answer)` };
+  }
+}
+
 /**
  * Read-only: where on-chain settlement stands and, if it's stuck, why
  * (2026-10-12). Compares the gateway's proof with the MiningRewardPool.
  */
 async function cmdSettlement() {
   const provider = new ethers.JsonRpcProvider(RPC, 8453, { staticNetwork: true });
-  const [pool, proof, claimed, relayerEth] = await Promise.all([
+  const [pool, fetched, claimed, relayerEth] = await Promise.all([
     readPoolState(provider),
-    gatewayGet<ProofResponse>(`/v1/mining/proof/${AGENT_ADDR}`).catch(() => null),
+    fetchProof().catch(() => null),
     new ethers.Contract(MINING_REWARD_POOL, MINING_REWARD_POOL_ABI, provider).cumulativeClaimed(AGENT_ADDR) as Promise<bigint>,
     provider.getBalance(GATEWAY_RELAYER),
   ]);
+  const proof = fetched?.proof ?? null;
   const ageDays = Math.floor((Date.now() - Date.parse(pool.lastRootPublishedAt)) / 86_400_000);
   console.log(`
 MiningRewardPool ${MINING_REWARD_POOL}`);
@@ -331,13 +359,13 @@ MiningRewardPool ${MINING_REWARD_POOL}`);
 This wallet: ${fmtNook(claimed)} NOOK claimed on-chain`);
   if (proof?.proof && proof.cumulativeAmountRaw) {
     const cum = BigInt(proof.cumulativeAmountRaw);
-    console.log(`  gateway proof  ${fmtNook(cum)} NOOK cumulative, gateway epoch ${proof.epochNumber ?? "?"}, root ${String(proof.merkleRoot).slice(0, 18)}…`);
+    console.log(`  proof          ${fmtNook(cum)} NOOK cumulative, gateway epoch ${proof.epochNumber ?? "?"}, root ${String(proof.merkleRoot).slice(0, 18)}…, from ${fetched?.source}`);
     const plan = planDirectClaim({ proofRoot: proof.merkleRoot, proofCumulative: cum, onChainRoot: pool.merkleRoot, alreadyClaimed: claimed, paused: pool.paused, claimable: pool.claimable });
     console.log(plan.action === "claim"
       ? `  → ${fmtNook(plan.delta)} NOOK claimable now: npm run stake -- claim-direct`
       : `  → nothing to claim: ${plan.reason}`);
   } else {
-    console.log("  gateway proof  none returned");
+    console.log("  proof          none returned (gateway or nookplot.com)");
   }
   console.log(`
 Gateway relayer ${GATEWAY_RELAYER}: ${Number(ethers.formatEther(relayerEth)).toFixed(6)} ETH for gas`);
@@ -352,18 +380,20 @@ Could Nookplot publish a root adding one day of credits (~4.85M)? ${pass.ok ? "y
 /**
  * Claim straight from this wallet with our own gas (2026-10-12): claim() is
  * permissionless, so this works when the gateway relayer is out of ETH.
- * Refuses unless the gateway's proof matches the on-chain root and there is
- * something new to claim; simulates before asking.
+ * Refuses unless the proof matches the on-chain root and there is something
+ * new to claim; simulates before asking. The proof comes from nookplot.com
+ * while the gateway can't answer (2026-10-31).
  */
 async function cmdClaimDirect() {
   const provider = new ethers.JsonRpcProvider(RPC, 8453, { staticNetwork: true });
   const signer = new ethers.Wallet(PRIVATE_KEY, provider);
   const poolC = new ethers.Contract(MINING_REWARD_POOL, MINING_REWARD_POOL_ABI, signer);
-  const [pool, proof, claimed] = await Promise.all([
+  const [pool, fetched, claimed] = await Promise.all([
     readPoolState(provider),
-    gatewayGet<ProofResponse>(`/v1/mining/proof/${AGENT_ADDR}`),
+    fetchProof(),
     poolC.cumulativeClaimed(AGENT_ADDR) as Promise<bigint>,
   ]);
+  const proof = fetched.proof;
   const cum = proof?.cumulativeAmountRaw ? BigInt(proof.cumulativeAmountRaw) : null;
   const plan = planDirectClaim({ proofRoot: proof?.merkleRoot, proofCumulative: cum, onChainRoot: pool.merkleRoot, alreadyClaimed: claimed, paused: pool.paused, claimable: pool.claimable });
   if (plan.action !== "claim") {
@@ -378,7 +408,7 @@ async function cmdClaimDirect() {
   const ethBal = await provider.getBalance(AGENT_ADDR);
   console.log(`
 About to claim ${fmtNook(plan.delta)} NOOK directly from ${AGENT_ADDR}`);
-  console.log(`  pool ${MINING_REWARD_POOL}, root ${pool.merkleRoot.slice(0, 18)}…`);
+  console.log(`  pool ${MINING_REWARD_POOL}, root ${pool.merkleRoot.slice(0, 18)}…, proof from ${fetched.source}`);
   console.log(`  gas ~${gas.toString()}, at most ${ethers.formatEther(maxCost)} ETH (wallet has ${ethers.formatEther(ethBal)})`);
   if (ethBal < maxCost) throw new Error("not enough ETH in the wallet for gas");
   if (!(await confirm("Proceed?"))) {
@@ -405,6 +435,139 @@ About to claim ${fmtNook(plan.delta)} NOOK directly from ${AGENT_ADDR}`);
   }
   console.log(`✓ claimed ${fmtNook(plan.delta)} NOOK in block ${rcpt.blockNumber}`);
   console.log(`  BaseScan: https://basescan.org/tx/${hash}`);
+}
+
+const nowSec = () => Math.floor(Date.now() / 1000);
+const utc = (sec: number) => new Date(sec * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC";
+
+/**
+ * Read-only (2026-10-31): the stake as MiningStake records it, and what each
+ * -direct command would do now, simulated as this wallet. Needs no gateway.
+ */
+async function cmdStakeOnchain() {
+  const provider = new ethers.JsonRpcProvider(RPC, 8453, { staticNetwork: true });
+  const [c, ethBal] = await Promise.all([readStakeContract(provider, AGENT_ADDR), provider.getBalance(AGENT_ADDR)]);
+  const s = c.stake, now = nowSec();
+  console.log(`\nMiningStake ${MINING_STAKE}${c.paused ? "  ⚠ PAUSED by its owner" : ""}`);
+  console.log(`  staked      ${fmtNook(s.amount)} NOOK, tier ${c.tier}${s.stakedAt ? `, since ${utc(s.stakedAt)}` : ""}`);
+  if (s.unstakeRequestedAt) {
+    const ready = unstakeAvailableAt(s);
+    console.log(`  unstaking   ${fmtNook(s.unstakeAmount)} NOOK, requested ${utc(s.unstakeRequestedAt)}, withdrawable ${now >= ready ? "now" : `from ${utc(ready)}`}`);
+  } else {
+    console.log("  unstaking   nothing pending");
+  }
+  if (s.slashedAt) console.log(`  slashed     ${utc(s.slashedAt)}`);
+  console.log(`  cooldown    ${(c.cooldown / 86_400).toFixed(1)} days for a new request`);
+  console.log(`  wallet gas  ${Number(ethers.formatEther(ethBal)).toFixed(6)} ETH`);
+  // eth_call as this wallet: nothing is signed or sent.
+  const sc = new ethers.Contract(MINING_STAKE, MINING_STAKE_ABI, provider);
+  const checks: [string, UnstakePlan, () => Promise<unknown>][] = [
+    ["unstake-direct all", planUnstake("request", c, now, s.amount), () => sc.requestUnstake.staticCall(s.amount, { from: AGENT_ADDR })],
+    ["cancel-unstake-direct", planUnstake("cancel", c, now), () => sc.cancelUnstake.staticCall({ from: AGENT_ADDR })],
+    ["complete-unstake-direct", planUnstake("complete", c, now), () => sc.completeUnstake.staticCall({ from: AGENT_ADDR })],
+  ];
+  console.log("");
+  for (const [name, plan, simulate] of checks) {
+    if (plan.action === "none") {
+      console.log(`  ${name.padEnd(24)} would refuse: ${plan.reason}`);
+      continue;
+    }
+    const verdict = await simulate().then(
+      () => "the contract would accept it (simulated, nothing sent)",
+      (err) => `the contract would revert: ${(err as Error).message.slice(0, 120)}`,
+    );
+    console.log(`  ${name.padEnd(24)} ${verdict}`);
+  }
+  console.log("");
+}
+
+/** Simulate, show, ask, send, wait: shared by the three -direct stake commands. */
+async function sendStakeTx(label: string, fn: "requestUnstake" | "cancelUnstake" | "completeUnstake", args: unknown[], lines: string[]): Promise<boolean> {
+  const provider = new ethers.JsonRpcProvider(RPC, 8453, { staticNetwork: true });
+  const signer = new ethers.Wallet(PRIVATE_KEY, provider);
+  const c = new ethers.Contract(MINING_STAKE, MINING_STAKE_ABI, signer);
+  // Simulate first: a revert here costs nothing.
+  await c[fn].staticCall(...args);
+  const gas: bigint = await c[fn].estimateGas(...args);
+  const fee = await provider.getFeeData();
+  const maxCost = gas * (fee.maxFeePerGas ?? fee.gasPrice ?? 0n);
+  const ethBal = await provider.getBalance(AGENT_ADDR);
+  console.log("");
+  for (const l of lines) console.log(l);
+  console.log(`  gas ~${gas.toString()}, at most ${ethers.formatEther(maxCost)} ETH (wallet has ${ethers.formatEther(ethBal)})`);
+  if (ethBal < maxCost) throw new Error("not enough ETH in the wallet for gas");
+  if (!(await confirm("Proceed?"))) {
+    console.log("aborted.");
+    return false;
+  }
+  let hash: string;
+  try {
+    hash = (await c[fn](...args)).hash;
+  } catch (err) {
+    console.error(`✗ ${label} not sent: ${(err as Error).message.slice(0, 300)}`);
+    process.exit(4);
+  }
+  console.log(`  tx: ${hash}`);
+  let rcpt: ethers.TransactionReceipt;
+  try {
+    rcpt = await waitForReceipt(provider, hash);
+  } catch (err) {
+    exitUnknown(label, hash, err);
+  }
+  if (rcpt.status !== 1) {
+    console.error(`✗ ${label} tx ${hash} reverted. Check https://basescan.org/tx/${hash}`);
+    process.exit(4);
+  }
+  console.log(`✓ ${label} confirmed in block ${rcpt.blockNumber}`);
+  console.log(`  BaseScan: https://basescan.org/tx/${hash}`);
+  return true;
+}
+
+/** Request an unstake straight from this wallet, paying its own gas (2026-10-31; stake-direct.ts). */
+async function cmdUnstakeDirect(amountArg?: string) {
+  const provider = new ethers.JsonRpcProvider(RPC, 8453, { staticNetwork: true });
+  const c = await readStakeContract(provider, AGENT_ADDR);
+  const plan = planUnstake("request", c, nowSec(), parseUnstakeAmount(amountArg, c.stake.amount));
+  if (plan.action !== "request") {
+    console.log(`Not sending: ${plan.reason}.`);
+    return;
+  }
+  const left = c.stake.amount - plan.amount;
+  await sendStakeTx("unstake request", "requestUnstake", [plan.amount], [
+    `About to REQUEST an unstake of ${fmtNook(plan.amount)} NOOK, straight from ${AGENT_ADDR} (no gateway needed)`,
+    `  staked now ${fmtNook(c.stake.amount)} NOOK, tier ${c.tier}; ${left > 0n ? `${fmtNook(left)} NOOK stays staked` : "nothing stays staked"}`,
+    `  withdrawable from ${utc(plan.availableAt)} (${(c.cooldown / 86_400).toFixed(1)}-day cooldown) with complete-unstake-direct`,
+    "  until then the NOOK stays locked, the gateway stops reward accrual, and the agent leaves its mining guild",
+    "  cancel-unstake-direct undoes the request; the guild seat comes back only if the guild still has room",
+  ]);
+}
+
+async function cmdCancelUnstakeDirect() {
+  const provider = new ethers.JsonRpcProvider(RPC, 8453, { staticNetwork: true });
+  const plan = planUnstake("cancel", await readStakeContract(provider, AGENT_ADDR), nowSec());
+  if (plan.action !== "cancel") {
+    console.log(`Not sending: ${plan.reason}.`);
+    return;
+  }
+  await sendStakeTx("unstake cancel", "cancelUnstake", [], [
+    `About to CANCEL the pending unstake of ${fmtNook(plan.amount)} NOOK, straight from ${AGENT_ADDR}`,
+    "  the NOOK goes back to active stake and the gateway resumes reward accrual",
+    "  the mining-guild seat comes back only if the guild still has room; otherwise rejoin by hand",
+  ]);
+}
+
+async function cmdCompleteUnstakeDirect() {
+  const provider = new ethers.JsonRpcProvider(RPC, 8453, { staticNetwork: true });
+  const plan = planUnstake("complete", await readStakeContract(provider, AGENT_ADDR), nowSec());
+  if (plan.action !== "complete") {
+    console.log(`Not sending: ${plan.reason}.`);
+    return;
+  }
+  const sent = await sendStakeTx("unstake completion", "completeUnstake", [], [
+    `About to WITHDRAW ${fmtNook(plan.amount)} NOOK from stake to ${AGENT_ADDR}`,
+    `  ${plan.remaining > 0n ? `${fmtNook(plan.remaining)} NOOK stays staked` : "nothing stays staked afterwards"}`,
+  ]);
+  if (sent) console.log(`  wallet now holds ${fmtNook((await readBalances()).nook)} NOOK`);
 }
 
 async function cmdCompound() {
@@ -473,7 +636,12 @@ Usage:
   npm run stake -- complete-unstake             Withdraw after cooldown
   npm run stake -- claim [sourceType]           Claim earned NOOK to wallet (gasless, via the gateway relayer)
   npm run stake -- claim-direct                 Claim straight from this wallet with our own ETH gas
+                                                (uses nookplot.com's proof when the gateway can't answer)
   npm run stake -- settlement                   Read-only: where on-chain settlement stands, and why
+  npm run stake -- stake-onchain                Read-only: the stake as the staking contract records it
+  npm run stake -- unstake-direct <amount|all>  Request unstake straight from this wallet with its own ETH gas
+  npm run stake -- cancel-unstake-direct        Cancel a pending unstake, the same way
+  npm run stake -- complete-unstake-direct      Withdraw after the 7-day cooldown, the same way
   npm run stake -- compound                     Claim + restake atomically
   npm run stake -- sweep <toAddress> [amount]   ERC-20 transfer NOOK out (needs ETH for gas)
 
@@ -514,6 +682,19 @@ async function main() {
     case "settlement":
       await cmdSettlement();
       break;
+    case "stake-onchain":
+      await cmdStakeOnchain();
+      break;
+    case "unstake-direct":
+      if (!args[0]) usage();
+      await cmdUnstakeDirect(args[0]);
+      break;
+    case "cancel-unstake-direct":
+      await cmdCancelUnstakeDirect();
+      break;
+    case "complete-unstake-direct":
+      await cmdCompleteUnstakeDirect();
+      break;
     case "sweep":
       if (!args[0]) usage();
       await cmdSweep(args[0], args[1]);
@@ -524,6 +705,10 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(`✗ ${err.message ?? err}`);
+  const msg = String(err?.message ?? err);
+  console.error(`✗ ${msg}`);
+  if (isMaintenanceError(msg)) {
+    console.error("  Nookplot's gateway is paused. These work without it: settlement, claim-direct, stake-onchain, unstake-direct, cancel-unstake-direct, complete-unstake-direct.");
+  }
   process.exit(1);
 });

@@ -18,6 +18,7 @@
     "buy-credits": "tsx src/buy-credits.ts",
     "dashboard": "tsx src/dashboard.ts",
     "stake": "tsx src/stake.ts",
+    "relaunch-watch": "tsx src/relaunch-watch-cli.ts",
     "forge": "tsx src/forge.ts",
     "forge:watch": "tsx src/forge-watch.ts",
     "surfaces": "tsx src/earning-surfaces.ts",
