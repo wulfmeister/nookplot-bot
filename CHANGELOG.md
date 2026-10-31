@@ -4,6 +4,31 @@
 > reasoning behind each change is often more useful than the change itself.
 > Earlier passes of the same journal live in the back half of AGENTS.md.
 
+## 2026-10-31 — Nookplot paused for a rebuild: wait it out instead of relaunching
+
+Since about 2026-10-22 17:00Z every gateway request returns 503 "Nookplot is
+paused while it is rebuilt. On-chain assets are unaffected". nookplot.com
+offers only on-chain actions: claiming the last published distribution (the
+09-02 root, which we had already claimed in full), unstaking, and bounty
+escrow. Credits earned after 09-02 are not mentioned,
+and issue nookprotocol/nookplot#12 has had no reply.
+
+The daemon treated the pause like a short outage: 30 connect attempts, exit,
+relaunch by launchd. That made 457 launches in 9 days, each re-arming the boot
+wake gate, with nothing done in between.
+
+- `gateway-maintenance.ts`: on the maintenance reply the daemon waits
+  in-process. It checks every `BOT_MAINTENANCE_POLL_MIN` minutes (default
+  10) without counting toward the 30-attempt limit, logs once an hour, and
+  keeps `~/.nookplot/gateway-maintenance.json` with the pause's start
+  preserved across restarts. When the gateway answers again it logs
+  "Nookplot is back" with the gateway version against the last one seen
+  (`gateway-manifest.json`, seeded with 0.5.32 from 10-12), then resumes.
+- Dashboard: an urgent "Nookplot is paused" item and headline sentence; the
+  status light reads "running, waiting: Nookplot is paused"; the old
+  gateway-unreachable rule (built for local network outages) no longer
+  repeats it with a stale duration.
+
 ## 2026-10-12 (b) — who spent the Venice allowance; lifetime NOOK corrected; quieter attention list
 
 - **Venice.** The key ran dry at 08:45Z and stood the bot down until the
