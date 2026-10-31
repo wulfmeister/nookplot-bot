@@ -967,7 +967,10 @@ function computeBlockers(args: {
   }
 
   const gw = gatewayReachability(args.networkHistory);
-  if (!gw.reachable && gw.consecutiveNoEpoch >= 2) {
+  // A maintenance pause is reported above; this rule (built for local
+  // network outages) would repeat it with a stale duration.
+  const pausedNow = !!(m && m.state === "maintenance" && Date.now() - Date.parse(m.lastCheck) < 2 * 3_600_000);
+  if (!pausedNow && !gw.reachable && gw.consecutiveNoEpoch >= 2) {
     blockers.push({
       severity: "high",
       scope: "us",
@@ -2040,7 +2043,10 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     const gateway = gatewayReachability(
       readJsonlTail<NetworkStatusEntry>(join(NOOK_DIR, "network-status.jsonl"), 12),
     );
-    return json(res, 200, { ok: true, ts: new Date().toISOString(), daemon: daemonStatus(), gateway });
+    // A current maintenance record from the daemon (gateway-maintenance.ts).
+    const mt = readMaintenanceState();
+    const maintenance = mt && mt.state === "maintenance" && Date.now() - Date.parse(mt.lastCheck) < 2 * 3_600_000 ? mt : null;
+    return json(res, 200, { ok: true, ts: new Date().toISOString(), daemon: daemonStatus(), gateway, maintenance });
   }
   if (path === "/api/solve-funnel") {
     try {

@@ -848,7 +848,12 @@ async function refreshBotStatus() {
     const rev = d.identity && d.identity.gitRev ? `, rev ${d.identity.gitRev}` : "";
     // Running alone lies: through the 53h blackout of 2026-07-25 the process
     // was up while the bot earned nothing. Healthy also needs the gateway.
-    if (d.running && gw && !gw.reachable && gw.consecutiveNoEpoch >= 2) {
+    if (d.running && h.maintenance) {
+      el.className = "lamp wait";
+      el.textContent = "running, waiting: Nookplot is paused";
+      el.title = `Nookplot is paused while it is rebuilt (since ${h.maintenance.since || "?"}); the daemon checks every 10 min and resumes on its own${rev}`;
+      botHealth = { state: "paused" };
+    } else if (d.running && gw && !gw.reachable && gw.consecutiveNoEpoch >= 2) {
       const hours = gw.hours >= 1 ? Math.round(gw.hours) + " h" : "under an hour";
       el.className = "lamp bad";
       el.textContent = `running, gateway down ${hours}`;
@@ -978,7 +983,8 @@ function renderAnswer() {
     const vt = snapshot.venice?.today;
     lines.push(["wait", `The Venice key is out of budget, so solving and checking pause until 00:00 UTC.${vt && vt.other >= 0.1 ? ` $${vt.other.toFixed(2)} of today's allowance went while the bot made no calls.` : ""}`]);
   }
-  const others = (snapshot.blockers ?? []).filter((b) => b.kind !== "settlement" && b.severity === "high").length;
+  // Only urgent items on our side are "waiting on you"; network ones aren't yours to act on.
+  const others = (snapshot.blockers ?? []).filter((b) => b.kind !== "settlement" && b.severity === "high" && b.scope === "us").length;
   const waiting = [];
   if (others) waiting.push(`${others} other urgent problem${others === 1 ? "" : "s"}`);
   if (projectReview?.pending) waiting.push("a project draft");
