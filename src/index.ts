@@ -6,6 +6,7 @@ import { chat, VENICE_WEB_SEARCH, assertVeniceKey } from "./venice.js";
 import { pickModel, pickModelAB } from "./models.js";
 import { runsInLean, leanBanner } from "./lean.js";
 import { NOOK_DIR, appendJsonl, extractJson, readJsonl, readJsonlTail, sleep } from "./util.js";
+import { describeVersionChange, isMaintenanceError, maintenancePollMs, nextMaintenanceState, readMaintenanceState, readManifestSnapshot, saveManifestSnapshot, writeMaintenanceState } from "./gateway-maintenance.js";
 import { findTemplateFingerprint, findNearDuplicateTrace, nearDupeCorpus, applyOffTopicClamp } from "./trace-fingerprint.js";
 import { webSearch, arxivSearch, formatResultsForPrompt, type SearchResult } from "./research.js";
 import { refine } from "./refine.js";
@@ -2715,19 +2716,58 @@ async function main() {
   assertVeniceKey();
   const runtime = getRuntime();
   let connection: Awaited<ReturnType<typeof runtime.connect>> | null = null;
-  for (let attempt = 0; attempt < 30; attempt++) {
+  // A maintenance pause ("Nookplot is paused while it is rebuilt") is waited
+  // out in-process: it doesn't count toward the 30-attempt limit, so the
+  // daemon no longer exits and relaunches every ~25 min (gateway-maintenance.ts).
+  let failures = 0;
+  let lastPauseLog = 0;
+  let sawPause = false;
+  for (;;) {
     try {
       connection = await runtime.connect();
       break;
     } catch (err) {
-      const wait = Math.min(60_000, 5_000 * Math.pow(1.4, attempt));
-      console.warn(`⚠ connect failed (attempt ${attempt + 1}): ${(err as Error).message} — retrying in ${Math.round(wait / 1000)}s`);
-      await new Promise((r) => setTimeout(r, wait));
+      const msg = (err as Error).message;
+      if (isMaintenanceError(msg)) {
+        sawPause = true;
+        const st = nextMaintenanceState(readMaintenanceState(), true, new Date().toISOString(), msg.slice(0, 200));
+        writeMaintenanceState(st);
+        const poll = maintenancePollMs();
+        if (Date.now() - lastPauseLog >= 3_600_000) {
+          console.log(`⏸ Nookplot is paused while it is rebuilt (since ${st.since}). Checking every ${Math.round(poll / 60_000)} min; the bot resumes on its own when it's back.`);
+          lastPauseLog = Date.now();
+        }
+        await sleep(poll);
+        continue;
+      }
+      failures++;
+      if (failures >= 30) {
+        console.error("✗ could not connect after 30 attempts — gateway may be down for an extended period. Exiting; launchd will start the daemon again.");
+        process.exit(1);
+      }
+      const wait = Math.min(60_000, 5_000 * Math.pow(1.4, failures - 1));
+      console.warn(`⚠ connect failed (attempt ${failures}): ${msg} — retrying in ${Math.round(wait / 1000)}s`);
+      await sleep(wait);
     }
   }
-  if (!connection) {
-    console.error("✗ could not connect after 30 attempts — gateway may be down for an extended period. Exiting; tsx-watch will restart on next file change.");
-    process.exit(1);
+  {
+    // Gateway answered. If we were (or a previous run was) waiting out a
+    // pause, say so and record the gateway version against the last one seen.
+    const prevState = readMaintenanceState();
+    const nowIso = new Date().toISOString();
+    if (sawPause || prevState?.state === "maintenance") {
+      let version: string | null = null;
+      try {
+        const res = await fetch(`${process.env.NOOKPLOT_GATEWAY_URL ?? "https://gateway.nookplot.com"}/v1`, {
+          headers: { Authorization: `Bearer ${process.env.NOOKPLOT_API_KEY ?? ""}` },
+          signal: AbortSignal.timeout(20_000),
+        });
+        if (res.ok) version = ((await res.json()) as { version?: string }).version ?? null;
+      } catch { /* version stays unknown */ }
+      console.log(`🔁 Nookplot is back after its rebuild pause (since ${prevState?.since ?? "?"}); ${describeVersionChange(readManifestSnapshot(), version)}.`);
+      saveManifestSnapshot(version, nowIso);
+    }
+    writeMaintenanceState(nextMaintenanceState(prevState, false, nowIso));
   }
   myAddress = connection?.address ?? null;
   console.log(`✓ Connected as ${myAddress ?? "agent"}`);

@@ -28,6 +28,7 @@ import { getWalletBalances } from "./wallet.js";
 import { mergePackPricing, readOnChainPacks, type OnChainPack } from "./credit-packs.js";
 import { GATEWAY_RELAYER, readPoolState } from "./settlement-pool.js";
 import { mergeWindows, reconcileVenice, type VeniceReconcile } from "./venice-reconcile.js";
+import { readMaintenanceState, type MaintenanceState } from "./gateway-maintenance.js";
 import { JsonRpcProvider } from "ethers";
 import { bountySummary } from "./bounties.js";
 import { clarificationSummary } from "./clarifications.js";
@@ -436,9 +437,12 @@ async function buildSnapshotUncached() {
       return null;
     }
   })();
+  // Written by the daemon while it waits out a gateway maintenance pause.
+  const maintenance = readMaintenanceState();
   const blockers = computeBlockers({
     chain,
     veniceToday,
+    maintenance,
     poolDist,
     avgVCount,
     myPending: myPending.length,
@@ -546,6 +550,7 @@ async function buildSnapshotUncached() {
           computedAt: contribRes.computedAt,
         }
       : null,
+    maintenance: readMaintenanceState(),
     // Nookplot's reputation passport (the public profile's "418/1000").
     passport: passportRes?.domains
       ? { overall: passportRes.overall ?? null, tier: passportRes.tier ?? null, tierName: passportRes.tierName ?? null, computedAt: passportRes.computedAt ?? null, domains: passportRes.domains.map((d) => ({ domain: d.domain, label: d.label ?? d.domain, score: d.score })) }
@@ -841,6 +846,7 @@ function computeBlockers(args: {
   proof?: { hasProof?: boolean; epochNumber?: number; publishedAt?: string } | null;
   chain?: SettlementChain | null;
   veniceToday?: VeniceReconcile | null;
+  maintenance?: MaintenanceState | null;
 }) {
   const blockers: Array<{ severity: "high" | "med" | "low"; scope: "network" | "us"; message: string; action?: string; kind?: string }> = [];
   const p = args.poolDist;
@@ -897,6 +903,19 @@ function computeBlockers(args: {
       scope: "us",
       message: `$${vt.other.toFixed(2)} of today's Venice allowance went while the bot made no calls (${otherWhen(vt)} UTC).`,
       action: "Something else is drawing on this Venice account. Check Venice's usage-by-key page for those times.",
+    });
+  }
+  // Nookplot itself paused for a rebuild (2026-10-22 onward): nothing works
+  // until it's back, and nothing is ours to fix. Shown while the daemon's
+  // last check is recent (it checks every 10 min by default).
+  const m = args.maintenance;
+  if (m && m.state === "maintenance" && Date.now() - Date.parse(m.lastCheck) < 2 * 3_600_000) {
+    blockers.push({
+      kind: "maintenance",
+      severity: "high",
+      scope: "network",
+      message: `Nookplot is paused while it is rebuilt${m.since ? ` (since ${m.since.slice(0, 16).replace("T", " ")} UTC)` : ""}. No solving, checking, posting or claims until it's back. On-chain assets are unaffected.`,
+      action: "Nothing to fix on our side. The bot checks every 10 minutes and resumes on its own, logging the gateway version so the rebuilt API can be checked. nookplot.com still offers on-chain unstaking.",
     });
   }
   const relay = claimRelayHealth(args.claimHistory ?? []);

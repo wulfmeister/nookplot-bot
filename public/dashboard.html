@@ -956,7 +956,10 @@ function renderAnswer() {
     ? `${fmt(todayNook)} NOOK credited today${price ? ` (about ${usdFmt(todayNook * price)})` : ""}.`
     : "Nothing credited yet today; the daily claim lands soon after 02:00 UTC.";
   const h = botHealth?.state;
-  if (h === "gateway-down") lines.push(["bad", `The bot is up but can't reach the Nookplot gateway (${botHealth.hours}), so it is earning nothing.`]);
+  const mt = snapshot.maintenance;
+  if (mt && mt.state === "maintenance" && Date.now() - Date.parse(mt.lastCheck) < 2 * 3_600_000) {
+    lines.push(["bad", `Nookplot is paused while it is rebuilt${mt.since ? `, since ${fmtDay(mt.since)}` : ""}. The bot is waiting and will resume on its own.`]);
+  } else if (h === "gateway-down") lines.push(["bad", `The bot is up but can't reach the Nookplot gateway (${botHealth.hours}), so it is earning nothing.`]);
   else if (h === "stopped") lines.push(["bad", `The bot is stopped. ${earned}`]);
   else if (h === "running") lines.push(["good", `The bot is running. ${earned}`]);
   else lines.push(["info", earned]);
